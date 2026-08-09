@@ -3,8 +3,26 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/clocks.h"
+#include "hardware/gpio.h"
 #include <stdio.h>
 #include <string.h>
+
+#define I2S_DMA_STALL_TIMEOUT_US 200000ULL
+static volatile bool i2s_dma_stalled = false;
+static volatile uint64_t last_tx_dma_us = 0;
+static volatile uint64_t last_rx_dma_us = 0;
+
+static void i2s_debug_led_stall(const char *channel_name, uint64_t now_us, volatile uint64_t *last_us) {
+    uint64_t delta_us = now_us - *last_us;
+    if (delta_us > I2S_DMA_STALL_TIMEOUT_US) {
+        i2s_dma_stalled = true;
+        gpio_put(PICO_DEFAULT_LED_PIN, (now_us / 50000ULL) & 1ULL);
+        printf("[I2S] DMA stall on %s: delta=%llu us (threshold=%llu us)\n",
+               channel_name,
+               (unsigned long long)delta_us,
+               (unsigned long long)I2S_DMA_STALL_TIMEOUT_US);
+    }
+}
 
 extern void audio_i2s_hardware_init(uint32_t sample_rate);
 extern PIO i2s_get_tx_pio(void);
@@ -34,30 +52,42 @@ static volatile uint32_t rx_buf_idx = 0;
 
 // Internal DMA IRQ Handler
 static void i2s_dma_irq_handler() {
+    uint64_t now_us = time_us_64();
+
     // Check TX DMA Channel Interrupt
     if (dma_hw->ints0 & (1u << dma_tx_chan)) {
         dma_hw->ints0 = (1u << dma_tx_chan); // Clear interrupt flag
-        
+
+        if (last_tx_dma_us != 0) {
+            i2s_debug_led_stall("TX", now_us, &last_tx_dma_us);
+        }
+        last_tx_dma_us = now_us;
+
         // Swap buffers for the next cycle
         tx_buf_idx = 1 - tx_buf_idx;
-        
+
         // Trigger user callback to populate the newly inactive buffer
         i2s_callback_tx_demanded(tx_buffers[1 - tx_buf_idx], I2S_BUFFER_SIZE);
-        
+
         // Reconfigure and chain the next DMA block pointer
         dma_channel_hw_addr(dma_tx_chan)->al1_read_addr = (uintptr_t)tx_buffers[tx_buf_idx];
     }
-    
+
     // Check RX DMA Channel Interrupt
     if (dma_hw->ints0 & (1u << dma_rx_chan)) {
         dma_hw->ints0 = (1u << dma_rx_chan); // Clear interrupt flag
-        
+
+        if (last_rx_dma_us != 0) {
+            i2s_debug_led_stall("RX", now_us, &last_rx_dma_us);
+        }
+        last_rx_dma_us = now_us;
+
         // Swap buffers for the next cycle
         rx_buf_idx = 1 - rx_buf_idx;
-        
+
         // Fire callback to instantly parse the raw data just recorded
         i2s_callback_rx_ready(rx_buffers[1 - rx_buf_idx], I2S_BUFFER_SIZE);
-        
+
         // Reconfigure and point to the fresh empty buffer slice
         dma_channel_hw_addr(dma_rx_chan)->al1_write_addr = (uintptr_t)rx_buffers[rx_buf_idx];
     }
@@ -68,6 +98,18 @@ void i2s_core_init(void) {
         printf("[I2S] Already initialized; skipping DMA/PIO setup.\n");
         return;
     }
+
+    memset(tx_buffers, 0, sizeof(tx_buffers));
+    memset(rx_buffers, 0, sizeof(rx_buffers));
+    tx_buf_idx = 0;
+    rx_buf_idx = 0;
+    i2s_dma_stalled = false;
+    last_tx_dma_us = 0;
+    last_rx_dma_us = 0;
+
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, 0);
 
     printf("[I2S] Initializing PIO clocking and DMA at %lu Hz...\n", (unsigned long)I2S_SAMPLE_RATE);
 
@@ -138,6 +180,8 @@ void i2s_core_start(void) {
     pio_enable_sm_mask_in_sync(rx_pio, 1u << rx_sm);
 
     // Fire off both background DMA channels simultaneously
+    last_tx_dma_us = time_us_64();
+    last_rx_dma_us = time_us_64();
     dma_channel_start(dma_tx_chan);
     dma_channel_start(dma_rx_chan);
     printf("[I2S] DMA TX/RX started.\n");
@@ -147,4 +191,7 @@ void i2s_core_stop(void) {
     dma_channel_abort(dma_tx_chan);
     dma_channel_abort(dma_rx_chan);
     irq_set_enabled(DMA_IRQ_0, false);
+    i2s_dma_stalled = false;
+    gpio_put(PICO_DEFAULT_LED_PIN, 0);
 }
+

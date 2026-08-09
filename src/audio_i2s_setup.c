@@ -39,8 +39,8 @@ void audio_i2s_hardware_init(uint32_t sample_rate) {
     sm_config_set_out_pins(&c_tx, I2S_DIN_OUT, 1);
     sm_config_set_sideset_pins(&c_tx, I2S_BCLK_PIN); // BCLK is pin 0, WS is pin 1 of side-set
 
-    // Configure Serializer Out shift register: Shift Right, Autopull enabled, Threshold = 32 bits
-    sm_config_set_out_shift(&c_tx, true, true, 32);
+    // Configure Serializer Out shift register: MSB-first, Autopull enabled, Threshold = 32 bits
+    sm_config_set_out_shift(&c_tx, false, true, 32);
 
     // Force specific GPIOs into PIO functional mode
     pio_gpio_init(pio_tx, I2S_DIN_OUT);
@@ -54,10 +54,11 @@ void audio_i2s_hardware_init(uint32_t sample_rate) {
     // 3. Configure PIO1 (RX / Microphone Slave Engine)
     pio_sm_config c_rx = audio_i2s_rx_program_get_default_config(offset_rx);
 
-    // Assign pin behaviors for RX: pin 0 = BCLK, pin 1 = WS, pin 2 = SD_IN
-    sm_config_set_in_pins(&c_rx, I2S_BCLK_PIN);
+    // Assign pin behaviors for RX: sample the microphone data pin, and use BCLK/WS as explicit wait pins
+    sm_config_set_in_pins(&c_rx, I2S_SD_IN);
+    sm_config_set_jmp_pin(&c_rx, I2S_WS_PIN);
 
-    // Configure Serializer In shift register: Shift Left, Autopush enabled, Threshold = 32 bits
+    // Configure Serializer In shift register: MSB-first, Autopush enabled, Threshold = 32 bits
     sm_config_set_in_shift(&c_rx, false, true, 32);
 
     // Set the data input pin to PIO mode
