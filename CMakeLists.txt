@@ -11,9 +11,13 @@ pico_sdk_init()
 add_executable(Pico-2W-INMP441-MAX98357A-core-test
     src/main.c
     src/i2s_core.c
+    src/audio_i2s_setup.c
 )
 
 target_include_directories(Pico-2W-INMP441-MAX98357A-core-test PRIVATE src)
+
+# Add the PIO file generation step for the actual target
+pico_generate_pio_header(Pico-2W-INMP441-MAX98357A-core-test ${CMAKE_CURRENT_LIST_DIR}/src/audio_i2s.pio)
 
 # Link hardware libraries required for RP2350 DMA and low-level control
 target_link_libraries(Pico-2W-INMP441-MAX98357A-core-test 
