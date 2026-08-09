@@ -8,9 +8,14 @@
 #include <string.h>
 
 #define I2S_DMA_STALL_TIMEOUT_US 200000ULL
+#define I2S_DEBUG_PRINT_EVERY 64U
 static volatile bool i2s_dma_stalled = false;
 static volatile uint64_t last_tx_dma_us = 0;
 static volatile uint64_t last_rx_dma_us = 0;
+volatile uint32_t g_i2s_tx_dma_count = 0;
+volatile uint32_t g_i2s_rx_dma_count = 0;
+static volatile uint32_t g_i2s_tx_debug_print_count = 0;
+static volatile uint32_t g_i2s_rx_debug_print_count = 0;
 
 static void i2s_debug_led_stall(const char *channel_name, uint64_t now_us, volatile uint64_t *last_us) {
     uint64_t delta_us = now_us - *last_us;
@@ -58,38 +63,64 @@ static void i2s_dma_irq_handler() {
     if (dma_hw->ints0 & (1u << dma_tx_chan)) {
         dma_hw->ints0 = (1u << dma_tx_chan); // Clear interrupt flag
 
-        if (last_tx_dma_us != 0) {
-            i2s_debug_led_stall("TX", now_us, &last_tx_dma_us);
-        }
+        g_i2s_tx_dma_count++;
+        g_i2s_tx_debug_print_count++;
+
+        // if (last_tx_dma_us != 0) {
+        //     i2s_debug_led_stall("TX", now_us, &last_tx_dma_us);
+        // }
         last_tx_dma_us = now_us;
 
-        // Swap buffers for the next cycle
-        tx_buf_idx = 1 - tx_buf_idx;
+        // Compute the next buffer to fill and arm, then fill it before the DMA reuses it.
+        uint32_t next_tx_index = 1 - tx_buf_idx;
+        int32_t *next_tx_buffer = tx_buffers[next_tx_index];
 
-        // Trigger user callback to populate the newly inactive buffer
-        i2s_callback_tx_demanded(tx_buffers[1 - tx_buf_idx], I2S_BUFFER_SIZE);
 
-        // Reconfigure and chain the next DMA block pointer
-        dma_channel_hw_addr(dma_tx_chan)->al1_read_addr = (uintptr_t)tx_buffers[tx_buf_idx];
+        tx_buf_idx = next_tx_index;
+        dma_channel_set_transfer_count(dma_tx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
+        dma_channel_set_read_addr(dma_tx_chan, next_tx_buffer, true);
+
+        // Fill the next buffer that will become active after the current transfer completes.
+        i2s_callback_tx_demanded(tx_buffers[tx_buf_idx], I2S_BUFFER_SIZE);
+
+        // if (g_i2s_tx_debug_print_count >= I2S_DEBUG_PRINT_EVERY) {
+        //     printf("[DMA] TX IRQ count=%lu last_delta_us=%llu\n",
+        //            (unsigned long)g_i2s_tx_dma_count,
+        //            (unsigned long long)(now_us - last_tx_dma_us));
+        //     g_i2s_tx_debug_print_count = 0;
+        // }
     }
 
     // Check RX DMA Channel Interrupt
     if (dma_hw->ints0 & (1u << dma_rx_chan)) {
         dma_hw->ints0 = (1u << dma_rx_chan); // Clear interrupt flag
 
+        g_i2s_rx_dma_count++;
+        g_i2s_rx_debug_print_count++;
+
         if (last_rx_dma_us != 0) {
             i2s_debug_led_stall("RX", now_us, &last_rx_dma_us);
         }
         last_rx_dma_us = now_us;
 
-        // Swap buffers for the next cycle
-        rx_buf_idx = 1 - rx_buf_idx;
+        // RX uses the previous buffer as the data-ready chunk and the opposite buffer as the next write target.
+        uint32_t ready_rx_index = rx_buf_idx;
+        uint32_t next_rx_index = 1 - rx_buf_idx;
+        int32_t *ready_rx_buffer = rx_buffers[ready_rx_index];
+        int32_t *next_rx_buffer = rx_buffers[next_rx_index];
 
-        // Fire callback to instantly parse the raw data just recorded
-        i2s_callback_rx_ready(rx_buffers[1 - rx_buf_idx], I2S_BUFFER_SIZE);
+        i2s_callback_rx_ready(ready_rx_buffer, I2S_BUFFER_SIZE);
+        rx_buf_idx = next_rx_index;
 
-        // Reconfigure and point to the fresh empty buffer slice
-        dma_channel_hw_addr(dma_rx_chan)->al1_write_addr = (uintptr_t)rx_buffers[rx_buf_idx];
+        dma_channel_set_transfer_count(dma_rx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
+        dma_channel_set_write_addr(dma_rx_chan, next_rx_buffer, true);
+
+        if (g_i2s_rx_debug_print_count >= I2S_DEBUG_PRINT_EVERY) {
+            printf("[DMA] RX IRQ count=%lu last_delta_us=%llu\n",
+                   (unsigned long)g_i2s_rx_dma_count,
+                   (unsigned long long)(now_us - last_rx_dma_us));
+            g_i2s_rx_debug_print_count = 0;
+        }
     }
 }
 
@@ -106,6 +137,10 @@ void i2s_core_init(void) {
     i2s_dma_stalled = false;
     last_tx_dma_us = 0;
     last_rx_dma_us = 0;
+    g_i2s_tx_dma_count = 0;
+    g_i2s_rx_dma_count = 0;
+    g_i2s_tx_debug_print_count = 0;
+    g_i2s_rx_debug_print_count = 0;
 
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
@@ -174,17 +209,14 @@ void i2s_core_start(void) {
 
     printf("[I2S] Starting I2S TX/RX state machines...\n");
 
-    // Enable state machines synchronously to lock audio phases together.
-    // Each PIO instance needs its own mask, since the two state machines live on different PIO blocks.
+    // For the first validation pass, keep the mic RX path disabled and focus on the speaker output.
+    // This isolates whether the TX side is generating valid I2S waveform timing for the MAX98357A.
     pio_enable_sm_mask_in_sync(tx_pio, 1u << tx_sm);
-    pio_enable_sm_mask_in_sync(rx_pio, 1u << rx_sm);
 
-    // Fire off both background DMA channels simultaneously
     last_tx_dma_us = time_us_64();
     last_rx_dma_us = time_us_64();
     dma_channel_start(dma_tx_chan);
-    dma_channel_start(dma_rx_chan);
-    printf("[I2S] DMA TX/RX started.\n");
+    printf("[I2S] TX-only validation started; RX path disabled for isolated speaker test.\n");
 }
 
 void i2s_core_stop(void) {

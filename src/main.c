@@ -6,7 +6,7 @@
 
 #define MIC_LEVEL_PRINT_PERIOD_MS 200
 #define BAR_WIDTH 40
-#define TONE_AMPLITUDE 18000
+#define TONE_AMPLITUDE 100000000
 #define TONE_STARTUP_STEPS 32
 
 enum test_mode {
@@ -15,12 +15,15 @@ enum test_mode {
     MODE_TONE_440 = 2,
 };
 
-static volatile enum test_mode current_mode = MODE_LOOPBACK;
+extern volatile uint32_t g_i2s_tx_dma_count;
+extern volatile uint32_t g_i2s_rx_dma_count;
+
+static volatile enum test_mode current_mode = MODE_TONE_440;
 static volatile bool loopback_enabled = true;
 static int32_t shared_dsp_buffer[I2S_BUFFER_SIZE];
 static volatile uint32_t mic_peak_value = 0;
 static volatile uint32_t mic_rms_value = 0;
-static uint32_t tone_phase_accum = 0;
+static float tone_phase = 0.0f;
 static uint32_t tone_step_index = 0;
 
 static void print_bar(uint32_t percent) {
@@ -64,6 +67,7 @@ static void set_mode(enum test_mode mode) {
 
 static void fill_tone_buffer(int32_t *buffer, size_t size) {
     const float phase_step = (2.0f * (float)M_PI * 440.0f) / (float)I2S_SAMPLE_RATE;
+    const float two_pi = 2.0f * (float)M_PI;
     float gain = 1.0f;
 
     if (tone_step_index < TONE_STARTUP_STEPS) {
@@ -72,11 +76,13 @@ static void fill_tone_buffer(int32_t *buffer, size_t size) {
     }
 
     for (size_t i = 0; i < size; ++i) {
-        float angle = (float)tone_phase_accum * phase_step;
-        float sine = sinf(angle);
+        float sine = sinf(tone_phase);
         int32_t sample = (int32_t)(sine * (float)TONE_AMPLITUDE * gain);
         buffer[i] = sample;
-        tone_phase_accum = (tone_phase_accum + 1U) % 65536U;
+        tone_phase += phase_step;
+        if (tone_phase >= two_pi) {
+            tone_phase -= two_pi;
+        }
     }
 }
 
@@ -132,8 +138,8 @@ int main() {
 
     i2s_core_init();
 
-    set_mode(MODE_LOOPBACK);
-    printf("[CORE] Waiting for input. Press 1, 2 or 3 to switch mode.\n");
+    set_mode(MODE_TONE_440);
+    printf("[CORE] Starting in tone validation mode to isolate the speaker output path.\n");
     i2s_core_start();
 
     uint32_t last_print_ms = 0;
@@ -172,10 +178,12 @@ int main() {
         if (now_ms - last_status_ms >= 1000U) {
             const char *mode_name = (current_mode == MODE_LOOPBACK) ? "loopback" :
                                     (current_mode == MODE_MIC_LEVEL) ? "mic-level" : "tone-440";
-            printf("[STATUS] running=%s peak=%lu rms=%lu\n",
+            printf("[STATUS] running=%s peak=%lu rms=%lu tx_dma=%lu rx_dma=%lu\n",
                    mode_name,
                    (unsigned long)mic_peak_value,
-                   (unsigned long)mic_rms_value);
+                   (unsigned long)mic_rms_value,
+                   (unsigned long)g_i2s_tx_dma_count,
+                   (unsigned long)g_i2s_rx_dma_count);
             last_status_ms = now_ms;
         }
 
