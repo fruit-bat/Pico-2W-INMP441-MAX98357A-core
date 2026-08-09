@@ -96,16 +96,18 @@ void i2s_core_init(void) {
     );
     
     // 5. Wire Handlers to RP2350 Nested Vectored Interrupt Controller (NVIC)
-    dma_set_irq0_channel_enabled(dma_tx_chan, true);
-    dma_set_irq0_channel_enabled(dma_rx_chan, true);
+    dma_channel_set_irq0_enabled(dma_tx_chan, true);
+    dma_channel_set_irq0_enabled(dma_rx_chan, true);
     irq_set_exclusive_handler(DMA_IRQ_0, i2s_dma_irq_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 }
 
 void i2s_core_start(void) {
-    // Enable state machines synchronously to lock audio phases together
-    pio_enable_sm_mask_in_sync((1u << tx_sm) | (1u << rx_sm));
-    
+    // Enable state machines synchronously to lock audio phases together.
+    // Each PIO instance needs its own mask, since the two state machines live on different PIO blocks.
+    pio_enable_sm_mask_in_sync(tx_pio, 1u << tx_sm);
+    pio_enable_sm_mask_in_sync(rx_pio, 1u << rx_sm);
+
     // Fire off both background DMA channels simultaneously
     dma_channel_start(dma_tx_chan);
     dma_channel_start(dma_rx_chan);

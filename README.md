@@ -22,15 +22,9 @@ audio_core_project/
 
 ## 2. Buid
 
-### 1. Create a dedicated isolated build directory and step into it
 ```sh
-mkdir build
-cd build
-```
-### 2. Configure the project for the RP2350 architecture
-### If your environment defaults to the older RP2040, explicitly pass the board variable:
-```ah
-cmake -DPICO_BOARD=pico2 ..
+cmake -S . -B build -DPICO_BOARD=pico2 -DPICO_SDK_PATH=/home/neo/fruit-bat/pico/pico/pico-sdk
+cmake --build build -j4
 ```
 
 ### 3. Compile the source code using all available CPU threads
