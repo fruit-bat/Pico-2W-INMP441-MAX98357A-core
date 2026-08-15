@@ -2,10 +2,11 @@
 #include <math.h>
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "pico/multicore.h"
 #include "i2s_core.h"
 
-#define MIC_LEVEL_PRINT_PERIOD_MS 200
-#define BAR_WIDTH 40
+#define MIC_LEVEL_PRINT_PERIOD_MS 100
+#define BAR_WIDTH 100
 #define TONE_AMPLITUDE 100000000
 #define TONE_STARTUP_STEPS 32
 
@@ -21,40 +22,32 @@ extern volatile uint32_t g_i2s_rx_dma_count;
 static volatile enum test_mode current_mode = MODE_TONE_440;
 static volatile bool loopback_enabled = true;
 static int32_t shared_dsp_buffer[I2S_BUFFER_SIZE];
+static int32_t rx_dsp_buffer[I2S_BUFFER_SIZE];
 static volatile uint32_t mic_peak_value = 0;
-static volatile uint32_t mic_rms_value = 0;
 static float tone_phase = 0.0f;
 static uint32_t tone_step_index = 0;
 
-static void print_bar(uint32_t percent) {
+static void print_bar(double percent) {
     int count = (percent * BAR_WIDTH) / 100;
-    printf("[MIC] %3lu%% |", (unsigned long)percent);
+    printf("[MIC] %3.2lf%% |", percent);
     for (int i = 0; i < BAR_WIDTH; ++i) {
         putchar(i < count ? '#' : ' ');
     }
     printf("|\n");
 }
 
-static void update_mic_level_stats(const int32_t *buffer, size_t size) {
-    uint64_t sum_sq = 0;
+static void __not_in_flash_func(update_mic_level_stats)(const int32_t *buffer, size_t size) {
+    double sum_sq = 0.0f;
     uint32_t peak = 0;
 
     for (size_t i = 0; i < size; ++i) {
-        int32_t sample = buffer[i];
-        uint32_t mag = (sample < 0) ? (uint32_t)(-(sample + 1)) + 1U : (uint32_t)sample;
+        int32_t sample = (buffer[i] >> 8); // Convert from 32-bit to 24-bit signed
+        uint32_t mag = (sample < 0) ? (uint32_t)(-sample) : (uint32_t)sample;
         if (mag > peak) {
             peak = mag;
         }
-        sum_sq += (uint64_t)((uint32_t)sample * (uint32_t)sample);
     }
-
     mic_peak_value = peak;
-    if (size > 0) {
-        uint32_t rms = (uint32_t)sqrt((double)sum_sq / (double)size);
-        mic_rms_value = rms;
-    } else {
-        mic_rms_value = 0;
-    }
 }
 
 static void set_mode(enum test_mode mode) {
@@ -65,7 +58,7 @@ static void set_mode(enum test_mode mode) {
            mode == MODE_MIC_LEVEL ? "mic-level" : "tone-440");
 }
 
-static void fill_tone_buffer(int32_t *buffer, size_t size) {
+static void __not_in_flash_func(fill_tone_buffer)(int32_t *buffer, size_t size) {
     const float phase_step = (2.0f * (float)M_PI * 440.0f) / (float)I2S_SAMPLE_RATE;
     const float two_pi = 2.0f * (float)M_PI;
     float gain = 1.0f;
@@ -86,19 +79,15 @@ static void fill_tone_buffer(int32_t *buffer, size_t size) {
     }
 }
 
+
+
 // Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
-void i2s_callback_rx_ready(const int32_t *buffer, size_t size) {
-    if (current_mode == MODE_LOOPBACK) {
-        for (size_t i = 0; i < size; ++i) {
-            shared_dsp_buffer[i] = buffer[i];
-        }
-    } else if (current_mode == MODE_MIC_LEVEL) {
-        update_mic_level_stats(buffer, size);
-    }
+void __not_in_flash_func(i2s_callback_rx_ready)(const int32_t *buffer, size_t size) {
+    update_mic_level_stats(buffer, size);
 }
 
 // Interrupt Hook: Invoked automatically when the MAX98357A requests audio bytes
-void i2s_callback_tx_demanded(int32_t *buffer, size_t size) {
+void __not_in_flash_func(i2s_callback_tx_demanded)(int32_t *buffer, size_t size) {
     switch (current_mode) {
         case MODE_LOOPBACK:
             if (loopback_enabled) {
@@ -124,6 +113,25 @@ void i2s_callback_tx_demanded(int32_t *buffer, size_t size) {
     }
 }
 
+void core1_main() {
+    static int32_t *tx_buffer = NULL;
+    static int32_t *rx_buffer = NULL;
+
+    while(1) {
+        int32_t *t_tx_buffer = get_tx_buffer();
+        int32_t *t_rx_buffer = get_rx_buffer();
+
+        if (tx_buffer != t_tx_buffer) {
+            tx_buffer = t_tx_buffer;
+            i2s_callback_tx_demanded(tx_buffer, I2S_BUFFER_SIZE);
+        }
+        if (rx_buffer != t_rx_buffer) {
+            rx_buffer = t_rx_buffer;
+            i2s_callback_rx_ready(rx_buffer, I2S_BUFFER_SIZE);
+        }
+    }
+}
+
 int main() {
     stdio_init_all();
     sleep_ms(2000);
@@ -142,10 +150,13 @@ int main() {
     printf("[CORE] Starting in tone validation mode to isolate the speaker output path.\n");
     i2s_core_start();
 
+    // Start core 1 
+    multicore_launch_core1(core1_main);
+
     uint32_t last_print_ms = 0;
     uint32_t last_status_ms = 0;
     while (true) {
-        int ch = getchar_timeout_us(1000);
+        int ch = getchar_timeout_us(500);
         if (ch != PICO_ERROR_TIMEOUT) {
             switch (ch) {
                 case '1':
@@ -166,9 +177,11 @@ int main() {
 
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
-        if (current_mode == MODE_MIC_LEVEL && now_ms - last_print_ms >= MIC_LEVEL_PRINT_PERIOD_MS) {
-            uint32_t percent = (mic_rms_value * 100U) / 32768U;
+        if (now_ms - last_print_ms >= MIC_LEVEL_PRINT_PERIOD_MS) {
+            double percent = ((double)mic_peak_value)  * 100.0 / ((double)(1 << 23)); // 24-bit full scale
+            if (percent < 0.0) percent = 0.0;
             if (percent > 100U) {
+                printf("[MIC] Warning: Peak value exceeds 100%% (%3.2lf) of full scale!\n", percent);
                 percent = 100U;
             }
             print_bar(percent);
@@ -178,10 +191,9 @@ int main() {
         if (now_ms - last_status_ms >= 1000U) {
             const char *mode_name = (current_mode == MODE_LOOPBACK) ? "loopback" :
                                     (current_mode == MODE_MIC_LEVEL) ? "mic-level" : "tone-440";
-            printf("[STATUS] running=%s peak=%lu rms=%lu tx_dma=%lu rx_dma=%lu\n",
+            printf("[STATUS] running=%s peak=%lu tx_dma=%lu rx_dma=%lu\n",
                    mode_name,
                    (unsigned long)mic_peak_value,
-                   (unsigned long)mic_rms_value,
                    (unsigned long)g_i2s_tx_dma_count,
                    (unsigned long)g_i2s_rx_dma_count);
             last_status_ms = now_ms;

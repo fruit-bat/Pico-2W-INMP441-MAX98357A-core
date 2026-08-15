@@ -34,19 +34,23 @@ void audio_i2s_hardware_init(uint32_t sample_rate) {
 
     // Assign pin behaviors for TX
     sm_config_set_out_pins(&c_tx, I2S_DIN_OUT, 1);
+    sm_config_set_in_pins(&c_tx, I2S_SD_IN);
     sm_config_set_sideset_pins(&c_tx, I2S_BCLK_PIN); // BCLK is pin 0, WS is pin 1 of side-set
 
     // Configure Serializer Out shift register: MSB-first, Autopull enabled, Threshold = 32 bits
     sm_config_set_out_shift(&c_tx, false, true, 32);
+    sm_config_set_in_shift(&c_tx, false, true, 32);
 
     // Force specific GPIOs into PIO functional mode
     pio_gpio_init(pio_tx, I2S_DIN_OUT);
     pio_gpio_init(pio_tx, I2S_BCLK_PIN);
     pio_gpio_init(pio_tx, I2S_WS_PIN);
+    pio_gpio_init(pio_tx, I2S_SD_IN);
 
     // Set clock directions: PIO pins are driven outputting clocks
     pio_sm_set_consecutive_pindirs(pio_tx, sm_tx, I2S_DIN_OUT, 1, true);
     pio_sm_set_consecutive_pindirs(pio_tx, sm_tx, I2S_BCLK_PIN, 2, true);
+    pio_sm_set_consecutive_pindirs(pio_rx, sm_tx, I2S_SD_IN, 1, false);
 
     // Calculate precise Audio Clock Division for the speaker master clock.
     uint32_t sys_clk = clock_get_hz(clk_sys);

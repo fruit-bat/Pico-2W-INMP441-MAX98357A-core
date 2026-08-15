@@ -3,8 +3,8 @@
 
 #include "pico/stdlib.h"
 
-#define I2S_SAMPLE_RATE  16000
-#define I2S_BUFFER_SIZE  512  // Number of 32-bit samples per buffer slice
+#define I2S_SAMPLE_RATE  44000
+#define I2S_BUFFER_SIZE  1024 // Number of 32-bit samples per buffer slice
 
 // Pin Configurations matching your prototype
 #define I2S_PIN_BCLK     13
@@ -21,5 +21,8 @@ void i2s_core_stop(void);
 // These are executed inside the ISR or high-priority thread context
 extern void i2s_callback_rx_ready(const int32_t *buffer, size_t size);
 extern void i2s_callback_tx_demanded(int32_t *buffer, size_t size);
+
+int32_t *get_tx_buffer(void);
+int32_t *get_rx_buffer(void);
 
 #endif // I2S_CORE_H

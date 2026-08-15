@@ -55,8 +55,16 @@ static int32_t rx_buffers[2][I2S_BUFFER_SIZE];
 static volatile uint32_t tx_buf_idx = 0;
 static volatile uint32_t rx_buf_idx = 0;
 
+int32_t *get_tx_buffer(void) {
+    return tx_buffers[tx_buf_idx];
+}
+
+int32_t *get_rx_buffer(void) {
+    return rx_buffers[rx_buf_idx];
+}
+
 // Internal DMA IRQ Handler
-static void i2s_dma_irq_handler() {
+static void __not_in_flash_func(i2s_dma_irq_handler)() {
     uint64_t now_us = time_us_64();
 
     // Check TX DMA Channel Interrupt
@@ -76,12 +84,12 @@ static void i2s_dma_irq_handler() {
         int32_t *next_tx_buffer = tx_buffers[next_tx_index];
 
 
-        tx_buf_idx = next_tx_index;
         dma_channel_set_transfer_count(dma_tx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
         dma_channel_set_read_addr(dma_tx_chan, next_tx_buffer, true);
 
         // Fill the next buffer that will become active after the current transfer completes.
-        i2s_callback_tx_demanded(tx_buffers[tx_buf_idx], I2S_BUFFER_SIZE);
+        //i2s_callback_tx_demanded(tx_buffers[tx_buf_idx], I2S_BUFFER_SIZE);
+        tx_buf_idx = next_tx_index;
 
         // if (g_i2s_tx_debug_print_count >= I2S_DEBUG_PRINT_EVERY) {
         //     printf("[DMA] TX IRQ count=%lu last_delta_us=%llu\n",
@@ -98,9 +106,9 @@ static void i2s_dma_irq_handler() {
         g_i2s_rx_dma_count++;
         g_i2s_rx_debug_print_count++;
 
-        if (last_rx_dma_us != 0) {
-            i2s_debug_led_stall("RX", now_us, &last_rx_dma_us);
-        }
+        // if (last_rx_dma_us != 0) {
+        //     i2s_debug_led_stall("RX", now_us, &last_rx_dma_us);
+        // }
         last_rx_dma_us = now_us;
 
         // RX uses the previous buffer as the data-ready chunk and the opposite buffer as the next write target.
@@ -109,18 +117,19 @@ static void i2s_dma_irq_handler() {
         int32_t *ready_rx_buffer = rx_buffers[ready_rx_index];
         int32_t *next_rx_buffer = rx_buffers[next_rx_index];
 
-        i2s_callback_rx_ready(ready_rx_buffer, I2S_BUFFER_SIZE);
-        rx_buf_idx = next_rx_index;
+        //i2s_callback_rx_ready(ready_rx_buffer, I2S_BUFFER_SIZE);
 
         dma_channel_set_transfer_count(dma_rx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
         dma_channel_set_write_addr(dma_rx_chan, next_rx_buffer, true);
 
-        if (g_i2s_rx_debug_print_count >= I2S_DEBUG_PRINT_EVERY) {
-            printf("[DMA] RX IRQ count=%lu last_delta_us=%llu\n",
-                   (unsigned long)g_i2s_rx_dma_count,
-                   (unsigned long long)(now_us - last_rx_dma_us));
-            g_i2s_rx_debug_print_count = 0;
-        }
+        rx_buf_idx = next_rx_index;
+
+        // if (g_i2s_rx_debug_print_count >= I2S_DEBUG_PRINT_EVERY) {
+        //     printf("[DMA] RX IRQ count=%lu last_delta_us=%llu\n",
+        //            (unsigned long)g_i2s_rx_dma_count,
+        //            (unsigned long long)(now_us - last_rx_dma_us));
+        //     g_i2s_rx_debug_print_count = 0;
+        // }
     }
 }
 
@@ -151,9 +160,9 @@ void i2s_core_init(void) {
     // 1. PIO Engine Configuration Setup
     audio_i2s_hardware_init(I2S_SAMPLE_RATE);
     tx_pio = i2s_get_tx_pio();
-    rx_pio = i2s_get_rx_pio();
+    rx_pio = i2s_get_tx_pio();
     tx_sm = i2s_get_tx_sm();
-    rx_sm = i2s_get_rx_sm();
+    rx_sm = i2s_get_tx_sm();
     printf("[I2S] PIO config: tx_pio=%p sm=%u rx_pio=%p sm=%u\n", (void *)tx_pio, tx_sm, (void *)rx_pio, rx_sm);
 
     // 2. Allocate DMA Channels
@@ -197,6 +206,7 @@ void i2s_core_init(void) {
     irq_set_exclusive_handler(DMA_IRQ_0, i2s_dma_irq_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 
+
     i2s_initialized = true;
     printf("[I2S] DMA/PIO initialization complete.\n");
 }
@@ -215,7 +225,12 @@ void i2s_core_start(void) {
 
     last_tx_dma_us = time_us_64();
     last_rx_dma_us = time_us_64();
+    
     dma_channel_start(dma_tx_chan);
+    dma_channel_start(dma_rx_chan);
+
+    dma_start_channel_mask((1u << dma_tx_chan) | (1u << dma_rx_chan));
+
     printf("[I2S] TX-only validation started; RX path disabled for isolated speaker test.\n");
 }
 

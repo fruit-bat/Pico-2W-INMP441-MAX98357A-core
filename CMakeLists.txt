@@ -21,7 +21,8 @@ pico_generate_pio_header(Pico-2W-INMP441-MAX98357A-core-test ${CMAKE_CURRENT_LIS
 
 # Link hardware libraries required for RP2350 DMA and low-level control
 target_link_libraries(Pico-2W-INMP441-MAX98357A-core-test 
-    pico_stdlib 
+    pico_stdlib
+    pico_multicore
     hardware_pio 
     hardware_dma 
     hardware_irq
