@@ -9,7 +9,7 @@
 
 #define MIC_LEVEL_PRINT_PERIOD_MS 100
 #define BAR_WIDTH 100
-#define TONE_AMPLITUDE (1<<28)
+#define TONE_AMPLITUDE (1<<30)
 #define TONE_STARTUP_STEPS 32
 
 enum test_mode {
@@ -54,6 +54,47 @@ float32_t* __not_in_flash_func(fft_mic_input_buffer)(float32_t* input_buffer) {
     arm_cmplx_mag_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE / 2);
     return &fft_magnitude_buffer[0];
 }
+
+void visualize_fft(float32_t *magnitude_buf) {
+    // 1. Send ANSI escape codes: Clear screen and reset cursor to top-left
+    // This stops the terminal from scrolling and keeps the graph stationary
+    printf("\033[2J\033[H");
+    
+    printf("=== RP2350 FFT SPECTRUM ANALYZER (44.1 kHz / 1024-pt) ===\n\n");
+
+    // We look at the first 128 bins (~0 Hz to 5.5 kHz) where audio is active.
+    // We group them by 4 to print 32 neat lines on the screen.
+    for (int i = 4; i < 128; i += 4) { // Start at bin 4 to ignore low-end DC noise
+        
+        // Average 4 adjacent bins together to make the display stable
+        float32_t avg_mag = (magnitude_buf[i] + magnitude_buf[i+1] + 
+                             magnitude_buf[i+2] + magnitude_buf[i+3]) / 4.0f;
+        
+        // Calculate the actual center frequency for this display line
+        int center_freq = (int)((i + 1.5f) * 43.066f);
+
+        // Convert the raw magnitude into a character width.
+        // The INMP441 is sensitive; you may need to tweak this '150.0f' multiplier
+        // up or down depending on how loud you are speaking!
+        int bar_length = (int)(avg_mag * 150.0f); 
+        
+        // Cap the bar length to fit comfortably in a standard 80-character terminal
+        if (bar_length > 55) bar_length = 55;
+        if (bar_length < 0)  bar_length = 0;
+
+        // Print the frequency label cleanly padded to 5 characters
+        printf("%5d Hz | ", center_freq);
+        
+        // Draw the amplitude bar
+        for (int b = 0; b < bar_length; b++) {
+            printf("#");
+        }
+        
+        printf("\n");
+    }
+}
+
+
 
 static void print_bar(float percent) {
     int count = (percent * BAR_WIDTH) / 100;
@@ -228,6 +269,7 @@ int main() {
                 printf("[MIC] Warning: Peak value exceeds 100%% (%3.2f) of full scale!\n", percent);
                 percent = 100.0f;
             }
+            visualize_fft(fft_magnitude_buffer);
             print_bar(percent);
             last_print_ms = now_ms;
         }
