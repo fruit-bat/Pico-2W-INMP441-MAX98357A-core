@@ -3,7 +3,9 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/multicore.h"
+#include "hardware/clocks.h"
 #include "i2s_core.h"
+#include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
 
 #define MIC_LEVEL_PRINT_PERIOD_MS 100
 #define BAR_WIDTH 100
@@ -26,6 +28,32 @@ static int32_t rx_dsp_buffer[I2S_BUFFER_SIZE];
 static volatile float mic_peak_value = 0;
 static float tone_phase = 0.0f;
 static uint32_t tone_step_index = 0;
+
+// Must be a supported power of 2 (32 to 4096)
+#define FFT_SIZE I2S_BUFFER_SIZE
+float32_t fft_output_buffer[FFT_SIZE];
+float32_t fft_magnitude_buffer[FFT_SIZE / 2];
+
+float32_t* __not_in_flash_func(fft_mic_input_buffer)(float32_t* input_buffer) {
+    // 1. Create and initialize the Real FFT instance
+    arm_rfft_fast_instance_f32 fft_instance;
+    arm_status status = arm_rfft_fast_init_1024_f32(&fft_instance);
+    
+    if (status != ARM_MATH_SUCCESS) {
+        // Initialization error handling (e.g., unsupported FFT size)
+        printf("Error initializing FFT: %d\n    ", status);
+        return &fft_magnitude_buffer[0]; // Return empty buffer on error
+    }
+
+    // 3. Execute the Forward FFT
+    // The last parameter '0' indicates a forward transform (1 would mean inverse)
+    arm_rfft_fast_f32(&fft_instance, input_buffer, fft_output_buffer, 0);
+
+    // 4. Calculate the frequency magnitudes 
+    // This processes the interleaved complex data into real amplitudes
+    arm_cmplx_mag_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE / 2);
+    return &fft_magnitude_buffer[0];
+}
 
 static void print_bar(float percent) {
     int count = (percent * BAR_WIDTH) / 100;
@@ -84,6 +112,7 @@ static void __not_in_flash_func(fill_tone_buffer)(int32_t *buffer, size_t size) 
 // Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
 void __not_in_flash_func(i2s_callback_rx_ready)(const float *buffer, size_t size) {
     update_mic_level_stats(buffer, size);
+    fft_mic_input_buffer((float32_t *)buffer);
 }
 
 // Interrupt Hook: Invoked automatically when the MAX98357A requests audio bytes
@@ -142,6 +171,10 @@ void core1_main() {
 }
 
 int main() {
+
+    // Set clock to 200 MHz (200,000 kHz)
+    set_sys_clock_khz(200000, true);
+
     stdio_init_all();
     sleep_ms(2000);
 
