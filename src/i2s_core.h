@@ -19,7 +19,7 @@ void i2s_core_stop(void);
 
 // Framework Loop Hooks for Chirp / DSP Integration
 // These are executed inside the ISR or high-priority thread context
-extern void i2s_callback_rx_ready(const int32_t *buffer, size_t size);
+extern void i2s_callback_rx_ready(const float *buffer, size_t size);
 extern void i2s_callback_tx_demanded(int32_t *buffer, size_t size);
 
 int32_t *get_tx_buffer(void);
