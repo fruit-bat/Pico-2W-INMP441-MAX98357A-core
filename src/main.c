@@ -144,9 +144,12 @@ void __not_in_flash_func(i2s_callback_tx_demanded)(int32_t *buffer, size_t size)
 
 float* __not_in_flash_func(rx_buffer_int32_to_float)(int32_t* int32_buf, uint32_t size) {
     static float float_buf[I2S_BUFFER_SIZE];   // Just re use the shared_dsp_buffer for float conversion to avoid dynamic allocation
-    for (uint32_t i = 0; i < size; ++i) {
-        float_buf[i] = ((float)(int32_buf[i])) / 2147483648.0f; // Convert to float in range [-1.0, 1.0]
-    }
+
+    // Blazing fast vector conversion using optimized CMSIS assembly loops
+    arm_q31_to_float((q31_t *)int32_buf, float_buf, size);
+    // for (uint32_t i = 0; i < size; ++i) {
+    //     float_buf[i] = ((float)(int32_buf[i])) / 2147483648.0f; // Convert to float in range [-1.0, 1.0]
+    // }
     return float_buf;
 }
 
