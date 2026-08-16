@@ -64,11 +64,11 @@ static void print_bar(float percent) {
     printf("|\n");
 }
 
-static void __not_in_flash_func(update_mic_level_stats)(const float *buffer, size_t size) {
+static void __not_in_flash_func(update_mic_level_stats)(const float *buffer) {
     float sum_sq = 0.0f;
     float peak = 0;
 
-    for (size_t i = 0; i < size; ++i) {
+    for (size_t i = 0; i < I2S_BUFFER_SIZE; ++i) {
         float sample = buffer[i];
         float mag = fabsf(sample);
         if (mag > peak) {
@@ -86,7 +86,7 @@ static void set_mode(enum test_mode mode) {
            mode == MODE_MIC_LEVEL ? "mic-level" : "tone-440");
 }
 
-static void __not_in_flash_func(fill_tone_buffer)(int32_t *buffer, size_t size) {
+static void __not_in_flash_func(fill_tone_buffer)(int32_t *buffer) {
     const float phase_step = (2.0f * (float)M_PI * 440.0f) / (float)I2S_SAMPLE_RATE;
     const float two_pi = 2.0f * (float)M_PI;
     float gain = 1.0f;
@@ -96,7 +96,7 @@ static void __not_in_flash_func(fill_tone_buffer)(int32_t *buffer, size_t size) 
         tone_step_index++;
     }
 
-    for (size_t i = 0; i < size; ++i) {
+    for (size_t i = 0; i < I2S_BUFFER_SIZE; ++i) {
         float sine = sinf(tone_phase);
         int32_t sample = (int32_t)(sine * (float)TONE_AMPLITUDE * gain);
         buffer[i] = sample;
@@ -110,13 +110,14 @@ static void __not_in_flash_func(fill_tone_buffer)(int32_t *buffer, size_t size) 
 
 
 // Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
-void __not_in_flash_func(i2s_callback_rx_ready)(const float *buffer, size_t size) {
-    update_mic_level_stats(buffer, size);
+void __not_in_flash_func(i2s_callback_rx_ready)(const float *buffer) {
+    update_mic_level_stats(buffer);
     fft_mic_input_buffer((float32_t *)buffer);
 }
 
 // Interrupt Hook: Invoked automatically when the MAX98357A requests audio bytes
-void __not_in_flash_func(i2s_callback_tx_demanded)(int32_t *buffer, size_t size) {
+void __not_in_flash_func(i2s_callback_tx_demanded)(int32_t *buffer) {
+    const size_t size = I2S_BUFFER_SIZE;
     switch (current_mode) {
         case MODE_LOOPBACK:
             if (loopback_enabled) {
@@ -137,19 +138,17 @@ void __not_in_flash_func(i2s_callback_tx_demanded)(int32_t *buffer, size_t size)
             break;
 
         case MODE_TONE_440:
-            fill_tone_buffer(buffer, size);
+            fill_tone_buffer(buffer);
             break;
     }
 }
 
-float* __not_in_flash_func(rx_buffer_int32_to_float)(int32_t* int32_buf, uint32_t size) {
+float* __not_in_flash_func(rx_buffer_int32_to_float)(int32_t* int32_buf) {
     static float float_buf[I2S_BUFFER_SIZE];   // Just re use the shared_dsp_buffer for float conversion to avoid dynamic allocation
 
     // Blazing fast vector conversion using optimized CMSIS assembly loops
-    arm_q31_to_float((q31_t *)int32_buf, float_buf, size);
-    // for (uint32_t i = 0; i < size; ++i) {
-    //     float_buf[i] = ((float)(int32_buf[i])) / 2147483648.0f; // Convert to float in range [-1.0, 1.0]
-    // }
+    arm_q31_to_float((q31_t *)int32_buf, float_buf, I2S_BUFFER_SIZE);
+
     return float_buf;
 }
 
@@ -163,12 +162,12 @@ void core1_main() {
 
         if (tx_buffer != t_tx_buffer) {
             tx_buffer = t_tx_buffer;
-            i2s_callback_tx_demanded(tx_buffer, I2S_BUFFER_SIZE);
+            i2s_callback_tx_demanded(tx_buffer);
         }
         if (rx_buffer != t_rx_buffer) {
             rx_buffer = t_rx_buffer;
-            float *float_buffer = rx_buffer_int32_to_float(rx_buffer, I2S_BUFFER_SIZE);
-            i2s_callback_rx_ready(float_buffer, I2S_BUFFER_SIZE);
+            float *float_buffer = rx_buffer_int32_to_float(rx_buffer);
+            i2s_callback_rx_ready(float_buffer);
         }
     }
 }
