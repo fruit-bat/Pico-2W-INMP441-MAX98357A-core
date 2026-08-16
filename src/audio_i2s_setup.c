@@ -54,7 +54,7 @@ void audio_i2s_hardware_init(uint32_t sample_rate) {
 
     // Calculate precise Audio Clock Division for the speaker master clock.
     uint32_t sys_clk = clock_get_hz(clk_sys);
-    float clk_div = (float)sys_clk / (float)(sample_rate * 32 * 2 * 2);
+    float clk_div = (float)sys_clk / (float)(sample_rate * 32 * 2 * 4);
     printf("[I2S] sys_clk=%lu clk_div=%.4f\n", (unsigned long)sys_clk, clk_div);
 
     sm_config_set_clkdiv(&c_tx, clk_div);

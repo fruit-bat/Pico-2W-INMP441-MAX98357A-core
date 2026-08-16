@@ -9,7 +9,7 @@
 
 #define MIC_LEVEL_PRINT_PERIOD_MS 100
 #define BAR_WIDTH 100
-#define TONE_AMPLITUDE 100000000
+#define TONE_AMPLITUDE (1<<28)
 #define TONE_STARTUP_STEPS 32
 
 enum test_mode {

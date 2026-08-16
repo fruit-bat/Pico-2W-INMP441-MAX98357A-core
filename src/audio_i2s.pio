@@ -1,5 +1,6 @@
 ; =====================================================================
-; I2S TX program.
+; I2S TX/RX program.
+; GPIO11 = SD (data input)
 ; GPIO13 = BCLK (side-set bit 0)
 ; GPIO14 = WS   (side-set bit 1)
 ; GPIO12 = DIN
@@ -8,102 +9,6 @@
 ; The side-set value is encoded as [BCLK, WS], so 0b00 = low/low,
 ; 0b01 = high/low, 0b10 = low/high, 0b11 = high/high.
 ; =====================================================================
-;.program audio_i2s_tx
-;.side_set 2 opt
-;
-;public entry_point:
-;    set x, 31           side 0b00      ; left sample starts with WS low
-;left_loop:
-;    out pins, 1         side 0b01      ; bit to DIN, BCLK high, WS low
-;    jmp x-- left_loop   side 0b00      ; BCLK low, WS low
-;
-;    set x, 31           side 0b10      ; right sample starts with WS high
-;right_loop:
-;    out pins, 1         side 0b11      ; bit to DIN, BCLK high, WS high
-;    jmp x-- right_loop  side 0b10      ; BCLK low, WS high
-;
-;    jmp entry_point     side 0b00      ; restart frame with WS low
-
-
-;.program audio_i2s_tx
-;.side_set 2 opt
-;public entry_point:
-;    set x, 0            side 0x00
-;.wrap_target
-;frameL:
-;    set y, 30         side 0b00 ; start of Left frame
-;    pull noblock      side 0b01 ; One clock after edge change with no data
-;dataL:
-;    out pins, 1       side 0b00
-;    jmp y-- dataL     side 0b01
-;
-;frameR:
-;    set y, 30         side 0b10
-;    pull noblock      side 0b11 ; One clock after edge change with no data
-;dataR:
-;    out pins, 1       side 0b10
-;    jmp y-- dataR     side 0b11
-
-;
-;.program audio_i2s_tx
-;.side_set 2 opt
-;
-;public entry_point:
-;
-;    set x, 0            side 0x00
-;.wrap_target
-;                    ;        /--- LRCLK
-;                    ;        |/-- BCLK
-;frameL:             ;        ||
-;    set y, 30         side 0b00 [1] ; start of Left frame
-;    pull noblock      side 0b01 
-;    push noblock      side 0x01
-;dataL:
-;    in pins, 1        side 0b00 ; sample on falling edge
-;    out pins, 1       side 0b00
-;    jmp y-- dataL     side 0b01 [1]
-;frameR:
-;    set y, 30         side 0b10 [1]
-;    pull noblock      side 0b11
-;    push noblock      side 0b11
-;dataR:
-;    in pins, 1        side 0b10
-;    out pins, 1       side 0b10
-;    jmp y-- dataR     side 0b11 [1]
-
-;.program audio_i2s_tx
-;.side_set 2 opt
-;
-;public entry_point:
-;.wrap_target
-;    set y, 30           side 0b10    ; LRCLK=1 (Right), BCLK=0 | Prep 31 loop iterations
-;
-;    ; --- LEFT CHANNEL (LRCLK = 0) ---
-;    ; Bit 31 (MSB): Output on falling BCLK edge while LRCLK drops to 0 (I2S 1-clock delay)
-;    out pins, 1         side 0b00    ; LRCLK=0, BCLK=0
-;    in pins, 1          side 0b01    ; LRCLK=0, BCLK=1 | Sample RX on rising edge;
-;
-;left_loop:
-;    out pins, 1         side 0b00    ; LRCLK=0, BCLK=0 | Bits 30..0 OUT
-;    in pins, 1          side 0b01    ;
-;    jmp y-- left_loop   side 0b01    ; LRCLK=0, BCLK=1 | Bits 30..0 IN
-;
-;    set y, 30           side 0b00    ; LRCLK=0 (Left), BCLK=0 | Prep 31 loop iterations
-;
-;    ; --- RIGHT CHANNEL (LRCLK = 1) ---
-;    ; Bit 31 (MSB): Output on falling BCLK edge while LRCLK rises to 1
-;    out pins, 1         side 0b10    ; LRCLK=1, BCLK=0
-;    in pins, 1          side 0b11    ; LRCLK=1, BCLK=1 | Sample RX on rising edge
-;
-;right_loop:
-;    out pins, 1         side 0b10    ; LRCLK=1, BCLK=0 | Bits 30..0 OUT
-;    in pins, 1          side 0b11    ;
-;    jmp y-- right_loop  side 0b11    ; LRCLK=1, BCLK=1 | Bits 30..0 IN
-;.wrap
-
-
-
-; MAKE A SOUND
 .program audio_i2s_tx
 .side_set 2 opt
 
@@ -124,40 +29,9 @@ dataL:
     in pins, 1        side 0b11     ; sample on rising edge
     set y, 30         side 0b11 
 dataR:
-    out pins, 1       side 0b10 [1] ; change on falling edge
-    in pins, 1        side 0b11     ; sample on rising edge
+    nop               side 0b10 [1] ; change on falling edge
+    nop               side 0b11     ; sample on rising edge
     jmp y-- dataR     side 0b11 
-    out pins, 1       side 0b00 [1] ; change on falling edge
-    in pins, 1        side 0b01     ; sample on rising edge
+    nop               side 0b00 [1] ; change on falling edge
+    nop               side 0b01     ; sample on rising edge
     set y, 30         side 0b01
-
-
-; =====================================================================
-; Minimal mono I2S RX program
-; - GPIO11 = SD (data input)
-; - GPIO13 = BCLK
-; - GPIO14 = WS
-; We sample the mic on the BCLK rising edge and shift bits into the RX FIFO.
-; =====================================================================
-.program audio_i2s_rx
-
-public entry_point:
-    wait 0 pin, 14           ; wait for WS low (left word begins)
-    set x, 31                ; 32-bit left sample
-left_sample:
-    wait 1 pin, 13           ; wait for BCLK rising edge
-    in pins, 1               ; sample one bit from GPIO11
-    wait 0 pin, 13           ; wait for BCLK falling edge
-    jmp x-- left_sample      ; continue until left word complete
-
-    wait 1 pin, 14           ; wait for WS high (right word begins)
-    set x, 31                ; 32-bit right sample
-right_sample:
-    wait 1 pin, 13           ; wait for BCLK rising edge
-    in pins, 1               ; sample one bit from GPIO11
-    wait 0 pin, 13           ; wait for BCLK falling edge
-    jmp x-- right_sample     ; continue until right word complete
-
-    jmp entry_point          ; repeat frame
-
-
