@@ -157,14 +157,14 @@ void visualize_fft(float32_t *magnitude_buf) {
 
     // We look at the first 128 bins (~0 Hz to 5.5 kHz) where audio is active.
     // We group them by 4 to print 32 neat lines on the screen.
-    for (int i = 4; i < 128; i += 4) { // Start at bin 4 to ignore low-end DC noise
+    for (int i = 4; i < 128 + (4 * 8); i += 4) { // Start at bin 4 to ignore low-end DC noise
         
         // Average 4 adjacent bins together to make the display stable
         float32_t avg_mag = (magnitude_buf[i] + magnitude_buf[i+1] + 
                              magnitude_buf[i+2] + magnitude_buf[i+3]) / 4.0f;
         
         // Calculate the actual center frequency for this display line
-        int center_freq = (int)((i + 1.5f) * 43.066f);
+        int center_freq = (int)((i + 1.5f) * FS / (float32_t)FFT_SIZE);
 
         // Convert the raw magnitude into a character width.
         // The INMP441 is sensitive; you may need to tweak this '150.0f' multiplier
