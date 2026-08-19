@@ -16,6 +16,17 @@ const float32_t F1 = 14000.0f;          // 14 kHz boundary
 const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
+const float32_t chirp_vol = 0.1f;
+
+// DYNAMIC DERIVATION OF SYMBOL SPACE:
+// 1. Calculate how many physical FFT bins fit into the chosen acoustic bandwidth
+const uint32_t BINS_IN_BANDWIDTH = (uint32_t)((BW * (float32_t)I2S_BUFFER_SIZE) / FS);
+
+// 2. Derive the maximum safe data symbols by finding the next lowest power of 2.
+// This prevents over-the-air signals from bleeding outside your 2kHz-14kHz window.
+const uint32_t MAX_SYMBOLS = (BINS_IN_BANDWIDTH >= 256) ? 256 :
+                             (BINS_IN_BANDWIDTH >= 128) ? 128 :
+                             (BINS_IN_BANDWIDTH >= 64)  ? 64  : 32;
 
 /**
  * Generates an acoustic chirp symbol with a cyclic frequency shift.
@@ -25,9 +36,10 @@ void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
 
     static float32_t global_tx_phase = 0.0f;
     
-    // Calculate how many samples we are shifting by based on the symbol value
-    // In a pure LoRa system, symbol_val ranges from 0 to (BUFFER_SIZE - 1)
-    float32_t sample_shift = (float32_t)symbol_val;
+    // ADJUSTMENT: Map our symbol index (0...MAX_SYMBOLS - 1) onto the sample shift timeline.
+    // Instead of shifting sample-by-sample, we shift by chunks so that each symbol 
+    // lands cleanly on a discrete, readable FFT bin center at the receiver.
+    float32_t sample_shift = ((float32_t)symbol_val / (float32_t)MAX_SYMBOLS) * (float32_t)I2S_BUFFER_SIZE;
 
     for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
         // 1. Determine our position in the unshifted timeline (0 to BUFFER_SIZE - 1)
@@ -62,7 +74,7 @@ void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
         // 7. Generate the clean, glitch-free sine sample
         float32_t float_sample = sinf(global_tx_phase);
 
-        tx_audio_buffer[n] = float_sample;
+        tx_audio_buffer[n] = float_sample * chirp_vol;
     }
 }
 
@@ -82,6 +94,7 @@ enum test_mode {
     MODE_LOOPBACK = 0,
     MODE_MIC_LEVEL = 1,
     MODE_TONE_440 = 2,
+    MODE_TONE_CHIRP = 3,
 };
 
 extern volatile uint32_t g_i2s_tx_dma_count;
@@ -95,29 +108,43 @@ static volatile float mic_peak_value = 0;
 static float tone_phase = 0.0f;
 static uint32_t tone_step_index = 0;
 
-// Must be a supported power of 2 (32 to 4096)
+// Currently must be 1024
 #define FFT_SIZE I2S_BUFFER_SIZE
-float32_t fft_output_buffer[FFT_SIZE];
-float32_t fft_magnitude_buffer[FFT_SIZE / 2];
 
-float32_t* __not_in_flash_func(fft_mic_input_buffer)(float32_t* input_buffer) {
-    // 1. Create and initialize the Real FFT instance
-    arm_rfft_fast_instance_f32 fft_instance;
+// 2. Output buffer must be the same size as input for CMSIS-DSP's packed format
+float32_t fft_output_buffer[FFT_SIZE];
+
+// 3. Magnitude buffer needs 513 elements to capture DC through Nyquist
+float32_t fft_magnitude_buffer[(FFT_SIZE / 2) + 1]; 
+
+
+// 1. Initialize the instance GLOBALLY once at startup, NOT inside the function
+static arm_rfft_fast_instance_f32 fft_instance;
+
+void init_audio_system(void) {
     arm_status status = arm_rfft_fast_init_1024_f32(&fft_instance);
-    
+
     if (status != ARM_MATH_SUCCESS) {
         // Initialization error handling (e.g., unsupported FFT size)
         printf("Error initializing FFT: %d\n    ", status);
-        return &fft_magnitude_buffer[0]; // Return empty buffer on error
     }
+}
 
-    // 3. Execute the Forward FFT
-    // The last parameter '0' indicates a forward transform (1 would mean inverse)
+float32_t* __not_in_flash_func(fft_mic_input_buffer)(float32_t* input_buffer) {
+    // 2. Execute the Forward FFT
     arm_rfft_fast_f32(&fft_instance, input_buffer, fft_output_buffer, 0);
 
-    // 4. Calculate the frequency magnitudes 
-    // This processes the interleaved complex data into real amplitudes
-    arm_cmplx_mag_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE / 2);
+    // 3. Handle DC and Nyquist separately due to CMSIS-DSP packed layout
+    // Use absolute value since they have no imaginary parts
+    fft_magnitude_buffer[0] = fabsf(fft_output_buffer[0]);   // DC Bin (0 Hz)
+    fft_magnitude_buffer[512] = fabsf(fft_output_buffer[1]); // Nyquist Bin (Fs/2)
+
+    // 4. Calculate magnitudes for bins 1 to 511
+    // We pass 'fft_output_buffer + 2' to skip DC/Nyquist
+    // We pass 'fft_magnitude_buffer + 1' to align the output
+    // The number of complex pairs remaining is 511
+    arm_cmplx_mag_f32(fft_output_buffer + 2, fft_magnitude_buffer + 1, 511);
+
     return &fft_magnitude_buffer[0];
 }
 
@@ -145,7 +172,7 @@ void visualize_fft(float32_t *magnitude_buf) {
         int bar_length = (int)(avg_mag * 150.0f); 
         
         // Cap the bar length to fit comfortably in a standard 80-character terminal
-        if (bar_length > 55) bar_length = 55;
+        if (bar_length > 80) bar_length = 80;
         if (bar_length < 0)  bar_length = 0;
 
         // Print the frequency label cleanly padded to 5 characters
@@ -241,6 +268,10 @@ void __not_in_flash_func(i2s_callback_tx_demanded)(float *buffer) {
         case MODE_TONE_440:
             fill_tone_buffer(buffer);
             break;
+
+        case MODE_TONE_CHIRP:
+            generate_modulated_chirp(buffer, 0);
+            break;
     }
 }
 
@@ -248,6 +279,8 @@ void core1_main() {
     static float float_buf[I2S_BUFFER_SIZE];
     static int32_t *tx_buffer = NULL;
     static int32_t *rx_buffer = NULL;
+
+    init_audio_system(); // Initialize the FFT instance once at startup
 
     while(1) {
         int32_t *t_tx_buffer = get_tx_buffer();
@@ -283,6 +316,7 @@ int main() {
     printf("  1 = loopback test\n");
     printf("  2 = mic level meter\n");
     printf("  3 = 440Hz sine tone\n");
+    printf("  4 = chirp tone\n");
     printf("[CORE] Initializing DMA and PIO peripherals...\n");
     printf("[CORE] Tone output uses a 440Hz sine wave with soft startup ramp.\n");
 
@@ -310,6 +344,10 @@ int main() {
                     break;
                 case '3':
                     set_mode(MODE_TONE_440);
+                    tone_step_index = 0;
+                    break;
+                case '4':
+                    set_mode(MODE_TONE_CHIRP);
                     tone_step_index = 0;
                     break;
                 default:
