@@ -7,6 +7,72 @@
 #include "i2s_core.h"
 #include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
 
+
+
+
+const float32_t FS = I2S_SAMPLE_RATE;
+const float32_t F0 = 2000.0f;           // 2 kHz boundary
+const float32_t F1 = 14000.0f;          // 14 kHz boundary
+const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
+const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
+const float32_t chirp_rate = BW / T;
+
+/**
+ * Generates an acoustic chirp symbol with a cyclic frequency shift.
+ * @param symbol_val: The data value to send (must be between 0 and BUFFER_SIZE - 1)
+ */
+void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
+
+    static float32_t global_tx_phase = 0.0f;
+    
+    // Calculate how many samples we are shifting by based on the symbol value
+    // In a pure LoRa system, symbol_val ranges from 0 to (BUFFER_SIZE - 1)
+    float32_t sample_shift = (float32_t)symbol_val;
+
+    for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
+        // 1. Determine our position in the unshifted timeline (0 to BUFFER_SIZE - 1)
+        float32_t unshifted_sample_idx = (float32_t)n;
+
+        // 2. Apply the cyclic symbol shift and wrap it within the symbol block
+        float32_t shifted_sample_idx = unshifted_sample_idx + sample_shift;
+        if (shifted_sample_idx >= (float32_t)I2S_BUFFER_SIZE) {
+            shifted_sample_idx -= (float32_t)I2S_BUFFER_SIZE;
+        }
+
+        // 3. Calculate target instantaneous frequency at this specific shifted index
+        // f_inst = F0 + (chirp_rate * t)
+        float32_t t_shifted = shifted_sample_idx / FS;
+        float32_t f_inst = F0 + (chirp_rate * t_shifted);
+
+        // 4. Convert instantaneous frequency to a phase increment for this single sample
+        // phase_delta = 2 * pi * f / fs
+        float32_t phase_delta = (2.0f * M_PI * f_inst) / FS;
+
+        // 5. Accumulate into our global transmitter phase
+        global_tx_phase += phase_delta;
+
+        // 6. Keep the accumulator bounded between -pi and +pi to maintain float32 precision
+        if (global_tx_phase > M_PI) {
+            global_tx_phase -= (2.0f * M_PI);
+        } 
+        else if (global_tx_phase < -M_PI) {
+            global_tx_phase += (2.0f * M_PI);
+        }
+
+        // 7. Generate the clean, glitch-free sine sample
+        float32_t float_sample = sinf(global_tx_phase);
+
+        tx_audio_buffer[n] = float_sample;
+    }
+}
+
+
+
+
+
+
+
+
 #define MIC_LEVEL_PRINT_PERIOD_MS 100
 #define BAR_WIDTH 100
 #define TONE_AMPLITUDE (1<<30)
