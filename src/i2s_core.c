@@ -14,8 +14,6 @@ static volatile uint64_t last_tx_dma_us = 0;
 static volatile uint64_t last_rx_dma_us = 0;
 volatile uint32_t g_i2s_tx_dma_count = 0;
 volatile uint32_t g_i2s_rx_dma_count = 0;
-static volatile uint32_t g_i2s_tx_debug_print_count = 0;
-static volatile uint32_t g_i2s_rx_debug_print_count = 0;
 
 static void i2s_debug_led_stall(const char *channel_name, uint64_t now_us, volatile uint64_t *last_us) {
     uint64_t delta_us = now_us - *last_us;
@@ -72,31 +70,13 @@ static void __not_in_flash_func(i2s_dma_irq_handler)() {
         dma_hw->ints0 = (1u << dma_tx_chan); // Clear interrupt flag
 
         g_i2s_tx_dma_count++;
-        g_i2s_tx_debug_print_count++;
 
-        // if (last_tx_dma_us != 0) {
-        //     i2s_debug_led_stall("TX", now_us, &last_tx_dma_us);
-        // }
         last_tx_dma_us = now_us;
 
-        // Compute the next buffer to fill and arm, then fill it before the DMA reuses it.
-        uint32_t next_tx_index = 1 - tx_buf_idx;
-        int32_t *next_tx_buffer = tx_buffers[next_tx_index];
-
-
         dma_channel_set_transfer_count(dma_tx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
-        dma_channel_set_read_addr(dma_tx_chan, next_tx_buffer, true);
+        dma_channel_set_read_addr(dma_tx_chan, tx_buffers[tx_buf_idx], true);
 
-        // Fill the next buffer that will become active after the current transfer completes.
-        //i2s_callback_tx_demanded(tx_buffers[tx_buf_idx], I2S_BUFFER_SIZE);
-        tx_buf_idx = next_tx_index;
-
-        // if (g_i2s_tx_debug_print_count >= I2S_DEBUG_PRINT_EVERY) {
-        //     printf("[DMA] TX IRQ count=%lu last_delta_us=%llu\n",
-        //            (unsigned long)g_i2s_tx_dma_count,
-        //            (unsigned long long)(now_us - last_tx_dma_us));
-        //     g_i2s_tx_debug_print_count = 0;
-        // }
+        tx_buf_idx = 1 - tx_buf_idx;
     }
 
     // Check RX DMA Channel Interrupt
@@ -104,32 +84,13 @@ static void __not_in_flash_func(i2s_dma_irq_handler)() {
         dma_hw->ints0 = (1u << dma_rx_chan); // Clear interrupt flag
 
         g_i2s_rx_dma_count++;
-        g_i2s_rx_debug_print_count++;
 
-        // if (last_rx_dma_us != 0) {
-        //     i2s_debug_led_stall("RX", now_us, &last_rx_dma_us);
-        // }
         last_rx_dma_us = now_us;
 
-        // RX uses the previous buffer as the data-ready chunk and the opposite buffer as the next write target.
-        uint32_t ready_rx_index = rx_buf_idx;
-        uint32_t next_rx_index = 1 - rx_buf_idx;
-        int32_t *ready_rx_buffer = rx_buffers[ready_rx_index];
-        int32_t *next_rx_buffer = rx_buffers[next_rx_index];
-
-        //i2s_callback_rx_ready(ready_rx_buffer, I2S_BUFFER_SIZE);
-
         dma_channel_set_transfer_count(dma_rx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
-        dma_channel_set_write_addr(dma_rx_chan, next_rx_buffer, true);
+        dma_channel_set_write_addr(dma_rx_chan, rx_buffers[rx_buf_idx], true);
 
-        rx_buf_idx = next_rx_index;
-
-        // if (g_i2s_rx_debug_print_count >= I2S_DEBUG_PRINT_EVERY) {
-        //     printf("[DMA] RX IRQ count=%lu last_delta_us=%llu\n",
-        //            (unsigned long)g_i2s_rx_dma_count,
-        //            (unsigned long long)(now_us - last_rx_dma_us));
-        //     g_i2s_rx_debug_print_count = 0;
-        // }
+        rx_buf_idx = 1 - rx_buf_idx;
     }
 }
 
@@ -148,8 +109,6 @@ void i2s_core_init(void) {
     last_rx_dma_us = 0;
     g_i2s_tx_dma_count = 0;
     g_i2s_rx_dma_count = 0;
-    g_i2s_tx_debug_print_count = 0;
-    g_i2s_rx_debug_print_count = 0;
 
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
