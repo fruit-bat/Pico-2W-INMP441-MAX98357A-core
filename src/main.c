@@ -269,6 +269,8 @@ void __not_in_flash_func(i2s_callback_rx_ready)(const float *buffer) {
     fft_mic_input_buffer((float32_t *)buffer);
 }
 
+static uint32_t symbol_index = 0; // Current symbol index for chirp modulation
+
 // Interrupt Hook: Invoked automatically when the MAX98357A requests audio bytes
 void __not_in_flash_func(i2s_callback_tx_demanded)(float *buffer) {
     const size_t size = I2S_BUFFER_SIZE;
@@ -291,7 +293,7 @@ void __not_in_flash_func(i2s_callback_tx_demanded)(float *buffer) {
             break;
 
         case MODE_TONE_CHIRP:
-            generate_modulated_chirp(buffer, 0);
+            generate_modulated_chirp(buffer, symbol_index);
             break;
     }
 }
@@ -370,6 +372,14 @@ int main() {
                 case '4':
                     set_mode(MODE_TONE_CHIRP);
                     tone_step_index = 0;
+                    break;
+                case 'n':
+                    symbol_index = (symbol_index + 1) % MAX_SYMBOLS;
+                    printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
+                    break;
+                case 'p':
+                    symbol_index = (symbol_index == 0) ? (MAX_SYMBOLS - 1) : (symbol_index - 1);
+                    printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
                     break;
                 default:
                     break;
