@@ -12,8 +12,8 @@
 
 
 const float32_t FS = I2S_SAMPLE_RATE;
-const float32_t F0 = 2000.0f;           // 2 kHz boundary
-const float32_t F1 = 7000.0f;           // 7 kHz boundary
+const float32_t F0 = 1000.0f;           // 2 kHz boundary
+const float32_t F1 = 6000.0f;           // 7 kHz boundary
 const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
@@ -40,7 +40,8 @@ void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
     // ADJUSTMENT: Map our symbol index (0...MAX_SYMBOLS - 1) onto the sample shift timeline.
     // Instead of shifting sample-by-sample, we shift by chunks so that each symbol 
     // lands cleanly on a discrete, readable FFT bin center at the receiver.
-    float32_t sample_shift = ((float32_t)symbol_val / (float32_t)MAX_SYMBOLS) * (float32_t)I2S_BUFFER_SIZE;
+//    float32_t sample_shift = ((float32_t)symbol_val / (float32_t)MAX_SYMBOLS) * (float32_t)I2S_BUFFER_SIZE;
+    float32_t sample_shift = (float32_t)symbol_val * (float32_t)FS / (float32_t)BW;
 
     for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
         // 1. Determine our position in the unshifted timeline (0 to BUFFER_SIZE - 1)
@@ -109,6 +110,12 @@ static volatile float mic_peak_value = 0;
 static float tone_phase = 0.0f;
 static uint32_t tone_step_index = 0;
 
+// So we can phase align with the input signal
+static volatile uint32_t rx_sample_delay = 0;
+// A couple of mic buffers so we can phase shift
+static float rx_float_buf[2][I2S_BUFFER_SIZE];
+static uint32_t rx_float_buf_idx = 0;
+
 // Currently must be 1024
 #define FFT_SIZE I2S_BUFFER_SIZE
 
@@ -124,7 +131,7 @@ void generate_complex_dechirp_vector() {
     const float32_t f_max = F1;
     const float32_t T = (float32_t)FFT_SIZE / sample_rate;
     
-    for (int n = 0; n < 1024; n++) {
+    for (uint32_t n = 0; n < FFT_SIZE; n++) {
         float32_t t = (float32_t)n / sample_rate;
         // The standard Up-Chirp phase equation
         float32_t phase = 2.0f * PI * (f_min * t + 0.5f * ((f_max - f_min) / T) * t * t);
@@ -142,14 +149,20 @@ void init_audio_system(void) {
     generate_complex_dechirp_vector();
 }
 
-float32_t* __not_in_flash_func(fft_mic_input_buffer)(float32_t* raw_mic_buffer) {
+float32_t* __not_in_flash_func(fft_mic_input_buffer)() {
 
     static float32_t complex_input_buffer[FFT_SIZE * 2]; // Interleaved complex input: [Real, Imag, Real, Imag...]    
 
     // 1. Stage real mic data into the complex array layout
-    for (int i = 0; i < FFT_SIZE; i++) {
-        complex_input_buffer[2 * i]     = raw_mic_buffer[i]; // Real part
-        complex_input_buffer[2 * i + 1] = 0.0f;              // Imaginary part
+    for (uint32_t i = 0; i < FFT_SIZE; i++) {
+
+        uint32_t rxb_idx = (rx_float_buf_idx + (rx_sample_delay > i ? 1 : 0)) % 2;
+        uint32_t rxs_idx = (FFT_SIZE - rx_sample_delay + i) % FFT_SIZE;
+
+        float32_t rx_sample = rx_float_buf[rxb_idx][rxs_idx];
+
+        complex_input_buffer[2 * i]     = rx_sample; // Real part
+        complex_input_buffer[2 * i + 1] = 0.0f;      // Imaginary part
     }
 
     // 2. Complex Element-wise Multiplication (De-chirp)
@@ -176,7 +189,7 @@ void visualize_fft(float32_t *magnitude_buf) {
     
     printf("=== RP2350 FFT SPECTRUM ANALYZER (44.1 kHz / 1024-pt) ===\n\n");
 
-    for (int i = 0; i < 40; i += 1) { 
+    for (int i = 0; i < 50; i += 1) { 
         
         // Average 4 adjacent bins together to make the display stable
         float32_t avg_mag = magnitude_buf[i];
@@ -261,9 +274,9 @@ static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
 
 
 // Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
-void __not_in_flash_func(i2s_callback_rx_ready)(const float *buffer) {
-    update_mic_level_stats(buffer);
-    fft_mic_input_buffer((float32_t *)buffer);
+void __not_in_flash_func(i2s_callback_rx_ready)() {
+    //update_mic_level_stats(buffer);
+    fft_mic_input_buffer();
 }
 
 static uint32_t symbol_index = 0; // Current symbol index for chirp modulation
@@ -295,10 +308,11 @@ void __not_in_flash_func(i2s_callback_tx_demanded)(float *buffer) {
     }
 }
 
+
 void core1_main() {
-    static float float_buf[I2S_BUFFER_SIZE];
     static int32_t *tx_buffer = NULL;
     static int32_t *rx_buffer = NULL;
+    static float float_buf[I2S_BUFFER_SIZE];
 
     init_audio_system(); // Initialize the FFT instance once at startup
 
@@ -315,9 +329,14 @@ void core1_main() {
         int32_t *t_rx_buffer = get_rx_buffer();
 
         if (rx_buffer != t_rx_buffer) {
+            rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
             // fast vector conversion using optimized CMSIS assembly loops
-            arm_q31_to_float((q31_t *)t_rx_buffer, (float32_t *)float_buf, I2S_BUFFER_SIZE);
-            i2s_callback_rx_ready(float_buf);
+            arm_q31_to_float(
+                (q31_t *)t_rx_buffer, 
+                (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
+                I2S_BUFFER_SIZE);
+
+            i2s_callback_rx_ready();
             rx_buffer = t_rx_buffer;
         }
     }
@@ -372,11 +391,17 @@ int main() {
                     break;
                 case 'n':
                     symbol_index = (symbol_index + 1) % MAX_SYMBOLS;
-                    printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
+                    //printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
                     break;
                 case 'p':
                     symbol_index = (symbol_index == 0) ? (MAX_SYMBOLS - 1) : (symbol_index - 1);
                     printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
+                    break;
+                case 'z':
+                    rx_sample_delay = rx_sample_delay > 0 ? rx_sample_delay - 1 : FFT_SIZE;
+                    break;
+                case 'x':
+                    rx_sample_delay = rx_sample_delay < (FFT_SIZE - 1) ? rx_sample_delay + 1 : 0;
                     break;
                 default:
                     break;
@@ -394,11 +419,14 @@ int main() {
             }
             visualize_fft(fft_magnitude_buffer);
             //print_bar(percent);
-            printf("Symbol %lu\n", symbol_index);
+            printf("Symbol %3lu RX delay %4ld       \n", 
+                symbol_index, 
+                rx_sample_delay
+            );
 
             last_print_ms = now_ms;
         }
-
+/*
         if (now_ms - last_status_ms >= 1000U) {
             const char *mode_name = (current_mode == MODE_LOOPBACK) ? "loopback" :
                                     (current_mode == MODE_MIC_LEVEL) ? "mic-level" : "tone-440";
@@ -409,7 +437,7 @@ int main() {
                    (unsigned long)g_i2s_rx_dma_count);
             last_status_ms = now_ms;
         }
-
+*/
         tight_loop_contents();
     }
 
