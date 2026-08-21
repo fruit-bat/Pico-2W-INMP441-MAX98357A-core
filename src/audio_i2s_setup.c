@@ -21,70 +21,46 @@ uint i2s_get_tx_sm(void) { return sm_tx; }
 uint i2s_get_rx_sm(void) { return sm_rx; }
 
 void audio_i2s_hardware_init(uint32_t sample_rate) {
-    printf("[I2S] Loading PIO programs for TX/RX at %lu Hz...\n", (unsigned long)sample_rate);
+    printf("[I2S] Loading TX PIO program for speaker-only validation at %lu Hz...\n", (unsigned long)sample_rate);
 
-    // 1. Load the compiled PIO programs into their respective blocks
+    // Speaker validation path: keep the mic RX side disabled so we can confirm the MAX98357A gets a valid TX I2S stream.
     uint offset_tx = pio_add_program(pio_tx, &audio_i2s_tx_program);
-    uint offset_rx = pio_add_program(pio_rx, &audio_i2s_rx_program);
 
-    // Claim available hardware state machines
     sm_tx = pio_claim_unused_sm(pio_tx, true);
-    sm_rx = pio_claim_unused_sm(pio_rx, true);
-    printf("[I2S] Assigned state machines: TX SM=%u on pio0, RX SM=%u on pio1\n", sm_tx, sm_rx);
+    printf("[I2S] Assigned TX state machine: SM=%u on pio0\n", sm_tx);
 
-    // 2. Configure PIO0 (TX / Speaker Master Engine)
+    // Configure PIO0 (TX / Speaker Master Engine)
     pio_sm_config c_tx = audio_i2s_tx_program_get_default_config(offset_tx);
 
     // Assign pin behaviors for TX
     sm_config_set_out_pins(&c_tx, I2S_DIN_OUT, 1);
+    sm_config_set_in_pins(&c_tx, I2S_SD_IN);
     sm_config_set_sideset_pins(&c_tx, I2S_BCLK_PIN); // BCLK is pin 0, WS is pin 1 of side-set
 
     // Configure Serializer Out shift register: MSB-first, Autopull enabled, Threshold = 32 bits
     sm_config_set_out_shift(&c_tx, false, true, 32);
+    sm_config_set_in_shift(&c_tx, false, true, 32);
 
     // Force specific GPIOs into PIO functional mode
     pio_gpio_init(pio_tx, I2S_DIN_OUT);
     pio_gpio_init(pio_tx, I2S_BCLK_PIN);
     pio_gpio_init(pio_tx, I2S_WS_PIN);
+    pio_gpio_init(pio_tx, I2S_SD_IN);
 
     // Set clock directions: PIO pins are driven outputting clocks
     pio_sm_set_consecutive_pindirs(pio_tx, sm_tx, I2S_DIN_OUT, 1, true);
     pio_sm_set_consecutive_pindirs(pio_tx, sm_tx, I2S_BCLK_PIN, 2, true);
+    pio_sm_set_consecutive_pindirs(pio_rx, sm_tx, I2S_SD_IN, 1, false);
 
-    // 3. Configure PIO1 (RX / Microphone Slave Engine)
-    pio_sm_config c_rx = audio_i2s_rx_program_get_default_config(offset_rx);
-
-    // Assign pin behaviors for RX: sample the microphone data pin, and use BCLK/WS as explicit wait pins
-    sm_config_set_in_pins(&c_rx, I2S_SD_IN);
-    sm_config_set_jmp_pin(&c_rx, I2S_WS_PIN);
-
-    // Configure Serializer In shift register: MSB-first, Autopush enabled, Threshold = 32 bits
-    sm_config_set_in_shift(&c_rx, false, true, 32);
-
-    // Set the data input pin to PIO mode
-    pio_gpio_init(pio_rx, I2S_SD_IN);
-
-    // Set clock slave pin directions: Input modes only
-    pio_sm_set_consecutive_pindirs(pio_rx, sm_rx, I2S_BCLK_PIN, 2, false);
-    pio_sm_set_consecutive_pindirs(pio_rx, sm_rx, I2S_SD_IN, 1, false);
-
-    // 4. Calculate precise Audio Clock Division
-    // System clock divided by (Sample Rate * 32 bits * 2 channels * 2 clock transitions per state)
+    // Calculate precise Audio Clock Division for the speaker master clock.
     uint32_t sys_clk = clock_get_hz(clk_sys);
-    float clk_div = (float)sys_clk / (float)(sample_rate * 32 * 2 * 2);
+    float clk_div = (float)sys_clk / (float)(sample_rate * 32 * 2 * 4);
     printf("[I2S] sys_clk=%lu clk_div=%.4f\n", (unsigned long)sys_clk, clk_div);
 
     sm_config_set_clkdiv(&c_tx, clk_div);
-    sm_config_set_clkdiv(&c_rx, 1.0f); // RX runs at full raw speed sampling inputs
 
-    // 5. Initialize and Synchronize execution
+    // Initialize and start the TX path only for the isolated speaker validation.
     pio_sm_init(pio_tx, sm_tx, offset_tx + audio_i2s_tx_offset_entry_point, &c_tx);
-    pio_sm_init(pio_rx, sm_rx, offset_rx + audio_i2s_rx_offset_entry_point, &c_rx);
-
-    printf("[I2S] TX/RX PIO programs initialized.\n");
-
-    // Start RX first so it is listening before the master clock TX begins ticking
-    pio_sm_set_enabled(pio_rx, sm_rx, true);
     pio_sm_set_enabled(pio_tx, sm_tx, true);
-    printf("[I2S] TX/RX state machines enabled.\n");
+    printf("[I2S] TX state machine enabled; RX intentionally disabled for speaker validation.\n");
 }

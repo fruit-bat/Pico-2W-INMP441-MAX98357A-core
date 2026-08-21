@@ -23,7 +23,7 @@ audio_core_project/
 ## 2. Buid
 
 ```sh
-cmake -S . -B build -DPICO_BOARD=pico2 -DPICO_SDK_PATH=/home/neo/fruit-bat/pico/pico/pico-sdk
+cmake -S . -B build -DPICO_BOARD=pico2 -DPICO_SDK_PATH=/home/neo/fruit-bat/pico/pico/pico-sdk -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
 ```
 

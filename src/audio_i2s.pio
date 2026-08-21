@@ -1,51 +1,37 @@
 ; =====================================================================
-; I2S TX (Transmit) Program - Generates BCLK and WS, outputs data
+; I2S TX/RX program.
+; GPIO11 = SD (data input)
+; GPIO13 = BCLK (side-set bit 0)
+; GPIO14 = WS   (side-set bit 1)
+; GPIO12 = DIN
+;
+; Standard I2S uses WS low for the left word and WS high for the right word.
+; The side-set value is encoded as [BCLK, WS], so 0b00 = low/low,
+; 0b01 = high/low, 0b10 = low/high, 0b11 = high/high.
 ; =====================================================================
 .program audio_i2s_tx
-.side_set 2
-
-; Side-set bit 0: BCLK
-; Side-set bit 1: WS (0 = Left, 1 = Right)
+.side_set 2 opt
 
 public entry_point:
-    set x, 30          side 0b10  ; Pre-load bit counter (32 bits per channel minus 2)
-left_loop:
-    out pins, 1        side 0b00  ; Shift 1 data bit out, drive BCLK low, WS low (Left)
-    jmp x-- left_loop  side 0b01  ; Drive BCLK high, loop back for next bit
-    
-    out pins, 1        side 0b00  ; Shift last left data bit out, BCLK low, WS low
-    set x, 30          side 0b11  ; Drive BCLK high, WS high (Switching to Right)
+                    ;        /--- LRCLK
+                    ;        |/-- BCLK
+    set x, 0          side 0b00 [1]
+    set y, 30         side 0b01 [1] ; start of Left frame
 
-right_loop:
-    out pins, 1        side 0b01  ; Shift 1 data bit out, drive BCLK low, WS high (Right)
-    jmp x-- right_loop side 0b11  ; Drive BCLK high, loop back for next bit
-    
-    out pins, 1        side 0b01  ; Shift last right data bit out, BCLK low, WS high
-    jmp entry_point    side 0b10  ; Drive BCLK high, flip WS back to low, restart frame
+.wrap_target
+; Everything should change on the falling edge
 
-
-; =====================================================================
-; I2S RX (Receive) Program - Syncs to external BCLK/WS, samples data
-; =====================================================================
-.program audio_i2s_rx
-
-; Input pins: pin 0 = BCLK, pin 1 = WS, pin 2 = SD (Serial Data Input)
-
-public entry_point:
-    wait 0 pin 1         ; Wait for WS to drop low (Start of Left channel frame)
-    set x, 31            ; Prepare to read 32 bits of audio data
-    
-left_sample:
-    wait 1 pin 0         ; Wait for BCLK rising edge (Data is stable here)
-    in pins, 1           ; Sample 1 bit from the SD data input pin
-    wait 0 pin 0         ; Wait for BCLK falling edge
-    jmp x-- left_sample  ; Loop until all 32 bits are shifted into the RX FIFO
-
-    wait 1 pin 1         ; Wait for WS to go high (Start of Right channel frame)
-    set x, 31            ; Prepare to read 32 bits
-    
-right_sample:
-    wait 1 pin 0         ; Wait for BCLK rising edge
-    in pins, 1           ; Sample 1 bit (or discard if using strict Left-only mono)
-    wait 0 pin 0         ; Wait for BCLK falling edge
-    jmp x-- right_sample ; Loop until 32 bits read, then circle back to entry_point
+dataL:
+    out pins, 1       side 0b00 [1] ; change on falling edge
+    in pins, 1        side 0b01     ; sample on rising edge
+    jmp y-- dataL     side 0b01 
+    out pins, 1       side 0b10 [1] ; change on falling edge
+    in pins, 1        side 0b11     ; sample on rising edge
+    set y, 30         side 0b11 
+dataR:
+    nop               side 0b10 [1] ; change on falling edge
+    nop               side 0b11     ; sample on rising edge
+    jmp y-- dataR     side 0b11 
+    nop               side 0b00 [1] ; change on falling edge
+    nop               side 0b01     ; sample on rising edge
+    set y, 30         side 0b01
