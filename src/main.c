@@ -5,18 +5,19 @@
 #include "pico/multicore.h"
 #include "hardware/clocks.h"
 #include "i2s_core.h"
-#include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
 
+#include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
+#include "arm_const_structs.h"
 
 
 
 const float32_t FS = I2S_SAMPLE_RATE;
 const float32_t F0 = 2000.0f;           // 2 kHz boundary
-const float32_t F1 = 14000.0f;          // 14 kHz boundary
+const float32_t F1 = 7000.0f;           // 7 kHz boundary
 const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
-const float32_t chirp_vol = 0.1f;
+const float32_t chirp_vol = 0.05f;
 
 // DYNAMIC DERIVATION OF SYMBOL SPACE:
 // 1. Calculate how many physical FFT bins fit into the chosen acoustic bandwidth
@@ -111,39 +112,59 @@ static uint32_t tone_step_index = 0;
 // Currently must be 1024
 #define FFT_SIZE I2S_BUFFER_SIZE
 
-// 2. Output buffer must be the same size as input for CMSIS-DSP's packed format
-float32_t fft_output_buffer[FFT_SIZE];
+float32_t fft_output_buffer[FFT_SIZE * 2]; // Complex output: real + imag interleaved
+float32_t fft_magnitude_buffer[FFT_SIZE]; 
 
-// 3. Magnitude buffer needs 513 elements to capture DC through Nyquist
-float32_t fft_magnitude_buffer[(FFT_SIZE / 2) + 1]; 
+static float32_t complex_dechirp_vector[FFT_SIZE * 2];
 
+void generate_complex_dechirp_vector() {
 
-// 1. Initialize the instance GLOBALLY once at startup, NOT inside the function
-static arm_rfft_fast_instance_f32 fft_instance;
-
-void init_audio_system(void) {
-    arm_status status = arm_rfft_fast_init_1024_f32(&fft_instance);
-
-    if (status != ARM_MATH_SUCCESS) {
-        // Initialization error handling (e.g., unsupported FFT size)
-        printf("Error initializing FFT: %d\n    ", status);
+    const float32_t sample_rate = FS;
+    const float32_t f_min = F0;
+    const float32_t f_max = F1;
+    const float32_t T = (float32_t)FFT_SIZE / sample_rate;
+    
+    for (int n = 0; n < 1024; n++) {
+        float32_t t = (float32_t)n / sample_rate;
+        // The standard Up-Chirp phase equation
+        float32_t phase = 2.0f * PI * (f_min * t + 0.5f * ((f_max - f_min) / T) * t * t);
+        
+        // Complex Conjugate: [Cos(phase), -Sin(phase)]
+        complex_dechirp_vector[2 * n]     = cosf(phase);  
+        complex_dechirp_vector[2 * n + 1] = -sinf(phase); 
     }
 }
 
-float32_t* __not_in_flash_func(fft_mic_input_buffer)(float32_t* input_buffer) {
-    // 2. Execute the Forward FFT
-    arm_rfft_fast_f32(&fft_instance, input_buffer, fft_output_buffer, 0);
+// The 1024-point complex instance is globally defined by CMSIS-DSP
+const arm_cfft_instance_f32 *cfft_instance = &arm_cfft_sR_f32_len1024;
 
-    // 3. Handle DC and Nyquist separately due to CMSIS-DSP packed layout
-    // Use absolute value since they have no imaginary parts
-    fft_magnitude_buffer[0] = fabsf(fft_output_buffer[0]);   // DC Bin (0 Hz)
-    fft_magnitude_buffer[512] = fabsf(fft_output_buffer[1]); // Nyquist Bin (Fs/2)
+void init_audio_system(void) {
+    generate_complex_dechirp_vector();
+}
 
-    // 4. Calculate magnitudes for bins 1 to 511
-    // We pass 'fft_output_buffer + 2' to skip DC/Nyquist
-    // We pass 'fft_magnitude_buffer + 1' to align the output
-    // The number of complex pairs remaining is 511
-    arm_cmplx_mag_f32(fft_output_buffer + 2, fft_magnitude_buffer + 1, 511);
+float32_t* __not_in_flash_func(fft_mic_input_buffer)(float32_t* raw_mic_buffer) {
+
+    static float32_t complex_input_buffer[FFT_SIZE * 2]; // Interleaved complex input: [Real, Imag, Real, Imag...]    
+
+    // 1. Stage real mic data into the complex array layout
+    for (int i = 0; i < FFT_SIZE; i++) {
+        complex_input_buffer[2 * i]     = raw_mic_buffer[i]; // Real part
+        complex_input_buffer[2 * i + 1] = 0.0f;              // Imaginary part
+    }
+
+    // 2. Complex Element-wise Multiplication (De-chirp)
+    // Multiplies complex_input by complex_dechirp and saves to fft_output_buffer
+    arm_cmplx_mult_cmplx_f32(complex_input_buffer, complex_dechirp_vector, fft_output_buffer, FFT_SIZE);
+
+    // 3. Execute the Complex FFT
+    // Note: arm_cfft_f32 processes data IN-PLACE. 
+    // The last parameter '0' means Forward FFT (1 would mean Inverse)
+    // The bit reversal flag is hardcoded to 1 in modern CMSIS-DSP
+    arm_cfft_f32(cfft_instance, fft_output_buffer, 0, 1);
+
+    // 4. Calculate magnitudes for all 1024 bins
+    // No more complex packing layouts or splitting DC/Nyquist!
+    arm_cmplx_mag_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE);
 
     return &fft_magnitude_buffer[0];
 }
@@ -287,7 +308,7 @@ void core1_main() {
 
         if (tx_buffer != t_tx_buffer) {
             i2s_callback_tx_demanded(float_buf);
-            // Blazing fast vector conversion using optimized CMSIS assembly loops
+            // fast vector conversion using optimized CMSIS assembly loops
             arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
             tx_buffer = t_tx_buffer;
         }
@@ -295,7 +316,7 @@ void core1_main() {
         int32_t *t_rx_buffer = get_rx_buffer();
 
         if (rx_buffer != t_rx_buffer) {
-            // Blazing fast vector conversion using optimized CMSIS assembly loops
+            // fast vector conversion using optimized CMSIS assembly loops
             arm_q31_to_float((q31_t *)t_rx_buffer, (float32_t *)float_buf, I2S_BUFFER_SIZE);
             i2s_callback_rx_ready(float_buf);
             rx_buffer = t_rx_buffer;
