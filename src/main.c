@@ -17,7 +17,7 @@ const float32_t F1 = 7000.0f;           // 7 kHz boundary
 const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
-const float32_t chirp_vol = 0.05f;
+const float32_t chirp_vol = 0.005f;
 
 // DYNAMIC DERIVATION OF SYMBOL SPACE:
 // 1. Calculate how many physical FFT bins fit into the chosen acoustic bandwidth
@@ -176,16 +176,13 @@ void visualize_fft(float32_t *magnitude_buf) {
     
     printf("=== RP2350 FFT SPECTRUM ANALYZER (44.1 kHz / 1024-pt) ===\n\n");
 
-    // We look at the first 128 bins (~0 Hz to 5.5 kHz) where audio is active.
-    // We group them by 4 to print 32 neat lines on the screen.
-    for (int i = 4; i < 128 + (4 * 8); i += 4) { // Start at bin 4 to ignore low-end DC noise
+    for (int i = 0; i < 40; i += 1) { 
         
         // Average 4 adjacent bins together to make the display stable
-        float32_t avg_mag = (magnitude_buf[i] + magnitude_buf[i+1] + 
-                             magnitude_buf[i+2] + magnitude_buf[i+3]) / 4.0f;
+        float32_t avg_mag = magnitude_buf[i];
         
         // Calculate the actual center frequency for this display line
-        int center_freq = (int)((i + 1.5f) * FS / (float32_t)FFT_SIZE);
+        int center_freq = (int)((i) * FS / (float32_t)FFT_SIZE);
 
         // Convert the raw magnitude into a character width.
         // The INMP441 is sensitive; you may need to tweak this '150.0f' multiplier
@@ -193,7 +190,7 @@ void visualize_fft(float32_t *magnitude_buf) {
         int bar_length = (int)(avg_mag * 150.0f); 
         
         // Cap the bar length to fit comfortably in a standard 80-character terminal
-        if (bar_length > 80) bar_length = 80;
+        if (bar_length > 120) bar_length = 120;
         if (bar_length < 0)  bar_length = 0;
 
         // Print the frequency label cleanly padded to 5 characters
@@ -396,7 +393,9 @@ int main() {
                 percent = 100.0f;
             }
             visualize_fft(fft_magnitude_buffer);
-            print_bar(percent);
+            //print_bar(percent);
+            printf("Symbol %lu\n", symbol_index);
+
             last_print_ms = now_ms;
         }
 
