@@ -18,16 +18,9 @@ const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
 const float32_t chirp_vol = 0.005f;
+const float32_T BPB = (float32_t)FS / (float32_t)BW; // Bandwidth per bin
 
-// DYNAMIC DERIVATION OF SYMBOL SPACE:
-// 1. Calculate how many physical FFT bins fit into the chosen acoustic bandwidth
-const uint32_t BINS_IN_BANDWIDTH = (uint32_t)((BW * (float32_t)I2S_BUFFER_SIZE) / FS);
-
-// 2. Derive the maximum safe data symbols by finding the next lowest power of 2.
-// This prevents over-the-air signals from bleeding outside your 2kHz-14kHz window.
-const uint32_t MAX_SYMBOLS = (BINS_IN_BANDWIDTH >= 256) ? 256 :
-                             (BINS_IN_BANDWIDTH >= 128) ? 128 :
-                             (BINS_IN_BANDWIDTH >= 64)  ? 64  : 32;
+const uint32_t MAX_SYMBOLS = BW / BPB ;
 
 /**
  * Generates an acoustic chirp symbol with a cyclic frequency shift.
@@ -37,11 +30,7 @@ void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
 
     static float32_t global_tx_phase = 0.0f;
     
-    // ADJUSTMENT: Map our symbol index (0...MAX_SYMBOLS - 1) onto the sample shift timeline.
-    // Instead of shifting sample-by-sample, we shift by chunks so that each symbol 
-    // lands cleanly on a discrete, readable FFT bin center at the receiver.
-//    float32_t sample_shift = ((float32_t)symbol_val / (float32_t)MAX_SYMBOLS) * (float32_t)I2S_BUFFER_SIZE;
-    float32_t sample_shift = (float32_t)symbol_val * (float32_t)FS / (float32_t)BW;
+    float32_t sample_shift = (float32_t)symbol_val * BPB;
 
     for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
         // 1. Determine our position in the unshifted timeline (0 to BUFFER_SIZE - 1)
@@ -182,6 +171,9 @@ float32_t* __not_in_flash_func(fft_mic_input_buffer)() {
     return &fft_magnitude_buffer[0];
 }
 
+static int visualize_fft_start = 0;
+const static int visualize_fft_page_size = 50;
+
 void visualize_fft(float32_t *magnitude_buf) {
     // 1. Send ANSI escape codes: Clear screen and reset cursor to top-left
     // This stops the terminal from scrolling and keeps the graph stationary
@@ -189,7 +181,9 @@ void visualize_fft(float32_t *magnitude_buf) {
     
     printf("=== RP2350 FFT SPECTRUM ANALYZER (44.1 kHz / 1024-pt) ===\n\n");
 
-    for (int i = 0; i < 50; i += 1) { 
+    for (int i = visualize_fft_start * visualize_fft_page_size;
+         i < (visualize_fft_page_size * (1 + visualize_fft_start)); 
+         i += 1) { 
         
         // Average 4 adjacent bins together to make the display stable
         float32_t avg_mag = magnitude_buf[i];
@@ -389,11 +383,11 @@ int main() {
                     set_mode(MODE_TONE_CHIRP);
                     tone_step_index = 0;
                     break;
-                case 'n':
+                case 'p':
                     symbol_index = (symbol_index + 1) % MAX_SYMBOLS;
                     //printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
                     break;
-                case 'p':
+                case 'o':
                     symbol_index = (symbol_index == 0) ? (MAX_SYMBOLS - 1) : (symbol_index - 1);
                     printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
                     break;
@@ -402,6 +396,12 @@ int main() {
                     break;
                 case 'x':
                     rx_sample_delay = rx_sample_delay < (FFT_SIZE - 1) ? rx_sample_delay + 1 : 0;
+                    break;
+                case 'c':
+                    visualize_fft_start = visualize_fft_start > 0 ? visualize_fft_start - 1 : 0;
+                    break;
+                case 'v':
+                    visualize_fft_start = visualize_fft_start < (FFT_SIZE / visualize_fft_page_size - 1) ? visualize_fft_start + 1 : (FFT_SIZE / 50 - 1);
                     break;
                 default:
                     break;
