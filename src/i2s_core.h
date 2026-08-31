@@ -3,7 +3,7 @@
 
 #include "pico/stdlib.h"
 
-#define I2S_SAMPLE_RATE  (44100/2)
+#define I2S_SAMPLE_RATE  (44100)
 #define I2S_BUFFER_SIZE  1024 // Number of 32-bit samples per buffer slice
 
 // Pin Configurations matching your prototype

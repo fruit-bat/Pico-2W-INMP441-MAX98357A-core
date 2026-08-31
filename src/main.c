@@ -12,8 +12,10 @@
 
 
 const float32_t FS = I2S_SAMPLE_RATE;
-const float32_t F0 = 1110.0f;           // 2 kHz boundary
-const float32_t F1 = 5500.0f;           // 7 kHz boundary
+// const float32_t F0 = 2110.0f;
+// const float32_t F1 = 3800.0f;
+const float32_t F0 = 7000.0f;
+const float32_t F1 = 9800.0f;
 const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
@@ -116,7 +118,6 @@ void generate_modulated_chirp_y(float32_t *tx_audio_buffer, uint32_t symbol_val)
 
 #define MIC_LEVEL_PRINT_PERIOD_MS 100
 #define BAR_WIDTH 100
-#define TONE_AMPLITUDE (1<<30)
 #define TONE_STARTUP_STEPS 32
 
 enum test_mode {
@@ -362,7 +363,8 @@ void core1_main() {
 
                 if (tx_buffer != t_tx_buffer) {
                     i2s_callback_tx_demanded(float_buf);
-                    arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
+                    // arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
+                    memset(t_tx_buffer, 0, I2S_BUFFER_SIZE * sizeof(int32_t)); // Clear TX buffer for loopback
                     tx_buffer = t_tx_buffer;
                     // Copy TX buffer to RX buffer for loopback
                     rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
