@@ -12,21 +12,60 @@
 
 
 const float32_t FS = I2S_SAMPLE_RATE;
-const float32_t F0 = 1000.0f;           // 2 kHz boundary
-const float32_t F1 = 6000.0f;           // 7 kHz boundary
+const float32_t F0 = 1110.0f;           // 2 kHz boundary
+const float32_t F1 = 5500.0f;           // 7 kHz boundary
 const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
 const float32_t chirp_vol = 0.005f;
-const float32_T BPB = (float32_t)FS / (float32_t)BW; // Bandwidth per bin
+const float32_t BPB = FS / (float32_t)I2S_BUFFER_SIZE; // Bandwidth per FFT bin
 
-const uint32_t MAX_SYMBOLS = BW / BPB ;
+const uint32_t MAX_SYMBOLS = BW / BPB; // Number of symbols that can be transmitted in the bandwidth
+
+inline float32_t chirp_phase(float32_t t) {
+    return 2.0f * PI * (F0 * t + 0.5f * chirp_rate * t * t);
+}
+
+
+
 
 /**
  * Generates an acoustic chirp symbol with a cyclic frequency shift.
  * @param symbol_val: The data value to send (must be between 0 and BUFFER_SIZE - 1)
  */
-void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
+void generate_modulated_chirp_x(float32_t *tx_audio_buffer, uint32_t symbol_val) {
+
+    static float32_t global_tx_phase = 0.0f;
+    
+    float32_t t_tot = T; // Time for a set of fft samples
+    float32_t t_sym = (float32_t)symbol_val / BW; // Time for the symbol duration
+    float32_t t_rem = T - t_sym; 
+    float32_t p_sym = chirp_phase(t_sym); // Phase at the end of the symbol duration
+    float32_t p_rem = chirp_phase(2 * t_sym) - p_sym; // Phase for the remaining duration
+
+    float32_t phase;
+
+    for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
+
+        float32_t t = (float32_t)n / FS;
+
+        if (t < t_sym) {
+            phase = chirp_phase(t + t_sym) - p_sym;
+        } else {
+            phase = chirp_phase(t - t_sym) + p_rem;
+        }
+        //phase = chirp_phase(t + t_sym);
+
+        // TODO handle global phase offset
+
+        float32_t float_sample = sinf(phase);
+
+        tx_audio_buffer[n] = float_sample * chirp_vol;
+    }
+}
+
+
+void generate_modulated_chirp_y(float32_t *tx_audio_buffer, uint32_t symbol_val) {
 
     static float32_t global_tx_phase = 0.0f;
     
@@ -75,7 +114,6 @@ void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
 
 
 
-
 #define MIC_LEVEL_PRINT_PERIOD_MS 100
 #define BAR_WIDTH 100
 #define TONE_AMPLITUDE (1<<30)
@@ -100,7 +138,7 @@ static float tone_phase = 0.0f;
 static uint32_t tone_step_index = 0;
 
 // So we can phase align with the input signal
-static volatile uint32_t rx_sample_delay = 0;
+static volatile uint32_t rx_sample_delay = 967;
 // A couple of mic buffers so we can phase shift
 static float rx_float_buf[2][I2S_BUFFER_SIZE];
 static uint32_t rx_float_buf_idx = 0;
@@ -123,11 +161,18 @@ void generate_complex_dechirp_vector() {
     for (uint32_t n = 0; n < FFT_SIZE; n++) {
         float32_t t = (float32_t)n / sample_rate;
         // The standard Up-Chirp phase equation
-        float32_t phase = 2.0f * PI * (f_min * t + 0.5f * ((f_max - f_min) / T) * t * t);
+        float32_t phase = chirp_phase(t);
         
         // Complex Conjugate: [Cos(phase), -Sin(phase)]
         complex_dechirp_vector[2 * n]     = cosf(phase);  
         complex_dechirp_vector[2 * n + 1] = -sinf(phase); 
+    }
+}
+
+void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
+    uint32_t shift = (float32_t)symbol_val * FS / BW; // Shift in samples for the symbol value
+    for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
+        tx_audio_buffer[n] = complex_dechirp_vector[((n + shift) % I2S_BUFFER_SIZE) * 2] * chirp_vol; // Apply the complex de-chirp and scale by volume
     }
 }
 
@@ -179,7 +224,7 @@ void visualize_fft(float32_t *magnitude_buf) {
     // This stops the terminal from scrolling and keeps the graph stationary
     printf("\033[2J\033[H");
     
-    printf("=== RP2350 FFT SPECTRUM ANALYZER (44.1 kHz / 1024-pt) ===\n\n");
+    printf("=== RP2350 FFT SPECTRUM ANALYZER (%2.1f kHz / 1024-pt) ===\n\n", FS/1000.0f);
 
     for (int i = visualize_fft_start * visualize_fft_page_size;
          i < (visualize_fft_page_size * (1 + visualize_fft_start)); 
@@ -281,9 +326,7 @@ void __not_in_flash_func(i2s_callback_tx_demanded)(float *buffer) {
     switch (current_mode) {
 
         case MODE_LOOPBACK:
-            for (size_t i = 0; i < size; ++i) {
-                buffer[i] = 0.0f;
-            }
+            generate_modulated_chirp(buffer, symbol_index);
             break;
 
         case MODE_MIC_LEVEL:
@@ -312,26 +355,50 @@ void core1_main() {
 
     while(1) {
         int32_t *t_tx_buffer = get_tx_buffer();
-
-        if (tx_buffer != t_tx_buffer) {
-            i2s_callback_tx_demanded(float_buf);
-            // fast vector conversion using optimized CMSIS assembly loops
-            arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
-            tx_buffer = t_tx_buffer;
-        }
-
         int32_t *t_rx_buffer = get_rx_buffer();
 
-        if (rx_buffer != t_rx_buffer) {
-            rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
-            // fast vector conversion using optimized CMSIS assembly loops
-            arm_q31_to_float(
-                (q31_t *)t_rx_buffer, 
-                (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
-                I2S_BUFFER_SIZE);
+        switch (current_mode) {
+            case MODE_LOOPBACK: {
 
-            i2s_callback_rx_ready();
-            rx_buffer = t_rx_buffer;
+                if (tx_buffer != t_tx_buffer) {
+                    i2s_callback_tx_demanded(float_buf);
+                    arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
+                    tx_buffer = t_tx_buffer;
+                    // Copy TX buffer to RX buffer for loopback
+                    rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
+                    memcpy(
+                        (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
+                        (float32_t *)float_buf, 
+                        I2S_BUFFER_SIZE * sizeof(float32_t));
+                    i2s_callback_rx_ready();
+                    rx_buffer = t_rx_buffer;
+                }
+
+                break;
+            }
+            default: {
+
+                if (tx_buffer != t_tx_buffer) {
+                    i2s_callback_tx_demanded(float_buf);
+                    // fast vector conversion using optimized CMSIS assembly loops
+                    arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
+                    tx_buffer = t_tx_buffer;
+                }
+
+                if (rx_buffer != t_rx_buffer) {
+                    rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
+                    // fast vector conversion using optimized CMSIS assembly loops
+                    arm_q31_to_float(
+                        (q31_t *)t_rx_buffer, 
+                        (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
+                        I2S_BUFFER_SIZE);
+
+                    i2s_callback_rx_ready();
+                    rx_buffer = t_rx_buffer;
+                }
+
+                break;
+            }
         }
     }
 }
@@ -385,11 +452,9 @@ int main() {
                     break;
                 case 'p':
                     symbol_index = (symbol_index + 1) % MAX_SYMBOLS;
-                    //printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
                     break;
                 case 'o':
                     symbol_index = (symbol_index == 0) ? (MAX_SYMBOLS - 1) : (symbol_index - 1);
-                    printf("[MODE] Chirp symbol index changed to: %u\n", symbol_index);
                     break;
                 case 'z':
                     rx_sample_delay = rx_sample_delay > 0 ? rx_sample_delay - 1 : FFT_SIZE;
@@ -401,7 +466,7 @@ int main() {
                     visualize_fft_start = visualize_fft_start > 0 ? visualize_fft_start - 1 : 0;
                     break;
                 case 'v':
-                    visualize_fft_start = visualize_fft_start < (FFT_SIZE / visualize_fft_page_size - 1) ? visualize_fft_start + 1 : (FFT_SIZE / 50 - 1);
+                    visualize_fft_start = visualize_fft_start  + 1;
                     break;
                 default:
                     break;
@@ -419,8 +484,9 @@ int main() {
             }
             visualize_fft(fft_magnitude_buffer);
             //print_bar(percent);
-            printf("Symbol %3lu RX delay %4ld       \n", 
+            printf("Symbol %3lu of %lu RX delay %4ld       \n", 
                 symbol_index, 
+                MAX_SYMBOLS,
                 rx_sample_delay
             );
 
