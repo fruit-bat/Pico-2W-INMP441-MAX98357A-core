@@ -16,7 +16,7 @@
 const float32_t FS = I2S_SAMPLE_RATE;
 const float32_t BPB = FS / (float32_t)I2S_BUFFER_SIZE; // Bandwidth per FFT bin
 const float32_t BW = BPB * MAX_SYMBOLS; // Total bandwidth for the chirp signal
-const float32_t F0 = 7000.0f;
+const float32_t F0 = 15000.0f;
 const float32_t F1 = F0 + BW;
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
@@ -110,7 +110,7 @@ void init_audio_system(void) {
     cyclic_weighted_centroid_init(
         &cwc,
         FFT_SIZE,
-        8.0f, // Power exponent for weighting
+        4.0f, // Power exponent for weighting
         MAX_SYMBOLS,
         cos_table,
         sin_table
@@ -173,7 +173,7 @@ void visualize_fft(float32_t *magnitude_buf) {
         // Convert the raw magnitude into a character width.
         // The INMP441 is sensitive; you may need to tweak this '150.0f' multiplier
         // up or down depending on how loud you are speaking!
-        int bar_length = (int)(avg_mag * 150.0f); 
+        int bar_length = (int)(avg_mag * 1500.0f); 
         
         // Cap the bar length to fit comfortably in a standard 80-character terminal
         if (bar_length > 120) bar_length = 120;
@@ -435,13 +435,18 @@ int main() {
             }
             visualize_fft(fft_magnitude_buffer);
             //print_bar(percent);
-            printf("Symbol %3lu of %lu RX delay %4ld RX symbol centroid: %3.2f      \n", 
+            printf("Symbol %3lu of %lu RX delay %4ld RX symbol centroid: %3.4f Rx symbol strength: %ef     \n", 
                 symbol_index, 
                 MAX_SYMBOLS,
                 rx_sample_delay,
-                cwc_result.bin
+                cwc_result.bin,
+                cwc_result.magnitude
             );
-
+            uint32_t rsym = roundf(cwc_result.bin);
+            if (rsym >= MAX_SYMBOLS) rsym = 0;
+            for (int i = 0; i < MAX_SYMBOLS; ++i) {
+                putchar(i == rsym  ? '*' : '.');
+            }
             last_print_ms = now_ms;
         }
 /*

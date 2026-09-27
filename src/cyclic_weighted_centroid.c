@@ -73,13 +73,14 @@ void cyclic_weighted_centroid_finalize(
         return;
     }
 
-    const float32_t x = vector->x / vector->weight_sum;
-    const float32_t y = vector->y / vector->weight_sum;
+    const float32_t x = vector->x;
+    const float32_t y = vector->y;
     result->angle = atan2f(y, x);
     if (result->angle < 0.0f) {
         result->angle += 2.0f * PI;
     }
-    result->magnitude = sqrtf(x * x + y * y);
+//    result->magnitude = sqrtf(x * x + y * y);
+    result->magnitude = powf(x * x + y * y, 1.0f / (2.0f + cwc->power_exponent)); // Adjust magnitude calculation based on power exponent
     result->bin = (result->angle / (2.0f * PI)) * (float32_t)cwc->size;
 }
 
