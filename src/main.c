@@ -9,20 +9,19 @@
 #include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
 #include "arm_const_structs.h"
 
+#include "cyclic_weighted_centroid.h"
 
+#define MAX_SYMBOLS 48u
 
 const float32_t FS = I2S_SAMPLE_RATE;
-// const float32_t F0 = 2110.0f;
-// const float32_t F1 = 3800.0f;
+const float32_t BPB = FS / (float32_t)I2S_BUFFER_SIZE; // Bandwidth per FFT bin
+const float32_t BW = BPB * MAX_SYMBOLS; // Total bandwidth for the chirp signal
 const float32_t F0 = 7000.0f;
-const float32_t F1 = 9800.0f;
-const float32_t BW = (F1-F0);           // Total Bandwidth (F1 - F0)
+const float32_t F1 = F0 + BW;
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
 const float32_t chirp_vol = 0.005f;
-const float32_t BPB = FS / (float32_t)I2S_BUFFER_SIZE; // Bandwidth per FFT bin
 
-const uint32_t MAX_SYMBOLS = BW / BPB; // Number of symbols that can be transmitted in the bandwidth
 
 inline float32_t chirp_phase(float32_t t) {
     return 2.0f * PI * (F0 * t + 0.5f * chirp_rate * t * t);
@@ -64,11 +63,23 @@ float32_t fft_magnitude_buffer[FFT_SIZE];
 
 static float32_t complex_dechirp_vector[FFT_SIZE * 2];
 
+// Space for the centroid calculation tables
+static float32_t cos_table[MAX_SYMBOLS];
+static float32_t sin_table[MAX_SYMBOLS];
+// Centroid configuration
+static CyclicWeightedCentroid_t cwc;
+// Centroid result vector
+static CyclicWeightedCentroidVector_t cwc_vector;
+static CyclicWeightedCentroidResult_t cwc_result;
+
+
+
+
+
 void generate_complex_dechirp_vector() {
 
     const float32_t sample_rate = FS;
     const float32_t f_min = F0;
-    const float32_t f_max = F1;
     const float32_t T = (float32_t)FFT_SIZE / sample_rate;
     
     for (uint32_t n = 0; n < FFT_SIZE; n++) {
@@ -94,6 +105,16 @@ const arm_cfft_instance_f32 *cfft_instance = &arm_cfft_sR_f32_len1024;
 
 void init_audio_system(void) {
     generate_complex_dechirp_vector();
+
+    // Initialize the centroid configuration
+    cyclic_weighted_centroid_init(
+        &cwc,
+        FFT_SIZE,
+        8.0f, // Power exponent for weighting
+        MAX_SYMBOLS,
+        cos_table,
+        sin_table
+    );
 }
 
 float32_t* __not_in_flash_func(fft_mic_input_buffer)() {
@@ -228,7 +249,23 @@ static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
 // Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
 void __not_in_flash_func(i2s_callback_rx_ready)() {
     //update_mic_level_stats(buffer);
-    fft_mic_input_buffer();
+    float32_t* fft_result = fft_mic_input_buffer();
+    
+    // Calculate the centroid of the FFT magnitude spectrum
+    cyclic_weighted_centroid_init_vector(&cwc_vector);
+    cyclic_weighted_centroid_accumulate_forwards(
+        &cwc, 
+        fft_result, 
+        cwc.power_exponent, 
+        &cwc_vector
+    );
+    cyclic_weighted_centroid_accumulate_backwards(
+        &cwc, 
+        fft_result, 
+        cwc.power_exponent, 
+        &cwc_vector
+    );
+    cyclic_weighted_centroid_finalize(&cwc, &cwc_vector, &cwc_result);
 }
 
 static uint32_t symbol_index = 0; // Current symbol index for chirp modulation
@@ -398,10 +435,11 @@ int main() {
             }
             visualize_fft(fft_magnitude_buffer);
             //print_bar(percent);
-            printf("Symbol %3lu of %lu RX delay %4ld       \n", 
+            printf("Symbol %3lu of %lu RX delay %4ld RX symbol centroid: %3.2f      \n", 
                 symbol_index, 
                 MAX_SYMBOLS,
-                rx_sample_delay
+                rx_sample_delay,
+                cwc_result.bin
             );
 
             last_print_ms = now_ms;
