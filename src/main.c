@@ -11,7 +11,7 @@
 
 #include "cyclic_weighted_centroid.h"
 
-#define MAX_SYMBOLS 48u
+#define MAX_SYMBOLS 64u
 
 const float32_t FS = I2S_SAMPLE_RATE;
 const float32_t BPB = FS / (float32_t)I2S_BUFFER_SIZE; // Bandwidth per FFT bin
@@ -440,7 +440,7 @@ int main() {
                 MAX_SYMBOLS,
                 rx_sample_delay,
                 cwc_result.bin,
-                cwc_result.magnitude
+                cwc_result.strength
             );
             uint32_t rsym = roundf(cwc_result.bin);
             if (rsym >= MAX_SYMBOLS) rsym = 0;

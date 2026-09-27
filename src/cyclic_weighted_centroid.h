@@ -18,12 +18,11 @@
  * The centroid is the normalized average of these vectors:
  *
  *   R = sum_i w_i * [cos(theta_i), sin(theta_i)]
- *   C = R / sum_i w_i
- *   angle = atan2(C_y, C_x)
- *   magnitude = |C|
+ *   angle = atan2(R_y, R_x)
+ *   magnitude = |R| / sum_i w_i
+ *   strength = |R|^(1/k)
  *
- * This is a circular mean, not a raw weighted sum. Normalizing by the total
- * weight keeps the magnitude meaningful when the exponent is changed.
+ * This is a circular mean, not a raw weighted sum. 
  *
  * For an FFT, the spectral bins are mirrored about DC, so the same occupied
  * band may appear on both the forward and mirrored negative-frequency side. The
@@ -75,6 +74,7 @@ typedef struct {
 typedef struct {
     float32_t angle;
     float32_t magnitude;
+    float32_t strength; // Amount of directional energy in the centroid, adjusted for power exponent
     float32_t bin;
 } CyclicWeightedCentroidResult_t;
 
