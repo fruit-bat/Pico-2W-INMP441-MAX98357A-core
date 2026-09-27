@@ -124,7 +124,7 @@ float32_t* __not_in_flash_func(fft_mic_input_buffer)() {
 
     // 4. Calculate magnitudes for all 1024 bins
     // No more complex packing layouts or splitting DC/Nyquist!
-    arm_cmplx_mag_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE);
+    arm_cmplx_mag_squared_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE);
 
     return &fft_magnitude_buffer[0];
 }
