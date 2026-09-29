@@ -442,7 +442,7 @@ int main() {
                 cwc_result.bin,
                 cwc_result.strength
             );
-            uint32_t rsym = roundf(cwc_result.bin);
+            uint32_t rsym = cwc_result.ubin;
             if (rsym >= MAX_SYMBOLS) rsym = 0;
             for (int i = 0; i < MAX_SYMBOLS; ++i) {
                 putchar(i == rsym  ? '*' : '.');
