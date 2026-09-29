@@ -82,7 +82,7 @@ typedef struct {
     float32_t magnitude;
     float32_t strength; // Power-adjusted size of the unnormalized resultant
     float32_t bin;
-    float32_t ubin; // The unsigned integer bin index corresponding to the centroid angle
+    uint32_t ubin; // The unsigned integer bin index corresponding to the centroid angle
 } CyclicWeightedCentroidResult_t;
 
 /**
