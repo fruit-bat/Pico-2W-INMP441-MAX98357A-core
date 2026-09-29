@@ -20,7 +20,7 @@
  *   R = sum_i w_i * [cos(theta_i), sin(theta_i)]
  *   angle = atan2(R_y, R_x)
  *   magnitude = |R| / sum_i w_i
- *   strength = |R|^(1/k)
+ *   strength = (|R|^2)^(1/(2 + k))
  *
  * This is a circular mean, not a raw weighted sum. 
  *
@@ -68,14 +68,21 @@ typedef struct {
  * Final centroid result.
  *
  * angle: angular position of the centroid in radians, normalized into [0, 2*pi)
- * magnitude: length of the normalized centroid vector; a value in [0, 1]
+ * magnitude: length of the normalized centroid vector; a value in [0, 1].
+ *            This measures directional concentration, not signal level.
+ * strength:  power-adjusted size of the unnormalized resultant. This retains
+ *            information about how much weighted energy is present and is
+ *            therefore more useful than magnitude for deciding whether a
+ *            signal is being received. Its threshold depends on FFT scaling,
+ *            microphone gain, and the noise floor.
  * bin: estimated bin index corresponding to the centroid angle
  */
 typedef struct {
     float32_t angle;
     float32_t magnitude;
-    float32_t strength; // Amount of directional energy in the centroid, adjusted for power exponent
+    float32_t strength; // Power-adjusted size of the unnormalized resultant
     float32_t bin;
+    float32_t ubin; // The unsigned integer bin index corresponding to the centroid angle
 } CyclicWeightedCentroidResult_t;
 
 /**
@@ -142,7 +149,8 @@ void cyclic_weighted_centroid_accumulate_forwards(
 );
 
 /**
- * Finalizes the accumulated vector into a centroid angle and magnitude.
+ * Finalizes the accumulated vector into a centroid angle, magnitude, and
+ * strength.
  *
  * The accumulated vector is:
  *
@@ -160,10 +168,18 @@ void cyclic_weighted_centroid_accumulate_forwards(
  * This gives a value in the range [0, 1] for a unit-circle interpretation,
  * which remains meaningful even if power_exponent changes.
  *
+ * Strength is calculated from the unnormalized resultant before normalization:
+ *
+ *   strength = (R_x^2 + R_y^2)^(1 / (2 + power_exponent))
+ *
+ * Unlike magnitude, strength reflects the total weighted energy in the window.
+ * Use it for signal-presence decisions after establishing a threshold against
+ * the measured noise floor.
+ *
  * @param cwc     The centroid configuration.
  * @param vector  Accumulated centroid vector before normalization.
  * @param result  Output result structure containing the finalized angle, magnitude,
- *                and corresponding bin estimate.
+ *                strength, and corresponding bin estimate.
  */
 void cyclic_weighted_centroid_finalize(
     CyclicWeightedCentroid_t *cwc,

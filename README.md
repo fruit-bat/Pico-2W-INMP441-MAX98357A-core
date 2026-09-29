@@ -1,8 +1,25 @@
 # RP2350 (Pico 2 W) I2S Audio Core Driver (DMA & Interrupts)
 
-This system provides a full-duplex, dual-peripheral I2S engine optimized for the RP2350 (Pico 2 W). 
+This system provides a full-duplex, dual-peripheral I2S engine optimized for the RP2350 (Pico 2 W).
 It uses both hardware PIO blocks (`pio0` and `pio1`) synchronized to the same master clock pins, 
 operating via zero-CPU ring-buffered Direct Memory Access (DMA) and hardware interrupts.
+
+## Signal Detection Metrics
+
+The receiver's cyclic weighted centroid reports two different measures:
+
+* **Magnitude** measures how concentrated the weighted spectrum is around one
+    direction on the centroid circle. It is normalized and is useful for judging
+    directional consistency, but it does not indicate how much signal energy is
+    present.
+* **Strength** is derived from the unnormalized resultant before normalization.
+    It preserves information about the total weighted energy in the selected FFT
+    window, so it is the preferred metric for deciding whether a signal is being
+    received.
+
+Use `strength` with a threshold established from the actual microphone gain,
+FFT scaling, and measured noise floor. A high `magnitude` with low `strength`
+can still represent a consistent but very weak or noise-level signal.
 
 ---
 
