@@ -8,9 +8,12 @@
 #include <string.h>
 
 #define I2S_DMA_STALL_TIMEOUT_US 200000ULL
+#define I2S_DEBUG_PRINT_EVERY 64U
 static volatile bool i2s_dma_stalled = false;
 static volatile uint64_t last_tx_dma_us = 0;
 static volatile uint64_t last_rx_dma_us = 0;
+volatile uint32_t g_i2s_tx_dma_count = 0;
+volatile uint32_t g_i2s_rx_dma_count = 0;
 
 static void i2s_debug_led_stall(const char *channel_name, uint64_t now_us, volatile uint64_t *last_us) {
     uint64_t delta_us = now_us - *last_us;
@@ -50,46 +53,44 @@ static int32_t rx_buffers[2][I2S_BUFFER_SIZE];
 static volatile uint32_t tx_buf_idx = 0;
 static volatile uint32_t rx_buf_idx = 0;
 
+int32_t *get_tx_buffer(void) {
+    return tx_buffers[tx_buf_idx];
+}
+
+int32_t *get_rx_buffer(void) {
+    return rx_buffers[rx_buf_idx];
+}
+
 // Internal DMA IRQ Handler
-static void i2s_dma_irq_handler() {
+static void __not_in_flash_func(i2s_dma_irq_handler)() {
     uint64_t now_us = time_us_64();
 
     // Check TX DMA Channel Interrupt
     if (dma_hw->ints0 & (1u << dma_tx_chan)) {
         dma_hw->ints0 = (1u << dma_tx_chan); // Clear interrupt flag
 
-        if (last_tx_dma_us != 0) {
-            i2s_debug_led_stall("TX", now_us, &last_tx_dma_us);
-        }
+        g_i2s_tx_dma_count++;
+
         last_tx_dma_us = now_us;
 
-        // Swap buffers for the next cycle
+        dma_channel_set_transfer_count(dma_tx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
+        dma_channel_set_read_addr(dma_tx_chan, tx_buffers[tx_buf_idx], true);
+
         tx_buf_idx = 1 - tx_buf_idx;
-
-        // Trigger user callback to populate the newly inactive buffer
-        i2s_callback_tx_demanded(tx_buffers[1 - tx_buf_idx], I2S_BUFFER_SIZE);
-
-        // Reconfigure and chain the next DMA block pointer
-        dma_channel_hw_addr(dma_tx_chan)->al1_read_addr = (uintptr_t)tx_buffers[tx_buf_idx];
     }
 
     // Check RX DMA Channel Interrupt
     if (dma_hw->ints0 & (1u << dma_rx_chan)) {
         dma_hw->ints0 = (1u << dma_rx_chan); // Clear interrupt flag
 
-        if (last_rx_dma_us != 0) {
-            i2s_debug_led_stall("RX", now_us, &last_rx_dma_us);
-        }
+        g_i2s_rx_dma_count++;
+
         last_rx_dma_us = now_us;
 
-        // Swap buffers for the next cycle
+        dma_channel_set_transfer_count(dma_rx_chan, dma_encode_transfer_count(I2S_BUFFER_SIZE), false);
+        dma_channel_set_write_addr(dma_rx_chan, rx_buffers[rx_buf_idx], true);
+
         rx_buf_idx = 1 - rx_buf_idx;
-
-        // Fire callback to instantly parse the raw data just recorded
-        i2s_callback_rx_ready(rx_buffers[1 - rx_buf_idx], I2S_BUFFER_SIZE);
-
-        // Reconfigure and point to the fresh empty buffer slice
-        dma_channel_hw_addr(dma_rx_chan)->al1_write_addr = (uintptr_t)rx_buffers[rx_buf_idx];
     }
 }
 
@@ -106,6 +107,8 @@ void i2s_core_init(void) {
     i2s_dma_stalled = false;
     last_tx_dma_us = 0;
     last_rx_dma_us = 0;
+    g_i2s_tx_dma_count = 0;
+    g_i2s_rx_dma_count = 0;
 
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
@@ -116,9 +119,9 @@ void i2s_core_init(void) {
     // 1. PIO Engine Configuration Setup
     audio_i2s_hardware_init(I2S_SAMPLE_RATE);
     tx_pio = i2s_get_tx_pio();
-    rx_pio = i2s_get_rx_pio();
+    rx_pio = i2s_get_tx_pio();
     tx_sm = i2s_get_tx_sm();
-    rx_sm = i2s_get_rx_sm();
+    rx_sm = i2s_get_tx_sm();
     printf("[I2S] PIO config: tx_pio=%p sm=%u rx_pio=%p sm=%u\n", (void *)tx_pio, tx_sm, (void *)rx_pio, rx_sm);
 
     // 2. Allocate DMA Channels
@@ -162,6 +165,7 @@ void i2s_core_init(void) {
     irq_set_exclusive_handler(DMA_IRQ_0, i2s_dma_irq_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 
+
     i2s_initialized = true;
     printf("[I2S] DMA/PIO initialization complete.\n");
 }
@@ -174,17 +178,19 @@ void i2s_core_start(void) {
 
     printf("[I2S] Starting I2S TX/RX state machines...\n");
 
-    // Enable state machines synchronously to lock audio phases together.
-    // Each PIO instance needs its own mask, since the two state machines live on different PIO blocks.
+    // For the first validation pass, keep the mic RX path disabled and focus on the speaker output.
+    // This isolates whether the TX side is generating valid I2S waveform timing for the MAX98357A.
     pio_enable_sm_mask_in_sync(tx_pio, 1u << tx_sm);
-    pio_enable_sm_mask_in_sync(rx_pio, 1u << rx_sm);
 
-    // Fire off both background DMA channels simultaneously
     last_tx_dma_us = time_us_64();
     last_rx_dma_us = time_us_64();
+    
     dma_channel_start(dma_tx_chan);
     dma_channel_start(dma_rx_chan);
-    printf("[I2S] DMA TX/RX started.\n");
+
+    dma_start_channel_mask((1u << dma_tx_chan) | (1u << dma_rx_chan));
+
+    printf("[I2S] TX-only validation started; RX path disabled for isolated speaker test.\n");
 }
 
 void i2s_core_stop(void) {

@@ -1,0 +1,27 @@
+.program audio_i2s_tx
+.side_set 2 opt
+
+public entry_point:
+                    ;        /--- LRCLK
+                    ;        |/-- BCLK
+    set x, 0          side 0b00 [1]
+    set y, 30         side 0b01 [1] ; start of Left frame
+
+.wrap_target
+; Everything should change on the falling edge
+
+dataL:
+    out pins, 1       side 0b00 [1] ; change on falling edge
+    in pins, 1        side 0b01     ; sample on rising edge
+    jmp y-- dataL     side 0b01 
+    out pins, 1       side 0b10 [1] ; change on falling edge
+    in pins, 1        side 0b11     ; sample on rising edge
+    set y, 30         side 0b11 
+dataR:
+    out pins, 1       side 0b10 [1] ; change on falling edge
+    in pins, 1        side 0b11     ; sample on rising edge
+    jmp y-- dataR     side 0b11 
+    out pins, 1       side 0b00 [1] ; change on falling edge
+    in pins, 1        side 0b01     ; sample on rising edge
+    set y, 30         side 0b01
+
