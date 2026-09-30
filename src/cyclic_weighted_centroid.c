@@ -82,7 +82,7 @@ void cyclic_weighted_centroid_finalize(
     result->magnitude = x * x + y * y / (vector->weight_sum * vector->weight_sum);
     result->strength = powf(x * x + y * y, 1.0f / (2.0f + cwc->power_exponent)); // Adjust magnitude calculation based on power exponent
     result->bin = (result->angle / (2.0f * PI)) * (float32_t)cwc->size;
-    const long int ubin = lroundf(result->bin);
-    result->ubin = ubin < 0 ? 0 : ubin >= (long int)cwc->size ? cwc->size - 1 : ubin;
+    const long int ubin = lroundf(result->bin) % (long int)cwc->size;
+    result->ubin = ubin < 0 ? (uint32_t)(ubin + cwc->size) : (uint32_t)ubin;
 }
 
