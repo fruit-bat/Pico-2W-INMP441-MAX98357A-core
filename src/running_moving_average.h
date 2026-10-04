@@ -1,8 +1,8 @@
-#ifndef MOVING_AVERAGE_H
-#define MOVING_AVERAGE_H
+#ifndef RUNNING_MOVING_AVERAGE_H
+#define RUNNING_MOVING_AVERAGE_H
 
 /**
- * @file moving_average.h
+ * @file running_moving_average.h
  *
  * Simple running-average accumulator for streaming sensor data.
  *
@@ -26,14 +26,14 @@
 typedef struct {
     float32_t average;
     size_t count;
-} MovingAverage_t;
+} RunningMovingAverage_t;
 
 /**
  * Resets the running average to its initial empty state.
  *
  * @param ma Pointer to the accumulator state to clear.
  */
-static inline void reset_moving_average(MovingAverage_t *ma) {
+static inline void running_moving_average_reset(RunningMovingAverage_t *ma) {
     ma->average = 0.0f;
     ma->count = 0;
 }
@@ -41,19 +41,15 @@ static inline void reset_moving_average(MovingAverage_t *ma) {
 /**
  * Adds a new sample to the running average and returns the updated mean.
  *
- * The accumulator is intentionally mutable because it stores the running state.
- * A caller passing a const-qualified pointer would silently fail to compile or
- * would incorrectly imply that no state change occurs.
- *
  * @param ma Pointer to the accumulator state.
  * @param new_value Sample value to include in the running mean.
  * @return Updated moving average.
  */
-static inline float32_t add_moving_average_value(MovingAverage_t *ma, const float32_t new_value) {
+static inline float32_t running_moving_average_add_value(RunningMovingAverage_t *ma, const float32_t new_value) {
     ma->count++;
     // Numerically stable formula to prevent precision drift across long runs.
     ma->average += (new_value - ma->average) / (float32_t)ma->count;
     return ma->average;
 }
 
-#endif // MOVING_AVERAGE_H
+#endif // RUNNING_MOVING_AVERAGE_H
