@@ -2,13 +2,11 @@
 
 void chirp_symbol_rx_config_init(
     ChirpSymbolRxConfig_t *config,
-    uint32_t number_of_symbols,
-    float32_t radians_per_hz) 
+    uint32_t number_of_symbols) 
 {
     config->number_of_symbols = number_of_symbols;
     config->symbols_per_radian = config->number_of_symbols / (2.0f * PI);
     config->radians_per_symbol = (2.0f * PI) / config->number_of_symbols;
-    config->radians_per_hz = radians_per_hz;
 }
 
 
