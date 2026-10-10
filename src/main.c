@@ -12,6 +12,8 @@
 #include "cyclic_weighted_centroid.h"
 
 #define MAX_SYMBOLS 64u
+// TODO Should we consider separating 'max symbols' from 'bins in bandwidth' ?
+// TODO perhaps hwe need 'bins per symbol' and 'bins per bandwidth' as separate parameters.
 
 const float32_t FS = I2S_SAMPLE_RATE;
 const float32_t BPB = FS / (float32_t)I2S_BUFFER_SIZE; // Bandwidth per FFT bin
