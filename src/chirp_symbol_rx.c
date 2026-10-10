@@ -9,7 +9,6 @@ void chirp_symbol_rx_config_init(
     config->radians_per_symbol = (2.0f * PI) / config->number_of_symbols;
 }
 
-
 void chirp_symbol_rx_set(
     ChirpSymbolRxConfig_t *config,
     ChirpSymbolRx_t *symbol_rx,

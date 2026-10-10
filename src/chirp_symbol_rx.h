@@ -55,6 +55,7 @@ typedef struct {
     ChirpSymbolRx_t *symbols; // Pointer to an array of received symbols
     size_t size;              // Number of symbols in the window
     size_t head;              // Index of the most recent symbol
+    size_t tail;              // Index of the oldest symbol
 } ChirpSymbolRxWindow_t;
 
 //
