@@ -122,8 +122,12 @@ static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     CyclicWeightedCentroidResult_t cwc_result;
     cyclic_weighted_centroid_finalize(&state->cwc, &cwc_vector, &cwc_result);
 
-    // Set the properties of the received chirp symbol based on the calculated centroid
-    chirp_symbol_rx_set(config, symbol_rx, cwc_result.angle, cwc_result.magnitude, cwc_result.strength);
+    // Refine the peak position to sub-bin precision; this is what makes small
+    // timing errors measurable
+    const float32_t angle = cyclic_weighted_centroid_interpolate_peak(&state->cwc, magnitude_buffer, &cwc_result);
+
+    // Set the properties of the received chirp symbol based on the refined angle
+    chirp_symbol_rx_set(config, symbol_rx, angle, cwc_result.magnitude, cwc_result.strength);
 
     return symbol_rx;
 }

@@ -150,3 +150,40 @@ void __not_in_flash_func(cyclic_weighted_centroid_finalize)(
     result->ubin = ubin < 0 ? (uint32_t)(ubin + cwc->size) : (uint32_t)ubin;
 }
 
+
+// Power of bin index (mod size), combined with its mirrored negative-frequency bin
+static inline float32_t folded_power(
+    const CyclicWeightedCentroid_t *cwc,
+    const float32_t *power_spectrum,
+    int32_t index
+) {
+    const int32_t size = (int32_t)cwc->size;
+    const uint32_t i = (uint32_t)(((index % size) + size) % size);
+    return power_spectrum[i] + power_spectrum[cwc->fft_size - cwc->size + i];
+}
+
+float32_t __not_in_flash_func(cyclic_weighted_centroid_interpolate_peak)(
+    const CyclicWeightedCentroid_t *cwc,
+    const float32_t *power_spectrum,
+    const CyclicWeightedCentroidResult_t *result
+) {
+    const int32_t peak = (int32_t)result->ubin;
+    const float32_t radians_per_bin = 2.0f * PI / (float32_t)cwc->size;
+
+    const float32_t below = folded_power(cwc, power_spectrum, peak - 1);
+    const float32_t centre = folded_power(cwc, power_spectrum, peak);
+    const float32_t above = folded_power(cwc, power_spectrum, peak + 1);
+
+    float32_t offset = 0.0f;
+    if (below > 0.0f && above > 0.0f && centre > below && centre > above) {
+        const float32_t lb = logf(below);
+        const float32_t lc = logf(centre);
+        const float32_t la = logf(above);
+        offset = 0.5f * (la - lb) / (2.0f * lc - la - lb);
+    }
+
+    float32_t angle = ((float32_t)peak + offset) * radians_per_bin;
+    if (angle < 0.0f) angle += 2.0f * PI;
+    if (angle >= 2.0f * PI) angle -= 2.0f * PI;
+    return angle;
+}

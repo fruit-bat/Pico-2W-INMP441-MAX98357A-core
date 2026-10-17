@@ -5,9 +5,9 @@ An acoustic data link experiment for the Raspberry Pi Pico 2 W (RP2350), using a
 sent as frequency-shifted chirps (chirp spread spectrum) in the 15–17.8 kHz band
 and decoded with a de-chirp + FFT receiver.
 
-The project is a work in progress: the I2S engine, symbol encoder and symbol
-decoder work; packet framing and timing recovery are still to come. A terminal
-display is provided to see what the receiver is doing.
+The project is a work in progress: the I2S engine, symbol encoder, symbol
+decoder and symbol timing tracking work; packet framing is still to come. A
+terminal display is provided to see what the receiver is doing.
 
 All code avoids dynamic memory allocation; every module takes caller-provided
 (typically static) storage.
@@ -54,18 +54,43 @@ by the transmitted and decoded symbols and receiver statistics.
 | `4` | Chirp: transmit chirps through the speaker, receive from the microphone |
 | `o` / `p` | Previous / next transmitted symbol |
 | `z` / `x` | Decrease / increase the receive alignment delay by one sample |
+| `t` | Cycle timing tracking: off → decision → pilot (see below) |
 | `c` / `v` | Previous / next page of the spectrum display |
 
 The status lines show:
 
 * **TX symbol / RX symbol** – what is being sent and what was decoded.
 * **centroid / error** – the decoded position in symbol units and its offset
-  from the nearest symbol in radians; useful for adjusting the delay.
+  from the nearest symbol in radians.
+* **Tracking / timing error / drift** – the tracking mode, the measured timing
+  error in samples and the tracker's drift estimate. The timing error is shown
+  even with tracking off, as a guide for adjusting the delay by hand.
+* **magnitude** – how clearly one tone stands out (0–1); tracking ignores
+  frames below 0.8.
 * **peak** – peak received level as a percentage of full scale.
 * **missed rx / tx** – DMA blocks the processing core failed to service in time
   (should stay at 0).
 * **dropped records** – receiver results lost because the display core fell
   behind.
+
+### Timing tracking
+
+Each frame must start at a symbol boundary. A window that is *d* samples off
+shifts the decoded position by *d*/16 of a symbol, so the decoder's angle error
+gives the timing error directly (one sample ≈ 2π/1024 rad).
+`symbol_timing_tracker` turns that into delay corrections each frame, learning
+any steady drift (e.g. clock mismatch between two boards) once it is close to
+lock. Frames without a clear tone are ignored, and pressing `z`/`x` while
+tracking simply moves it to the new delay, from where it re-locks.
+
+* **decision** – uses the error from the nearest symbol, as a real receiver
+  must. It aligns to the symbol grid (±8 samples pull-in), but because a
+  16-sample shift looks exactly like the next symbol, decoded symbols may be
+  offset from the transmitted ones by a constant. A preamble will resolve this.
+* **pilot** – uses the error from the known transmitted symbol (testing only).
+  It locks from any delay with the correct symbol labels.
+
+The gains are `TRACK_*` constants near the top of `main.c`.
 
 ---
 
@@ -114,13 +139,14 @@ whose position is estimated with a circular weighted centroid.
 I2S RX DMA block (q31)
   → float conversion
   → rx_sample_window      align the frame to symbol timing (delay)
-  → chirp_decoder         de-chirp × FFT → magnitudes → centroid
+  → chirp_decoder         de-chirp × FFT → magnitudes → centroid → sub-bin peak
   → chirp_symbol_rx       angle → symbol index + error
+  → symbol_timing_tracker timing error → next frame's delay
   → RxFrameRecord_t       pushed to spsc_ring → core 0
 ```
 
 Each `RxFrameRecord_t` carries the frame number, delay, transmitted symbol, peak
-level and decoded symbol. This queue is the receiver's output: today it feeds
+level, decoded symbol and timing tracking state. This queue is the receiver's output: today it feeds
 the display; it is intended to feed logging to a host and packet decoding later.
 
 ### Source files
@@ -133,8 +159,9 @@ the display; it is intended to feed logging to a host and packet decoding later.
 | `chirp_encoder.c/.h` | Symbol → transmitted chirp samples |
 | `chirp_decoder.c/.h` | Received samples → symbol (de-chirp, FFT, centroid) |
 | `chirp_symbol_rx.c/.h` | Symbol index and error from a centroid angle |
-| `cyclic_weighted_centroid.c/.h` | Circular weighted centroid of a spectrum band |
+| `cyclic_weighted_centroid.c/.h` | Circular weighted centroid of a spectrum band, with sub-bin peak interpolation |
 | `rx_sample_window.c/.h` | Double-buffered receive window with adjustable alignment delay |
+| `symbol_timing_tracker.c/.h` | Second-order loop keeping the receive window aligned to the symbols |
 | `spsc_ring.c/.h` | Lock-free single-producer/single-consumer queue between cores |
 | `frame_snapshot.c/.h` | Request/ready handshake for copying a frame between cores |
 | `fft_visualise.c/.h` | Paged terminal bar graph of a spectrum |

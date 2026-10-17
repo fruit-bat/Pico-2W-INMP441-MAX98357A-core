@@ -196,4 +196,27 @@ void cyclic_weighted_centroid_finalize(
     CyclicWeightedCentroidResult_t *result
 );
 
+/**
+ * Refines the centroid to sub-bin precision.
+ *
+ * With a high power_exponent the centroid locks onto the strongest bin, which
+ * makes it robust but insensitive to offsets of less than about half a bin.
+ * This function takes the peak bin found by the centroid (result->ubin) and
+ * fits a parabola to the log power of that bin and its two neighbours
+ * (Gaussian interpolation), giving the peak position to a small fraction of a
+ * bin. Bins are folded exactly as in the accumulate functions, i.e. bin i and
+ * its mirrored bin (fft_size - size + i) are combined.
+ *
+ * @param cwc             The centroid configuration.
+ * @param power_spectrum  The power spectrum the centroid was computed from.
+ * @param result          A finalized centroid result.
+ * @return Refined angle in radians, in [0, 2*pi). If the peak is not a local
+ *         maximum (e.g. no signal), the centroid angle of the peak bin is returned.
+ */
+float32_t cyclic_weighted_centroid_interpolate_peak(
+    const CyclicWeightedCentroid_t *cwc,
+    const float32_t *power_spectrum,
+    const CyclicWeightedCentroidResult_t *result
+);
+
 #endif // CYCLIC_WEIGHTED_CENTROID_H

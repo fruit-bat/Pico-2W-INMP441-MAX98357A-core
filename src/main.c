@@ -17,6 +17,7 @@
 #include "frame_snapshot.h"
 #include "rx_sample_window.h"
 #include "spsc_ring.h"
+#include "symbol_timing_tracker.h"
 
 #define MAX_SYMBOLS 64u
 // TODO Should we consider separating 'max symbols' from 'bins in bandwidth' ?
@@ -37,11 +38,26 @@ static const float32_t chirp_vol = 0.005f;
 #define TONE_STARTUP_STEPS 32
 #define RX_RECORD_QUEUE_CAPACITY 64u // Must be a power of two
 
+// Symbol timing tracking (see symbol_timing_tracker.h)
+#define TRACK_ALPHA          0.25f // Proportional gain
+#define TRACK_BETA           0.005f // Drift (rate) gain
+#define TRACK_MAX_RATE       0.5f  // Max drift, samples per frame
+#define TRACK_RATE_WINDOW    4.0f  // Only learn drift when |error| <= this many samples
+#define TRACK_MIN_MAGNITUDE  0.8f  // Ignore frames whose centroid magnitude is below this (no clear tone)
+
 enum test_mode {
     MODE_LOOPBACK = 0,
     MODE_MIC_LEVEL = 1,
     MODE_TONE_440 = 2,
     MODE_TONE_CHIRP = 3,
+};
+
+enum tracking_mode {
+    TRACK_OFF = 0,      // Delay only changes with the z/x keys
+    TRACK_DECISION = 1, // Track using each frame's error from the nearest symbol (no knowledge of TX);
+                        // aligns to the symbol grid, but symbol labels may be offset by a constant
+    TRACK_PILOT = 2,    // Track using the error from the known transmitted symbol (testing only);
+                        // locks from any delay with correct symbol labels
 };
 
 // ---------------------------------------------------------------------------
@@ -51,6 +67,7 @@ enum test_mode {
 static volatile enum test_mode current_mode = MODE_TONE_440;
 static volatile uint32_t tx_symbol = 0;        // Symbol transmitted in chirp modes
 static volatile uint32_t tone_step_index = 0;  // Reset by core 0 to restart the tone ramp
+static volatile enum tracking_mode tracking_mode = TRACK_OFF;
 
 // Core 1 writes these counters; core 0 reads them.
 static volatile uint32_t rx_blocks_missed = 0;  // RX blocks not processed in time
@@ -68,6 +85,9 @@ typedef struct {
     uint32_t tx_symbol;      // Symbol being transmitted at the time (useful for loopback/testing)
     float32_t peak;          // Peak absolute sample value in the frame, [0, 1]
     ChirpSymbolRx_t symbol;  // Decoded symbol
+    uint32_t tracking;       // enum tracking_mode in effect for this frame
+    float32_t timing_error;  // Timing error in samples (positive: delay should increase)
+    float32_t timing_rate;   // Tracker's drift estimate, samples per frame
 } RxFrameRecord_t;
 
 static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
@@ -99,6 +119,7 @@ static float32_t sin_table[MAX_SYMBOLS];
 static ChirpDecoderState_t chirp_decoder;
 static ChirpEncoder_t chirp_encoder;
 static ChirpSymbolRxConfig_t symbol_rx_config;
+static SymbolTimingTracker_t timing_tracker;
 
 static float tone_phase = 0.0f;
 
@@ -138,6 +159,25 @@ static void init_audio_system(void) {
     );
 
     chirp_symbol_rx_config_init(&symbol_rx_config, MAX_SYMBOLS);
+
+    symbol_timing_tracker_init(
+        &timing_tracker,
+        FFT_SIZE,
+        TRACK_ALPHA,
+        TRACK_BETA,
+        TRACK_MAX_RATE,
+        TRACK_RATE_WINDOW,
+        rx_sample_window_get_delay(&rx_window)
+    );
+}
+
+static const char *tracking_name(enum tracking_mode mode) {
+    switch (mode) {
+        case TRACK_OFF:      return "off";
+        case TRACK_DECISION: return "decision";
+        case TRACK_PILOT:    return "pilot";
+    }
+    return "unknown";
 }
 
 static const char *mode_name(enum test_mode mode) {
@@ -189,8 +229,37 @@ static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
     }
 }
 
+// Wraps an angle into [-pi, pi)
+static float32_t __not_in_flash_func(wrap_pi)(float32_t a) {
+    while (a >= PI) a -= 2.0f * PI;
+    while (a < -PI) a += 2.0f * PI;
+    return a;
+}
+
+//
+// Core 1: timing error in samples for a decoded frame (positive: increase the delay).
+//
+// A symbol is the base chirp cyclically shifted by FFT_SIZE / MAX_SYMBOLS
+// samples per symbol step, so an angle error converts directly into samples.
+// A late window (delay too large) reduces the effective shift and so the
+// decoded angle, giving a negative error.
+//
+static float32_t __not_in_flash_func(timing_error_samples)(const RxFrameRecord_t *record, enum tracking_mode mode) {
+    const float32_t samples_per_radian =
+        (float32_t)(FFT_SIZE / MAX_SYMBOLS) * symbol_rx_config.symbols_per_radian;
+
+    float32_t error_angle = record->symbol.error_angle; // Relative to the nearest symbol: +/- half a symbol
+    if (mode == TRACK_PILOT) {
+        // Relative to the symbol actually sent: +/- half a frame
+        error_angle = wrap_pi(record->symbol.angle - (float32_t)record->tx_symbol * symbol_rx_config.radians_per_symbol);
+    }
+    return error_angle * samples_per_radian;
+}
+
 // Core 1: decode the newest block in the RX window and publish the result.
 static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
+    static enum tracking_mode last_tracking = TRACK_OFF;
+
     rx_sample_window_read(&rx_window, rx_frame);
 
     RxFrameRecord_t record = {
@@ -206,6 +275,22 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
         &symbol_rx_config,
         &record.symbol
     );
+
+    // Symbol timing tracking; the new delay applies from the next frame
+    const enum tracking_mode tracking = tracking_mode;
+    if (tracking != last_tracking) {
+        symbol_timing_tracker_reset(&timing_tracker, record.delay);
+        last_tracking = tracking;
+    }
+    record.tracking = tracking;
+    record.timing_error = timing_error_samples(&record, tracking);
+    if (tracking != TRACK_OFF) {
+        const bool valid = record.symbol.magnitude >= TRACK_MIN_MAGNITUDE;
+        rx_sample_window_set_delay(
+            &rx_window,
+            symbol_timing_tracker_update(&timing_tracker, record.delay, record.timing_error, valid));
+    }
+    record.timing_rate = timing_tracker.rate;
 
     if (!spsc_ring_push(&rx_record_queue, &record)) {
         rx_records_dropped++;
@@ -299,12 +384,17 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
     }
     putchar('\n');
 
+    printf("Tracking %-8s  timing error %+7.2f smp  drift %+.3f smp/frame  magnitude %.3f          \n",
+        tracking_name((enum tracking_mode)record->tracking),
+        record->timing_error,
+        record->timing_rate,
+        record->symbol.magnitude);
     printf("Frames %lu  missed rx %lu tx %lu  dropped records %lu          \n",
         (unsigned long)records_received,
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-4 mode  o/p symbol  z/x delay  c/v page\n");
+    printf("Keys: 1-4 mode  o/p symbol  z/x delay  t tracking  c/v page\n");
 }
 
 static void handle_key(int ch) {
@@ -337,6 +427,9 @@ static void handle_key(int ch) {
             rx_sample_window_set_delay(&rx_window, delay < (FFT_SIZE - 1) ? delay + 1 : 0);
             break;
         }
+        case 't':
+            tracking_mode = (enum tracking_mode)((tracking_mode + 1) % 3);
+            break;
         case 'c':
             fft_visualise_page_prev(&fft_visualise);
             break;
