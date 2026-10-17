@@ -42,7 +42,7 @@ typedef struct {
 // This function calculates the symbol index and error angle based on the configuration and the provided angle.
 //
 void chirp_symbol_rx_set(
-    ChirpSymbolRxConfig_t *config,
+    const ChirpSymbolRxConfig_t *config,
     ChirpSymbolRx_t *symbol_rx,
     float32_t angle,
     float32_t magnitude,

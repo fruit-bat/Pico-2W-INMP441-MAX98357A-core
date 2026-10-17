@@ -9,7 +9,8 @@
 #include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
 #include "arm_const_structs.h"
 
-#include "cyclic_weighted_centroid.h"
+#include "chirp_decoder.h"
+#include "chirp_symbol_rx.h"
 
 #define MAX_SYMBOLS 64u
 // TODO Should we consider separating 'max symbols' from 'bins in bandwidth' ?
@@ -23,11 +24,6 @@ const float32_t F1 = F0 + BW;
 const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
 const float32_t chirp_rate = BW / T;
 const float32_t chirp_vol = 0.005f;
-
-
-inline float32_t chirp_phase(float32_t t) {
-    return 2.0f * PI * (F0 * t + 0.5f * chirp_rate * t * t);
-}
 
 #define MIC_LEVEL_PRINT_PERIOD_MS 100
 #define BAR_WIDTH 100
@@ -60,68 +56,53 @@ static uint32_t rx_float_buf_idx = 0;
 // Currently must be 1024
 #define FFT_SIZE I2S_BUFFER_SIZE
 
-float32_t fft_output_buffer[FFT_SIZE * 2]; // Complex output: real + imag interleaved
-float32_t fft_magnitude_buffer[FFT_SIZE]; 
-
-static float32_t complex_dechirp_vector[FFT_SIZE * 2];
-
-// Space for the centroid calculation tables
+// Statically allocated storage for the chirp decoder (no malloc)
+static float32_t complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t fft_output_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t fft_magnitude_buffer[FFT_SIZE];
 static float32_t cos_table[MAX_SYMBOLS];
 static float32_t sin_table[MAX_SYMBOLS];
-// Centroid configuration
-static CyclicWeightedCentroid_t cwc;
-// Centroid result vector
-static CyclicWeightedCentroidVector_t cwc_vector;
-static CyclicWeightedCentroidResult_t cwc_result;
 
-
-
-
-
-void generate_complex_dechirp_vector() {
-
-    const float32_t sample_rate = FS;
-    const float32_t f_min = F0;
-    const float32_t T = (float32_t)FFT_SIZE / sample_rate;
-    
-    for (uint32_t n = 0; n < FFT_SIZE; n++) {
-        float32_t t = (float32_t)n / sample_rate;
-        // The standard Up-Chirp phase equation
-        float32_t phase = chirp_phase(t);
-        
-        // Complex Conjugate: [Cos(phase), -Sin(phase)]
-        complex_dechirp_vector[2 * n]     = cosf(phase);  
-        complex_dechirp_vector[2 * n + 1] = -sinf(phase); 
-    }
-}
+static ChirpDecoderState_t chirp_decoder;
+static ChirpSymbolRxConfig_t symbol_rx_config;
+static ChirpSymbolRx_t symbol_rx;
 
 void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
+    const float32_t *dechirp = chirp_decoder.complex_dechirp_vector;
     uint32_t shift = (float32_t)symbol_val * FS / BW; // Shift in samples for the symbol value
     for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
-        tx_audio_buffer[n] = complex_dechirp_vector[((n + shift) % I2S_BUFFER_SIZE) * 2] * chirp_vol; // Apply the complex de-chirp and scale by volume
+        tx_audio_buffer[n] = dechirp[((n + shift) % I2S_BUFFER_SIZE) * 2] * chirp_vol; // Apply the complex de-chirp and scale by volume
     }
 }
 
-// The 1024-point complex instance is globally defined by CMSIS-DSP
-const arm_cfft_instance_f32 *cfft_instance = &arm_cfft_sR_f32_len1024;
-
 void init_audio_system(void) {
-    generate_complex_dechirp_vector();
+    const ChirpParams_t chirp_params = {
+        .sample_rate = FS,
+        .f0 = F0,
+        .chirp_rate = chirp_rate,
+    };
 
-    // Initialize the centroid configuration
-    cyclic_weighted_centroid_init(
-        &cwc,
+    chirp_decoder_init(
+        &chirp_decoder,
+        &chirp_params,
         FFT_SIZE,
+        &arm_cfft_sR_f32_len1024, // The 1024-point complex instance is globally defined by CMSIS-DSP
         4.0f, // Power exponent for weighting
         MAX_SYMBOLS,
+        complex_dechirp_vector,
+        fft_output_buffer,
+        fft_magnitude_buffer,
         cos_table,
         sin_table
     );
+
+    chirp_symbol_rx_config_init(&symbol_rx_config, MAX_SYMBOLS);
 }
 
-float32_t* __not_in_flash_func(fft_mic_input_buffer)() {
+// Interleaved complex input: [Real, Imag, Real, Imag...]
+static float32_t complex_input_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
 
-    static float32_t complex_input_buffer[FFT_SIZE * 2]; // Interleaved complex input: [Real, Imag, Real, Imag...]    
+static void __not_in_flash_func(stage_mic_input_buffer)(void) {
 
     // 1. Stage real mic data into the complex array layout
     for (uint32_t i = 0; i < FFT_SIZE; i++) {
@@ -134,22 +115,6 @@ float32_t* __not_in_flash_func(fft_mic_input_buffer)() {
         complex_input_buffer[2 * i]     = rx_sample; // Real part
         complex_input_buffer[2 * i + 1] = 0.0f;      // Imaginary part
     }
-
-    // 2. Complex Element-wise Multiplication (De-chirp)
-    // Multiplies complex_input by complex_dechirp and saves to fft_output_buffer
-    arm_cmplx_mult_cmplx_f32(complex_input_buffer, complex_dechirp_vector, fft_output_buffer, FFT_SIZE);
-
-    // 3. Execute the Complex FFT
-    // Note: arm_cfft_f32 processes data IN-PLACE. 
-    // The last parameter '0' means Forward FFT (1 would mean Inverse)
-    // The bit reversal flag is hardcoded to 1 in modern CMSIS-DSP
-    arm_cfft_f32(cfft_instance, fft_output_buffer, 0, 1);
-
-    // 4. Calculate magnitudes for all 1024 bins
-    // No more complex packing layouts or splitting DC/Nyquist!
-    arm_cmplx_mag_squared_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE);
-
-    return &fft_magnitude_buffer[0];
 }
 
 static int visualize_fft_start = 0;
@@ -251,23 +216,14 @@ static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
 // Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
 void __not_in_flash_func(i2s_callback_rx_ready)() {
     //update_mic_level_stats(buffer);
-    float32_t* fft_result = fft_mic_input_buffer();
-    
-    // Calculate the centroid of the FFT magnitude spectrum
-    cyclic_weighted_centroid_init_vector(&cwc_vector);
-    cyclic_weighted_centroid_accumulate_forwards(
-        &cwc, 
-        fft_result, 
-        cwc.power_exponent, 
-        &cwc_vector
+    stage_mic_input_buffer();
+
+    chirp_decoder_complex_chirp_to_symbol(
+        &chirp_decoder,
+        complex_input_buffer,
+        &symbol_rx_config,
+        &symbol_rx
     );
-    cyclic_weighted_centroid_accumulate_backwards(
-        &cwc, 
-        fft_result, 
-        cwc.power_exponent, 
-        &cwc_vector
-    );
-    cyclic_weighted_centroid_finalize(&cwc, &cwc_vector, &cwc_result);
 }
 
 static uint32_t symbol_index = 0; // Current symbol index for chirp modulation
@@ -441,10 +397,10 @@ int main() {
                 symbol_index, 
                 MAX_SYMBOLS,
                 rx_sample_delay,
-                cwc_result.bin,
-                cwc_result.strength
+                symbol_rx.angle * symbol_rx_config.symbols_per_radian,
+                symbol_rx.strength
             );
-            uint32_t rsym = cwc_result.ubin;
+            uint32_t rsym = symbol_rx.symbol_index;
             if (rsym >= MAX_SYMBOLS) rsym = 0;
             for (int i = 0; i < MAX_SYMBOLS; ++i) {
                 putchar(i == rsym  ? '*' : '.');

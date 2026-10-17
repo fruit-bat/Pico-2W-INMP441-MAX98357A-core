@@ -19,7 +19,7 @@
  *
  *   R = sum_i w_i * [cos(theta_i), sin(theta_i)]
  *   angle = atan2(R_y, R_x)
- *   magnitude = |R| / sum_i w_i
+ *   magnitude = |R|^2 / (sum_i w_i)^2
  *   strength = (|R|^2)^(1/(2 + k))
  *
  * This is a circular mean, not a raw weighted sum. 
@@ -68,7 +68,7 @@ typedef struct {
  * Final centroid result.
  *
  * angle: angular position of the centroid in radians, normalized into [0, 2*pi)
- * magnitude: length of the normalized centroid vector; a value in [0, 1].
+ * magnitude: squared length of the normalized centroid vector; a value in [0, 1].
  *            This measures directional concentration, not signal level.
  * strength:  power-adjusted size of the unnormalized resultant. This retains
  *            information about how much weighted energy is present and is
@@ -161,12 +161,16 @@ void cyclic_weighted_centroid_accumulate_forwards(
  *   C = R / sum_i w_i
  *
  * The final angle is computed using atan2(C_y, C_x) so the correct quadrant is
- * preserved even when the vector is near the axes. The magnitude is then:
+ * preserved even when the vector is near the axes. The magnitude is the
+ * squared length of the normalized centroid (the square root is skipped to
+ * save cycles; ordering is preserved, but thresholds must be squared too):
  *
- *   |C| = sqrt(C_x^2 + C_y^2)
+ *   |C|^2 = C_x^2 + C_y^2 = (R_x^2 + R_y^2) / (sum_i w_i)^2
  *
  * This gives a value in the range [0, 1] for a unit-circle interpretation,
  * which remains meaningful even if power_exponent changes.
+ *
+ * If the total weight is zero (e.g. silence), every result field is set to 0.
  *
  * Strength is calculated from the unnormalized resultant before normalization:
  *

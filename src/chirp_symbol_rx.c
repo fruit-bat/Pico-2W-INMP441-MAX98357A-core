@@ -10,7 +10,7 @@ void chirp_symbol_rx_config_init(
 }
 
 void chirp_symbol_rx_set(
-    ChirpSymbolRxConfig_t *config,
+    const ChirpSymbolRxConfig_t *config,
     ChirpSymbolRx_t *symbol_rx,
     float32_t angle,
     float32_t magnitude,
