@@ -64,4 +64,14 @@ ChirpSymbolRx_t* chirp_decoder_complex_chirp_to_symbol(
     ChirpSymbolRx_t *symbol_rx // Output structure to hold the decoded symbol properties
 );
 
+// Real chirp -> Magnitudes -> ChirpSymbolRx_t
+// Equivalent to the complex version with all imaginary parts zero, but avoids
+// staging an interleaved complex input buffer.
+ChirpSymbolRx_t* chirp_decoder_real_chirp_to_symbol(
+    ChirpDecoderState_t *state,
+    const float32_t* real_input_buffer, // Real input samples (length = fft_size)
+    const ChirpSymbolRxConfig_t *config, // Configuration for symbol decoding
+    ChirpSymbolRx_t *symbol_rx // Output structure to hold the decoded symbol properties
+);
+
 #endif // CHIRP_DECODER_H

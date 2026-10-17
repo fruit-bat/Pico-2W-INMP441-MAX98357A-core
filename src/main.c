@@ -12,6 +12,7 @@
 #include "chirp_decoder.h"
 #include "chirp_symbol_rx.h"
 #include "fft_visualise.h"
+#include "rx_sample_window.h"
 
 #define MAX_SYMBOLS 64u
 // TODO Should we consider separating 'max symbols' from 'bins in bandwidth' ?
@@ -48,14 +49,14 @@ static volatile float mic_peak_value = 0;
 static float tone_phase = 0.0f;
 static uint32_t tone_step_index = 0;
 
-// So we can phase align with the input signal
-static volatile uint32_t rx_sample_delay = 967;
-// A couple of mic buffers so we can phase shift
-static float rx_float_buf[2][I2S_BUFFER_SIZE];
-static uint32_t rx_float_buf_idx = 0;
-
 // Currently must be 1024
 #define FFT_SIZE I2S_BUFFER_SIZE
+
+// Double-buffered mic input so we can phase align with the input signal
+static float32_t rx_window_storage[RX_SAMPLE_WINDOW_STORAGE_LEN(FFT_SIZE)];
+static RxSampleWindow_t rx_window;
+// The aligned frame passed to the decoder
+static float32_t rx_frame[FFT_SIZE];
 
 // Statically allocated storage for the chirp decoder (no malloc)
 static float32_t complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
@@ -98,24 +99,6 @@ void init_audio_system(void) {
     );
 
     chirp_symbol_rx_config_init(&symbol_rx_config, MAX_SYMBOLS);
-}
-
-// Interleaved complex input: [Real, Imag, Real, Imag...]
-static float32_t complex_input_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
-
-static void __not_in_flash_func(stage_mic_input_buffer)(void) {
-
-    // 1. Stage real mic data into the complex array layout
-    for (uint32_t i = 0; i < FFT_SIZE; i++) {
-
-        uint32_t rxb_idx = (rx_float_buf_idx + (rx_sample_delay > i ? 1 : 0)) % 2;
-        uint32_t rxs_idx = (FFT_SIZE - rx_sample_delay + i) % FFT_SIZE;
-
-        float32_t rx_sample = rx_float_buf[rxb_idx][rxs_idx];
-
-        complex_input_buffer[2 * i]     = rx_sample; // Real part
-        complex_input_buffer[2 * i + 1] = 0.0f;      // Imaginary part
-    }
 }
 
 static FftVisualise_t fft_visualise;
@@ -178,11 +161,11 @@ static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
 // Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
 void __not_in_flash_func(i2s_callback_rx_ready)() {
     //update_mic_level_stats(buffer);
-    stage_mic_input_buffer();
+    rx_sample_window_read(&rx_window, rx_frame);
 
-    chirp_decoder_complex_chirp_to_symbol(
+    chirp_decoder_real_chirp_to_symbol(
         &chirp_decoder,
-        complex_input_buffer,
+        rx_frame,
         &symbol_rx_config,
         &symbol_rx
     );
@@ -236,9 +219,8 @@ void core1_main() {
                     memset(t_tx_buffer, 0, I2S_BUFFER_SIZE * sizeof(int32_t)); // Clear TX buffer for loopback
                     tx_buffer = t_tx_buffer;
                     // Copy TX buffer to RX buffer for loopback
-                    rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
                     memcpy(
-                        (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
+                        rx_sample_window_next_block(&rx_window),
                         (float32_t *)float_buf, 
                         I2S_BUFFER_SIZE * sizeof(float32_t));
                     i2s_callback_rx_ready();
@@ -257,11 +239,10 @@ void core1_main() {
                 }
 
                 if (rx_buffer != t_rx_buffer) {
-                    rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
                     // fast vector conversion using optimized CMSIS assembly loops
                     arm_q31_to_float(
                         (q31_t *)t_rx_buffer, 
-                        (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
+                        rx_sample_window_next_block(&rx_window),
                         I2S_BUFFER_SIZE);
 
                     i2s_callback_rx_ready();
@@ -292,6 +273,13 @@ int main() {
     printf("[CORE] Tone output uses a 440Hz sine wave with soft startup ramp.\n");
 
     i2s_core_init();
+
+    rx_sample_window_init(
+        &rx_window,
+        rx_window_storage,
+        FFT_SIZE,
+        967 // Initial delay in samples to phase align with the input signal
+    );
 
     fft_visualise_init(
         &fft_visualise,
@@ -336,12 +324,16 @@ int main() {
                 case 'o':
                     symbol_index = (symbol_index == 0) ? (MAX_SYMBOLS - 1) : (symbol_index - 1);
                     break;
-                case 'z':
-                    rx_sample_delay = rx_sample_delay > 0 ? rx_sample_delay - 1 : (FFT_SIZE - 1);
+                case 'z': {
+                    const uint32_t delay = rx_sample_window_get_delay(&rx_window);
+                    rx_sample_window_set_delay(&rx_window, delay > 0 ? delay - 1 : (FFT_SIZE - 1));
                     break;
-                case 'x':
-                    rx_sample_delay = rx_sample_delay < (FFT_SIZE - 1) ? rx_sample_delay + 1 : 0;
+                }
+                case 'x': {
+                    const uint32_t delay = rx_sample_window_get_delay(&rx_window);
+                    rx_sample_window_set_delay(&rx_window, delay < (FFT_SIZE - 1) ? delay + 1 : 0);
                     break;
+                }
                 case 'c':
                     fft_visualise_page_prev(&fft_visualise);
                     break;
@@ -367,7 +359,7 @@ int main() {
             printf("Symbol %3lu of %lu RX delay %4ld RX symbol centroid: %3.4f Rx symbol strength: %ef     \n", 
                 symbol_index, 
                 MAX_SYMBOLS,
-                rx_sample_delay,
+                rx_sample_window_get_delay(&rx_window),
                 symbol_rx.angle * symbol_rx_config.symbols_per_radian,
                 symbol_rx.strength
             );

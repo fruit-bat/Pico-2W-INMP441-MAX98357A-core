@@ -44,6 +44,7 @@ add_executable(Pico-2W-INMP441-MAX98357A-core-test
     src/chirp_symbol_rx.c
     src/chirp_decoder.c
     src/fft_visualise.c
+    src/rx_sample_window.c
     
     # Target precisely the Float32 Transform source files
     ${cmsisdsp_SOURCE_DIR}/Source/TransformFunctions/TransformFunctions.c

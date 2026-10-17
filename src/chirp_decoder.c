@@ -48,18 +48,10 @@ void chirp_decoder_init(
     );
 }
 
-float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)(
-    ChirpDecoderState_t *state,
-    const float32_t* complex_input_buffer // Interleaved complex input: [Real, Imag, Real, Imag...]
+// FFT of the de-chirped signal already in fft_output_buffer -> magnitudes
+static float32_t* __not_in_flash_func(dechirped_to_magnitudes)(
+    ChirpDecoderState_t *state
 ) {
-    // Complex Element-wise Multiplication (De-chirp).
-    // Multiplies complex_input by complex_dechirp and saves to fft_output_buffer.
-    arm_cmplx_mult_cmplx_f32(
-        complex_input_buffer,
-        state->complex_dechirp_vector,
-        state->fft_output_buffer,
-        state->fft_size);
-
     // Execute the Complex FFT.
     // Note: arm_cfft_f32 processes data IN-PLACE.
     arm_cfft_f32(
@@ -73,6 +65,36 @@ float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)(
     arm_cmplx_mag_squared_f32(state->fft_output_buffer, state->fft_magnitude_buffer, state->fft_size);
 
     return &state->fft_magnitude_buffer[0];
+}
+
+float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)(
+    ChirpDecoderState_t *state,
+    const float32_t* complex_input_buffer // Interleaved complex input: [Real, Imag, Real, Imag...]
+) {
+    // Complex Element-wise Multiplication (De-chirp).
+    // Multiplies complex_input by complex_dechirp and saves to fft_output_buffer.
+    arm_cmplx_mult_cmplx_f32(
+        complex_input_buffer,
+        state->complex_dechirp_vector,
+        state->fft_output_buffer,
+        state->fft_size);
+
+    return dechirped_to_magnitudes(state);
+}
+
+float32_t* __not_in_flash_func(chirp_decoder_real_chirp_to_magnitudes)(
+    ChirpDecoderState_t *state,
+    const float32_t* real_input_buffer // Real input samples (length = fft_size)
+) {
+    // Complex-by-Real Element-wise Multiplication (De-chirp).
+    // Scales each complex de-chirp sample by the real input and saves to fft_output_buffer.
+    arm_cmplx_mult_real_f32(
+        state->complex_dechirp_vector,
+        real_input_buffer,
+        state->fft_output_buffer,
+        state->fft_size);
+
+    return dechirped_to_magnitudes(state);
 }
 
 ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
@@ -114,6 +136,19 @@ ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_symbol)(
 ) {
     // Convert the complex chirp signal to its magnitude spectrum
     const float32_t* magnitude_buffer = chirp_decoder_complex_chirp_to_magnitudes(state, complex_input_buffer);
+
+    // Decode the symbol from the magnitude spectrum
+    return chirp_decoder_magnitudes_to_symbol(state, magnitude_buffer, config, symbol_rx);
+}
+
+ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_real_chirp_to_symbol)(
+    ChirpDecoderState_t *state,
+    const float32_t* real_input_buffer, // Real input samples (length = fft_size)
+    const ChirpSymbolRxConfig_t *config, // Configuration for symbol decoding
+    ChirpSymbolRx_t *symbol_rx // Output structure to hold the decoded symbol properties
+) {
+    // Convert the real chirp signal to its magnitude spectrum
+    const float32_t* magnitude_buffer = chirp_decoder_real_chirp_to_magnitudes(state, real_input_buffer);
 
     // Decode the symbol from the magnitude spectrum
     return chirp_decoder_magnitudes_to_symbol(state, magnitude_buffer, config, symbol_rx);
