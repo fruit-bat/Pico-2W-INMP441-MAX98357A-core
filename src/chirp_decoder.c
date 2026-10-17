@@ -22,7 +22,7 @@ void chirp_decoder_init(
     const ChirpParams_t *params,
     uint32_t fft_size,
     const arm_cfft_instance_f32 *cfft_instance,
-    float32_t power_exponent,
+    uint32_t power_exponent,
     uint32_t number_of_bins,
     float32_t *complex_dechirp_vector,
     float32_t *fft_output_buffer,

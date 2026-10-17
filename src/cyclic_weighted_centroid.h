@@ -33,10 +33,10 @@
  * bins so a narrowband signal stays centered and does not split across adjacent
  * bins.
  *
- * Performance: when power_exponent is a whole number from 1 to 32 the weights
- * are computed by multiplication (k = 1..4 have dedicated loops, larger values
- * use repeated squaring). Any other exponent falls back to powf, which is much
- * slower. The choice is made once per accumulate call, not per bin.
+ * Performance: power_exponent is an unsigned integer so the weights are
+ * computed by multiplication only (k = 1..4 have dedicated loops, larger values
+ * use repeated squaring). The choice is made once per accumulate call, not per
+ * bin. k = 0 gives every bin equal weight.
  */
 
 #include <stddef.h>
@@ -54,7 +54,7 @@ typedef struct {
     size_t size;           // Number of bins included in this centroid window
     float32_t *cos_table;  // Precomputed cos(theta_i) values for the selected bins
     float32_t *sin_table;  // Precomputed sin(theta_i) values for the selected bins
-    float32_t power_exponent; // Power used to emphasize stronger bins: w_i = p_i^k
+    uint32_t power_exponent;  // Power used to emphasize stronger bins: w_i = p_i^k
 } CyclicWeightedCentroid_t;
 
 /**
@@ -103,7 +103,7 @@ typedef struct {
 void cyclic_weighted_centroid_init(
     CyclicWeightedCentroid_t *cwc,
     size_t fft_size,
-    float32_t power_exponent,
+    uint32_t power_exponent,
     size_t size,
     float32_t *cos_table,
     float32_t *sin_table
@@ -134,7 +134,7 @@ void cyclic_weighted_centroid_init_vector(
 void cyclic_weighted_centroid_accumulate_backwards(
     CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    float32_t power_exponent,
+    uint32_t power_exponent,
     CyclicWeightedCentroidVector_t *result
 );
 
@@ -149,7 +149,7 @@ void cyclic_weighted_centroid_accumulate_backwards(
 void cyclic_weighted_centroid_accumulate_forwards(
     CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    float32_t power_exponent,
+    uint32_t power_exponent,
     CyclicWeightedCentroidVector_t *result
 );
 

@@ -119,7 +119,7 @@ static void init_audio_system(void) {
         &chirp_params,
         FFT_SIZE,
         &arm_cfft_sR_f32_len1024, // The 1024-point complex instance is globally defined by CMSIS-DSP
-        4.0f, // Power exponent for weighting
+        4, // Power exponent for weighting
         MAX_SYMBOLS,
         complex_dechirp_vector,
         fft_output_buffer,

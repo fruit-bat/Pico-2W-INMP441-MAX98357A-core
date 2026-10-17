@@ -47,7 +47,7 @@ void chirp_decoder_init(
     const ChirpParams_t *params,
     uint32_t fft_size,
     const arm_cfft_instance_f32 *cfft_instance,
-    float32_t power_exponent,              // Centroid weighting exponent, w = p^k
+    uint32_t power_exponent,               // Centroid weighting exponent, w = p^k
     uint32_t number_of_bins,               // Number of FFT bins spanned by the chirp bandwidth
     float32_t *complex_dechirp_vector,     // length = fft_size * 2
     float32_t *fft_output_buffer,          // length = fft_size * 2
