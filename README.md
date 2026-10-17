@@ -92,9 +92,11 @@ whose position is estimated with a circular weighted centroid.
 * **One PIO state machine** (on `pio0`) generates BCLK and WS, shifts data out to
   the amplifier, and samples the microphone on the same clock edges, so TX and RX
   are locked together. Mic samples arrive in the same state machine's RX FIFO.
-* **Two DMA channels** move 1024-sample blocks between ping-pong buffers and the
-  PIO FIFOs. The DMA interrupt (DMA_IRQ_0, on core 0) restarts each channel and
-  advances a block counter.
+* **Four DMA channels** (two chained channels per direction) move 1024-sample
+  blocks between ping-pong buffers and the PIO FIFOs. When one channel finishes
+  its buffer the hardware immediately starts the other, so the I2S stream has no
+  gaps. The DMA interrupt (DMA_IRQ_0, on core 0) rewinds the finished channel,
+  marks its buffer as ready for core code and advances a block counter.
 * The system clock runs at 200 MHz.
 
 ### Cores
@@ -126,7 +128,7 @@ the display; it is intended to feed logging to a host and packet decoding later.
 | File | Purpose |
 | :--- | :--- |
 | `main.c` | Application: mode handling, core 1 audio loop, core 0 display |
-| `i2s_core.c/.h` | DMA ping-pong buffers, interrupt handler, block counters, pin definitions |
+| `i2s_core.c/.h` | Chained DMA ping-pong buffers, interrupt handler, block counters, pin definitions |
 | `audio_i2s_setup.c/.h`, `audio_i2s.pio` | PIO program and state machine setup |
 | `chirp_encoder.c/.h` | Symbol → transmitted chirp samples |
 | `chirp_decoder.c/.h` | Received samples → symbol (de-chirp, FFT, centroid) |
@@ -167,8 +169,6 @@ generate a TX block and decode an RX block before the next one completes. If it
 overruns, the `missed rx` / `missed tx` counters increase and receive alignment
 is lost for that block.
 
-Known limitation: each DMA channel is restarted from the interrupt handler. The
-PIO FIFOs (4 words, about 90 µs at 44.1 kHz) cover the restart, but if the
-interrupt is ever delayed longer than that the I2S stream glitches at a block
-boundary. Chaining two DMA channels per direction would remove this dependency
-on interrupt latency.
+Because the DMA channels are chained, the interrupt handler only has to rewind
+the finished channel before its partner completes, so it too has a full block
+period; the I2S stream does not depend on interrupt latency.

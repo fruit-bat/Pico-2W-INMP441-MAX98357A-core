@@ -18,7 +18,9 @@ void i2s_core_start(void);
 void i2s_core_stop(void);
 
 // Returns the buffer core code should fill (TX) or read (RX) next.
-// Only valid immediately after the corresponding block count has changed.
+// Call immediately after the corresponding block count has changed; the
+// buffer must then be filled (TX) or consumed (RX) within one block period
+// (I2S_BUFFER_SIZE / I2S_SAMPLE_RATE, about 23 ms), before DMA reuses it.
 int32_t *get_tx_buffer(void);
 int32_t *get_rx_buffer(void);
 
