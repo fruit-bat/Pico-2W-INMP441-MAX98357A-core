@@ -233,7 +233,7 @@ static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
 }
 
 // Core 1: real-time audio loop. Services each DMA block as it completes.
-static void core1_main(void) {
+static void __not_in_flash_func(core1_main)(void) {
     static float32_t tx_block[I2S_BUFFER_SIZE];
 
     init_audio_system();

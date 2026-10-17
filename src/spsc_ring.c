@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <string.h>
 #include "spsc_ring.h"
+#include "pico/stdlib.h"
 
 void spsc_ring_init(SpscRing_t *ring, void *storage, uint32_t element_size, uint32_t capacity) {
     assert(capacity > 0 && (capacity & (capacity - 1)) == 0);
@@ -12,7 +13,7 @@ void spsc_ring_init(SpscRing_t *ring, void *storage, uint32_t element_size, uint
     atomic_init(&ring->tail, 0);
 }
 
-bool spsc_ring_push(SpscRing_t *ring, const void *element) {
+bool __not_in_flash_func(spsc_ring_push)(SpscRing_t *ring, const void *element) {
     const unsigned head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     const unsigned tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
     if (head - tail >= ring->capacity) {

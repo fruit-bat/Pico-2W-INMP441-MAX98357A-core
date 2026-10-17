@@ -1,4 +1,5 @@
 #include "chirp_symbol_rx.h"
+#include "pico/stdlib.h"
 
 void chirp_symbol_rx_config_init(
     ChirpSymbolRxConfig_t *config,
@@ -9,7 +10,7 @@ void chirp_symbol_rx_config_init(
     config->radians_per_symbol = (2.0f * PI) / config->number_of_symbols;
 }
 
-void chirp_symbol_rx_set(
+void __not_in_flash_func(chirp_symbol_rx_set)(
     const ChirpSymbolRxConfig_t *config,
     ChirpSymbolRx_t *symbol_rx,
     float32_t angle,

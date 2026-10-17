@@ -25,7 +25,7 @@ void rx_sample_window_set_delay(RxSampleWindow_t *w, uint32_t delay) {
     w->delay = delay % w->frame_size;
 }
 
-uint32_t rx_sample_window_get_delay(const RxSampleWindow_t *w) {
+uint32_t __not_in_flash_func(rx_sample_window_get_delay)(const RxSampleWindow_t *w) {
     return w->delay;
 }
 

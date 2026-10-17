@@ -54,19 +54,19 @@ static int32_t rx_buffers[2][I2S_BUFFER_SIZE];
 static volatile uint32_t tx_buf_idx = 0;
 static volatile uint32_t rx_buf_idx = 0;
 
-int32_t *get_tx_buffer(void) {
+int32_t *__not_in_flash_func(get_tx_buffer)(void) {
     return tx_buffers[tx_buf_idx];
 }
 
-int32_t *get_rx_buffer(void) {
+int32_t *__not_in_flash_func(get_rx_buffer)(void) {
     return rx_buffers[rx_buf_idx];
 }
 
-uint32_t i2s_core_get_tx_block_count(void) {
+uint32_t __not_in_flash_func(i2s_core_get_tx_block_count)(void) {
     return g_i2s_tx_dma_count;
 }
 
-uint32_t i2s_core_get_rx_block_count(void) {
+uint32_t __not_in_flash_func(i2s_core_get_rx_block_count)(void) {
     return g_i2s_rx_dma_count;
 }
 

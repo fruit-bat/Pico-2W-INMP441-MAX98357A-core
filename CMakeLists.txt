@@ -87,6 +87,61 @@ target_link_libraries(Pico-2W-INMP441-MAX98357A-core-test
     cmsis_core
 )
 
+# Run the whole program from RAM.
+#
+# The boot loader copies all code and read-only data from flash to RAM at
+# startup, so nothing on the real-time path (including CMSIS-DSP and the SDK
+# float functions, which __not_in_flash_func cannot reach) waits on flash.
+# The cost is RAM: roughly the size of the 'text' column reported by
+# arm-none-eabi-size (about 62 KB at the time of writing).
+#
+# The __not_in_flash_func markers in the sources are kept on purpose: they
+# have no effect in this mode, but take over again if this line is removed.
+pico_set_binary_type(Pico-2W-INMP441-MAX98357A-core-test copy_to_ram)
+
+# ---------------------------------------------------------------------------
+# Alternative if RAM runs short: run from flash, but move just the hot
+# library code into RAM.
+#
+# 1. Delete the pico_set_binary_type(... copy_to_ram) line above.
+#
+# 2. Create a directory (e.g. linker/) holding project copies of these two
+#    SDK files from
+#      ${PICO_SDK_PATH}/src/rp2_common/pico_standard_link/script_include/
+#    The SDK's default linker script places everything listed in
+#    EXCLUDE_FILE(...) in RAM instead of flash; we just extend the lists.
+#
+#    linker/default_text_excludes.incl (code):
+#      *(EXCLUDE_FILE(*libgcc.a: *libc.a: *lib*_a-mem*.o *libm.a: *TransformFunctions.c.o *ComplexMathFunctions.c.o *SupportFunctions.c.o *float_math.c.o *float_sci_m33_vfp.S.o) .text*)
+#
+#    linker/default_rodata_excludes.incl (constant tables, e.g. FFT twiddles):
+#      *(EXCLUDE_FILE(*libgcc.a: *libc.a: *lib*_a-mem*.o *libm.a: *CommonTables.c.o) .rodata*)
+#
+#    The first four entries of each list are the SDK defaults; keep them.
+#    The extra entries are:
+#      TransformFunctions.c.o    CMSIS-DSP FFT (arm_cfft_f32, butterflies, bit reversal)
+#      ComplexMathFunctions.c.o  CMSIS-DSP complex multiply / magnitude
+#      SupportFunctions.c.o      CMSIS-DSP q31 <-> float conversion
+#      float_math.c.o            SDK powf etc.
+#      float_sci_m33_vfp.S.o     SDK sinf, cosf, atan2f etc.
+#      CommonTables.c.o          CMSIS-DSP FFT twiddle and bit-reversal tables
+#    Because of --gc-sections only functions/tables actually used are kept.
+#    To find the object file for any symbol, search the .elf.map file in the
+#    build directory for ".text.<symbol>" or ".rodata.<symbol>".
+#
+# 3. Tell the SDK to use them in preference to its defaults:
+#
+#    pico_add_linker_script_override_path(Pico-2W-INMP441-MAX98357A-core-test
+#        ${CMAKE_CURRENT_LIST_DIR}/linker
+#        FILES default_text_excludes.incl default_rodata_excludes.incl)
+#
+# 4. Check placement with:
+#      arm-none-eabi-nm build/Pico-2W-INMP441-MAX98357A-core-test.elf | grep arm_cfft_f32
+#    Addresses starting 0x2... are RAM, 0x1... are flash.
+#
+# (Requires Pico SDK >= 2.2 for the modular linker scripts; tested with 2.3.0.)
+# ---------------------------------------------------------------------------
+
 pico_enable_stdio_usb(Pico-2W-INMP441-MAX98357A-core-test 1)
 pico_enable_stdio_uart(Pico-2W-INMP441-MAX98357A-core-test 0)
 pico_add_extra_outputs(Pico-2W-INMP441-MAX98357A-core-test)

@@ -1,5 +1,6 @@
 #include <string.h>
 #include "frame_snapshot.h"
+#include "pico/stdlib.h"
 
 void frame_snapshot_init(FrameSnapshot_t *snapshot, float32_t *buffer, uint32_t length) {
     snapshot->buffer = buffer;
@@ -7,7 +8,7 @@ void frame_snapshot_init(FrameSnapshot_t *snapshot, float32_t *buffer, uint32_t 
     atomic_init(&snapshot->state, FRAME_SNAPSHOT_REQUESTED);
 }
 
-void frame_snapshot_offer(FrameSnapshot_t *snapshot, const float32_t *frame) {
+void __not_in_flash_func(frame_snapshot_offer)(FrameSnapshot_t *snapshot, const float32_t *frame) {
     if (atomic_load_explicit(&snapshot->state, memory_order_acquire) != FRAME_SNAPSHOT_REQUESTED) {
         return;
     }

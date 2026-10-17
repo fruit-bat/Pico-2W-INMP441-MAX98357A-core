@@ -32,6 +32,11 @@
  * A good configuration is to choose a bandwidth that is an integer number of FFT
  * bins so a narrowband signal stays centered and does not split across adjacent
  * bins.
+ *
+ * Performance: when power_exponent is a whole number from 1 to 32 the weights
+ * are computed by multiplication (k = 1..4 have dedicated loops, larger values
+ * use repeated squaring). Any other exponent falls back to powf, which is much
+ * slower. The choice is made once per accumulate call, not per bin.
  */
 
 #include <stddef.h>
