@@ -67,7 +67,7 @@ static float32_t* __not_in_flash_func(dechirped_to_magnitudes)(
     return &state->fft_magnitude_buffer[0];
 }
 
-float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)(
+static float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)(
     ChirpDecoderState_t *state,
     const float32_t* complex_input_buffer // Interleaved complex input: [Real, Imag, Real, Imag...]
 ) {
@@ -82,7 +82,7 @@ float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)(
     return dechirped_to_magnitudes(state);
 }
 
-float32_t* __not_in_flash_func(chirp_decoder_real_chirp_to_magnitudes)(
+static float32_t* __not_in_flash_func(chirp_decoder_real_chirp_to_magnitudes)(
     ChirpDecoderState_t *state,
     const float32_t* real_input_buffer // Real input samples (length = fft_size)
 ) {
@@ -97,7 +97,7 @@ float32_t* __not_in_flash_func(chirp_decoder_real_chirp_to_magnitudes)(
     return dechirped_to_magnitudes(state);
 }
 
-ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
+static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     ChirpDecoderState_t *state,
     const float32_t* magnitude_buffer, // Input magnitude spectrum (length = fft_size)
     const ChirpSymbolRxConfig_t *config, // Configuration for symbol decoding

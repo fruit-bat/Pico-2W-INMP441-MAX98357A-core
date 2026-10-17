@@ -17,7 +17,16 @@ void i2s_core_init(void);
 void i2s_core_start(void);
 void i2s_core_stop(void);
 
+// Returns the buffer core code should fill (TX) or read (RX) next.
+// Only valid immediately after the corresponding block count has changed.
 int32_t *get_tx_buffer(void);
 int32_t *get_rx_buffer(void);
+
+// Free-running counts of completed DMA blocks. A change means a new buffer is
+// available; a jump of more than one means blocks were missed. The count is
+// updated after the buffer index, so reading the count and then the buffer
+// is safe from another core.
+uint32_t i2s_core_get_tx_block_count(void);
+uint32_t i2s_core_get_rx_block_count(void);
 
 #endif // I2S_CORE_H
