@@ -1,10 +1,147 @@
-# RP2350 (Pico 2 W) I2S Audio Core Driver (DMA & Interrupts)
+# RP2350 (Pico 2 W) Chirp Audio Transceiver
 
-This system provides a full-duplex, dual-peripheral I2S engine optimized for the RP2350 (Pico 2 W).
-It uses both hardware PIO blocks (`pio0` and `pio1`) synchronized to the same master clock pins, 
-operating via zero-CPU ring-buffered Direct Memory Access (DMA) and hardware interrupts.
+An acoustic data link experiment for the Raspberry Pi Pico 2 W (RP2350), using an
+**INMP441** I2S microphone and a **MAX98357A** I2S amplifier. Data symbols are
+sent as frequency-shifted chirps (chirp spread spectrum) in the 15–17.8 kHz band
+and decoded with a de-chirp + FFT receiver.
 
-## Signal Detection Metrics
+The project is a work in progress: the I2S engine, symbol encoder and symbol
+decoder work; packet framing and timing recovery are still to come. A terminal
+display is provided to see what the receiver is doing.
+
+All code avoids dynamic memory allocation; every module takes caller-provided
+(typically static) storage.
+
+See [i2s_audio_circuit_guide.md](i2s_audio_circuit_guide.md) for wiring.
+
+---
+
+## 1. Build
+
+Requires the Pico SDK (tested with 2.3.0). CMSIS-DSP v1.15.0 is fetched
+automatically.
+
+```sh
+cmake -S . -B build -DPICO_BOARD=pico2 -DPICO_SDK_PATH=/path/to/pico-sdk -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+Copy `build/Pico-2W-INMP441-MAX98357A-core-test.uf2` to the board in BOOTSEL mode.
+
+Notes:
+
+* The board is configured as `pico2`, which is sufficient because the wireless
+  chip is not used. Use `pico2_w` if Wi-Fi or the on-board LED (which is driven
+  through the wireless chip) is needed.
+* The program is built as `copy_to_ram`: everything is copied from flash to RAM
+  at boot so the real-time path never waits on flash. If RAM becomes short,
+  [CMakeLists.txt](CMakeLists.txt) documents how to run from flash and move
+  only the hot library code into RAM instead.
+
+---
+
+## 2. Using It
+
+Connect to the USB serial port (e.g. `minicom -D /dev/ttyACM0`). The display
+shows a page of the FFT spectrum of the received (de-chirped) signal, followed
+by the transmitted and decoded symbols and receiver statistics.
+
+| Key | Action |
+| :--- | :--- |
+| `1` | Loopback: generated chirps are fed straight to the receiver (speaker silent) |
+| `2` | Mic level: speaker silent, receive from the microphone |
+| `3` | 440 Hz test tone (start-up default, to check the speaker path) |
+| `4` | Chirp: transmit chirps through the speaker, receive from the microphone |
+| `o` / `p` | Previous / next transmitted symbol |
+| `z` / `x` | Decrease / increase the receive alignment delay by one sample |
+| `c` / `v` | Previous / next page of the spectrum display |
+
+The status lines show:
+
+* **TX symbol / RX symbol** – what is being sent and what was decoded.
+* **centroid / error** – the decoded position in symbol units and its offset
+  from the nearest symbol in radians; useful for adjusting the delay.
+* **peak** – peak received level as a percentage of full scale.
+* **missed rx / tx** – DMA blocks the processing core failed to service in time
+  (should stay at 0).
+* **dropped records** – receiver results lost because the display core fell
+  behind.
+
+---
+
+## 3. Signal Parameters
+
+| Parameter | Value |
+| :--- | :--- |
+| Sample rate | 44.1 kHz, 32-bit I2S |
+| Frame / symbol length | 1024 samples (≈ 23.2 ms) |
+| FFT | 1024-point complex (CMSIS-DSP) |
+| Symbols | 64 (6 bits per frame, ≈ 258 bit/s raw) |
+| Band | 15000 Hz to ≈ 17756 Hz (64 FFT bins of ≈ 43.1 Hz) |
+
+Symbol *s* is the base up-chirp cyclically shifted by 16·*s* samples. After
+multiplying by the conjugate chirp, this concentrates its energy at FFT bin *s*,
+whose position is estimated with a circular weighted centroid.
+
+---
+
+## 4. Architecture
+
+### Hardware
+
+* **One PIO state machine** (on `pio0`) generates BCLK and WS, shifts data out to
+  the amplifier, and samples the microphone on the same clock edges, so TX and RX
+  are locked together. Mic samples arrive in the same state machine's RX FIFO.
+* **Two DMA channels** move 1024-sample blocks between ping-pong buffers and the
+  PIO FIFOs. The DMA interrupt (DMA_IRQ_0, on core 0) restarts each channel and
+  advances a block counter.
+* The system clock runs at 200 MHz.
+
+### Cores
+
+* **Core 1 – real-time DSP.** Polls the DMA block counters. For each TX block it
+  generates audio; for each RX block it aligns the frame, decodes a symbol and
+  publishes the result. It never blocks and does no I/O.
+* **Core 0 – user interface.** Handles keys and the terminal display. It reads
+  the receiver's results from a lock-free queue and the spectrum from a
+  snapshot handshake, so it always sees complete, consistent data.
+
+### Receive chain (core 1)
+
+```text
+I2S RX DMA block (q31)
+  → float conversion
+  → rx_sample_window      align the frame to symbol timing (delay)
+  → chirp_decoder         de-chirp × FFT → magnitudes → centroid
+  → chirp_symbol_rx       angle → symbol index + error
+  → RxFrameRecord_t       pushed to spsc_ring → core 0
+```
+
+Each `RxFrameRecord_t` carries the frame number, delay, transmitted symbol, peak
+level and decoded symbol. This queue is the receiver's output: today it feeds
+the display; it is intended to feed logging to a host and packet decoding later.
+
+### Source files
+
+| File | Purpose |
+| :--- | :--- |
+| `main.c` | Application: mode handling, core 1 audio loop, core 0 display |
+| `i2s_core.c/.h` | DMA ping-pong buffers, interrupt handler, block counters, pin definitions |
+| `audio_i2s_setup.c/.h`, `audio_i2s.pio` | PIO program and state machine setup |
+| `chirp_encoder.c/.h` | Symbol → transmitted chirp samples |
+| `chirp_decoder.c/.h` | Received samples → symbol (de-chirp, FFT, centroid) |
+| `chirp_symbol_rx.c/.h` | Symbol index and error from a centroid angle |
+| `cyclic_weighted_centroid.c/.h` | Circular weighted centroid of a spectrum band |
+| `rx_sample_window.c/.h` | Double-buffered receive window with adjustable alignment delay |
+| `spsc_ring.c/.h` | Lock-free single-producer/single-consumer queue between cores |
+| `frame_snapshot.c/.h` | Request/ready handshake for copying a frame between cores |
+| `fft_visualise.c/.h` | Paged terminal bar graph of a spectrum |
+| `running_moving_average.h`, `window_moving_average.h` | Averaging helpers |
+| `audio_i2s_stereo.pio` | Alternative PIO program (not currently built) |
+
+---
+
+## 5. Signal Detection Metrics
 
 The receiver's cyclic weighted centroid reports two different measures:
 
@@ -23,46 +160,15 @@ can still represent a consistent but very weak or noise-level signal.
 
 ---
 
-## 1. Project Directory Structure
+## 6. Timing Budget
 
-```text
-audio_core_project/
-├── CMakeLists.txt
-├── pico_sdk_import.cmake
-└── src/
-    ├── main.c
-    ├── i2s_core.c
-    └── i2s_core.h
-```
+Each block is 1024 samples at 44.1 kHz, so core 1 has about **23.2 ms** to
+generate a TX block and decode an RX block before the next one completes. If it
+overruns, the `missed rx` / `missed tx` counters increase and receive alignment
+is lost for that block.
 
----
-
-## 2. Buid
-
-```sh
-cmake -S . -B build -DPICO_BOARD=pico2 -DPICO_SDK_PATH=/home/neo/fruit-bat/pico/pico/pico-sdk -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j4
-```
-
-### 3. Compile the source code using all available CPU threads
-```sh
-cmake --build . -j
-```
----
-
-## 2. Hardware Allocation Architecture
-
-To guarantee strict multi-core or interrupt stability on the RP2350, resources are explicitly isolated:
-
-* **PIO Blocks**: `pio0` is dedicated to I2S Transmit (TX / Amplifier). `pio1` is dedicated to I2S Receive (RX / Microphone).
-* **DMA Channels**: Channel A manages the ping-pong peripheral write stream. Channel B manages the ping-pong peripheral read stream.
-* **Interrupt Handlers**: Tied natively to DMA IRQ0 to process buffer switches instantly with zero jitter.
-
----
-
-## 4. Operational Validation and Test Strategy
-
-Before implementing Chirp Spread Spectrum modulation, verify the base engine layer using these validation criteria:
-
-1. **Phase and Timing Verification:** Ensure that the Master Bit Clock does not slip phase under full-duplex operation. If the microphone and speaker sample rates drift, double-buffering asserts underflows.
-2. **DMA Inter-lock Check:** The system uses dual ring buffers. Monitor execution using standard visual indicators. Ensure that `i2s_callback_rx_ready` processing time does not exceed $32\,	ext{ms}$ (the duration of a $512$-sample buffer at $16\,	ext{kHz}$), otherwise subsequent data packets will overwrite values before processing finishes.
+Known limitation: each DMA channel is restarted from the interrupt handler. The
+PIO FIFOs (4 words, about 90 µs at 44.1 kHz) cover the restart, but if the
+interrupt is ever delayed longer than that the I2S stream glitches at a block
+boundary. Chaining two DMA channels per direction would remove this dependency
+on interrupt latency.
