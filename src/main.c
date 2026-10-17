@@ -11,6 +11,7 @@
 
 #include "chirp_decoder.h"
 #include "chirp_symbol_rx.h"
+#include "fft_visualise.h"
 
 #define MAX_SYMBOLS 64u
 // TODO Should we consider separating 'max symbols' from 'bins in bandwidth' ?
@@ -117,46 +118,7 @@ static void __not_in_flash_func(stage_mic_input_buffer)(void) {
     }
 }
 
-static int visualize_fft_start = 0;
-const static int visualize_fft_page_size = 50;
-
-void visualize_fft(float32_t *magnitude_buf) {
-    // 1. Send ANSI escape codes: Clear screen and reset cursor to top-left
-    // This stops the terminal from scrolling and keeps the graph stationary
-    printf("\033[2J\033[H");
-    
-    printf("=== RP2350 FFT SPECTRUM ANALYZER (%2.1f kHz / 1024-pt) ===\n\n", FS/1000.0f);
-
-    for (int i = visualize_fft_start * visualize_fft_page_size;
-         i < (visualize_fft_page_size * (1 + visualize_fft_start)); 
-         i += 1) { 
-        
-        // Average 4 adjacent bins together to make the display stable
-        float32_t avg_mag = magnitude_buf[i];
-        
-        // Calculate the actual center frequency for this display line
-        int center_freq = (int)((i) * FS / (float32_t)FFT_SIZE);
-
-        // Convert the raw magnitude into a character width.
-        // The INMP441 is sensitive; you may need to tweak this '150.0f' multiplier
-        // up or down depending on how loud you are speaking!
-        int bar_length = (int)(avg_mag * 1500.0f); 
-        
-        // Cap the bar length to fit comfortably in a standard 80-character terminal
-        if (bar_length > 120) bar_length = 120;
-        if (bar_length < 0)  bar_length = 0;
-
-        // Print the frequency label cleanly padded to 5 characters
-        printf("%5d Hz | ", center_freq);
-        
-        // Draw the amplitude bar
-        for (int b = 0; b < bar_length; b++) {
-            printf("#");
-        }
-        
-        printf("\n");
-    }
-}
+static FftVisualise_t fft_visualise;
 
 
 
@@ -331,6 +293,15 @@ int main() {
 
     i2s_core_init();
 
+    fft_visualise_init(
+        &fft_visualise,
+        FFT_SIZE,
+        FS,
+        50,      // Bins per page
+        1500.0f, // Magnitude to bar length; tune for microphone gain
+        120      // Max bar width in characters
+    );
+
     set_mode(MODE_TONE_440);
     printf("[CORE] Starting in tone validation mode to isolate the speaker output path.\n");
     i2s_core_start();
@@ -366,16 +337,16 @@ int main() {
                     symbol_index = (symbol_index == 0) ? (MAX_SYMBOLS - 1) : (symbol_index - 1);
                     break;
                 case 'z':
-                    rx_sample_delay = rx_sample_delay > 0 ? rx_sample_delay - 1 : FFT_SIZE;
+                    rx_sample_delay = rx_sample_delay > 0 ? rx_sample_delay - 1 : (FFT_SIZE - 1);
                     break;
                 case 'x':
                     rx_sample_delay = rx_sample_delay < (FFT_SIZE - 1) ? rx_sample_delay + 1 : 0;
                     break;
                 case 'c':
-                    visualize_fft_start = visualize_fft_start > 0 ? visualize_fft_start - 1 : 0;
+                    fft_visualise_page_prev(&fft_visualise);
                     break;
                 case 'v':
-                    visualize_fft_start = visualize_fft_start  + 1;
+                    fft_visualise_page_next(&fft_visualise);
                     break;
                 default:
                     break;
@@ -391,7 +362,7 @@ int main() {
                 printf("[MIC] Warning: Peak value exceeds 100%% (%3.2f) of full scale!\n", percent);
                 percent = 100.0f;
             }
-            visualize_fft(fft_magnitude_buffer);
+            fft_visualise_draw(&fft_visualise, fft_magnitude_buffer);
             //print_bar(percent);
             printf("Symbol %3lu of %lu RX delay %4ld RX symbol centroid: %3.4f Rx symbol strength: %ef     \n", 
                 symbol_index, 

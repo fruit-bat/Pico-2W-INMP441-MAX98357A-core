@@ -56,20 +56,6 @@ void chirp_decoder_init(
     float32_t *sin_table                   // length = number_of_bins
 );
 
-// Complex chirp -> Magnitudes (returns state->fft_magnitude_buffer)
-float32_t* chirp_decoder_complex_chirp_to_magnitudes(
-    ChirpDecoderState_t *state,
-    const float32_t* complex_input_buffer // Interleaved complex input: [Real, Imag, Real, Imag...]
-);
-
-// Magnitudes -> ChirpSymbolRx_t
-ChirpSymbolRx_t* chirp_decoder_magnitudes_to_symbol(
-    ChirpDecoderState_t *state,
-    const float32_t* magnitude_buffer, // Input magnitude spectrum (length = fft_size)
-    const ChirpSymbolRxConfig_t *config, // Configuration for symbol decoding
-    ChirpSymbolRx_t *symbol_rx // Output structure to hold the decoded symbol properties
-);
-
 // Complex chirp -> Magnitudes -> ChirpSymbolRx_t
 ChirpSymbolRx_t* chirp_decoder_complex_chirp_to_symbol(
     ChirpDecoderState_t *state,
