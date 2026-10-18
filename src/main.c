@@ -41,7 +41,7 @@ static const float32_t chirp_vol = 0.005f;
 
 // Symbol timing tracking (see symbol_timing_tracker.h)
 #define TRACK_ALPHA          0.25f // Proportional gain
-#define TRACK_BETA           0.005f // Drift (rate) gain
+#define TRACK_BETA           0.0f  // Drift (rate) gain; 0 while TX and RX share a clock (nothing to learn)
 #define TRACK_MAX_RATE       0.5f  // Max drift, samples per frame
 #define TRACK_RATE_WINDOW    4.0f  // Only learn drift when |error| <= this many samples
 #define TRACK_MIN_MAGNITUDE  0.8f  // Ignore frames whose centroid magnitude is below this (no clear tone)
@@ -146,6 +146,7 @@ static void init_audio_system(void) {
         &arm_cfft_sR_f32_len1024, // The 1024-point complex instance is globally defined by CMSIS-DSP
         4, // Power exponent for weighting
         MAX_SYMBOLS,
+        4, // Bins either side of the peak used to refine its position (timing)
         complex_dechirp_vector,
         fft_output_buffer,
         fft_magnitude_buffer,

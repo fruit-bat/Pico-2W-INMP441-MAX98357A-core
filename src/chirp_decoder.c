@@ -24,6 +24,7 @@ void chirp_decoder_init(
     const arm_cfft_instance_f32 *cfft_instance,
     uint32_t power_exponent,
     uint32_t number_of_bins,
+    uint32_t peak_half_width,
     float32_t *complex_dechirp_vector,
     float32_t *fft_output_buffer,
     float32_t *fft_magnitude_buffer,
@@ -35,6 +36,7 @@ void chirp_decoder_init(
     state->complex_dechirp_vector = complex_dechirp_vector;
     state->fft_output_buffer = fft_output_buffer;
     state->fft_magnitude_buffer = fft_magnitude_buffer;
+    state->peak_half_width = peak_half_width;
 
     generate_complex_dechirp_vector(complex_dechirp_vector, fft_size, params);
 
@@ -122,9 +124,11 @@ static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     CyclicWeightedCentroidResult_t cwc_result;
     cyclic_weighted_centroid_finalize(&state->cwc, &cwc_vector, &cwc_result);
 
-    // Refine the peak position to sub-bin precision; this is what makes small
-    // timing errors measurable
-    const float32_t angle = cyclic_weighted_centroid_interpolate_peak(&state->cwc, magnitude_buffer, &cwc_result);
+    // Refine the peak position to sub-bin precision from the energy around it;
+    // this is what makes small timing errors measurable, even when echoes
+    // spread the peak over several bins
+    const float32_t angle = cyclic_weighted_centroid_refine_peak(
+        &state->cwc, magnitude_buffer, &cwc_result, state->peak_half_width);
 
     // Set the properties of the received chirp symbol based on the refined angle
     chirp_symbol_rx_set(config, symbol_rx, angle, cwc_result.magnitude, cwc_result.strength);

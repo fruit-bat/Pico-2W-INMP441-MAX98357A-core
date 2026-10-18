@@ -26,6 +26,7 @@ typedef struct {
     float32_t *complex_dechirp_vector;      // Preallocated buffer for the complex de-chirp vector (length = fft_size * 2, interleaved real/imag)
     const arm_cfft_instance_f32 *cfft_instance; // Pointer to the CMSIS-DSP CFFT instance for the specified FFT size
     CyclicWeightedCentroid_t cwc;           // Centroid configuration for symbol decoding
+    uint32_t peak_half_width;               // Bins either side of the peak used to refine its position
 } ChirpDecoderState_t;
 
 //
@@ -49,6 +50,7 @@ void chirp_decoder_init(
     const arm_cfft_instance_f32 *cfft_instance,
     uint32_t power_exponent,               // Centroid weighting exponent, w = p^k
     uint32_t number_of_bins,               // Number of FFT bins spanned by the chirp bandwidth
+    uint32_t peak_half_width,              // Bins either side of the peak used to refine its position (e.g. 4)
     float32_t *complex_dechirp_vector,     // length = fft_size * 2
     float32_t *fft_output_buffer,          // length = fft_size * 2
     float32_t *fft_magnitude_buffer,       // length = fft_size

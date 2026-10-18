@@ -197,26 +197,34 @@ void cyclic_weighted_centroid_finalize(
 );
 
 /**
- * Refines the centroid to sub-bin precision.
+ * Refines the centroid to sub-bin precision using the energy in a window
+ * around the peak.
  *
  * With a high power_exponent the centroid locks onto the strongest bin, which
  * makes it robust but insensitive to offsets of less than about half a bin.
- * This function takes the peak bin found by the centroid (result->ubin) and
- * fits a parabola to the log power of that bin and its two neighbours
- * (Gaussian interpolation), giving the peak position to a small fraction of a
- * bin. Bins are folded exactly as in the accumulate functions, i.e. bin i and
- * its mirrored bin (fft_size - size + i) are combined.
+ * This function starts from that peak bin (result->ubin) and computes the
+ * power-weighted mean position (exponent 1) of the bins within +/- half_width
+ * of it. It then re-centres the window on the nearest bin to that mean and
+ * computes the mean again, so the result does not depend on which of several
+ * similar bins happened to be strongest.
+ *
+ * This copes with spread-out peaks such as an acoustic channel with echoes,
+ * where energy arrives over several bins; a 3-point peak fit is unstable there.
+ * Bins are folded exactly as in the accumulate functions, i.e. bin i and its
+ * mirrored bin (fft_size - size + i) are combined.
  *
  * @param cwc             The centroid configuration.
  * @param power_spectrum  The power spectrum the centroid was computed from.
  * @param result          A finalized centroid result.
- * @return Refined angle in radians, in [0, 2*pi). If the peak is not a local
- *         maximum (e.g. no signal), the centroid angle of the peak bin is returned.
+ * @param half_width      Window half-width in bins (e.g. 4).
+ * @return Refined angle in radians, in [0, 2*pi). With no power in the window
+ *         the centroid angle of the peak bin is returned.
  */
-float32_t cyclic_weighted_centroid_interpolate_peak(
+float32_t cyclic_weighted_centroid_refine_peak(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    const CyclicWeightedCentroidResult_t *result
+    const CyclicWeightedCentroidResult_t *result,
+    uint32_t half_width
 );
 
 #endif // CYCLIC_WEIGHTED_CENTROID_H

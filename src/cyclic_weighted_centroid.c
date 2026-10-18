@@ -162,27 +162,40 @@ static inline float32_t folded_power(
     return power_spectrum[i] + power_spectrum[cwc->fft_size - cwc->size + i];
 }
 
-float32_t __not_in_flash_func(cyclic_weighted_centroid_interpolate_peak)(
+// Power-weighted mean position, in bins relative to centre, of the folded bins
+// within +/- half_width of centre. Returns 0 if the window holds no power.
+static float32_t __not_in_flash_func(window_offset)(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    const CyclicWeightedCentroidResult_t *result
+    int32_t centre,
+    int32_t half_width
 ) {
-    const int32_t peak = (int32_t)result->ubin;
-    const float32_t radians_per_bin = 2.0f * PI / (float32_t)cwc->size;
-
-    const float32_t below = folded_power(cwc, power_spectrum, peak - 1);
-    const float32_t centre = folded_power(cwc, power_spectrum, peak);
-    const float32_t above = folded_power(cwc, power_spectrum, peak + 1);
-
-    float32_t offset = 0.0f;
-    if (below > 0.0f && above > 0.0f && centre > below && centre > above) {
-        const float32_t lb = logf(below);
-        const float32_t lc = logf(centre);
-        const float32_t la = logf(above);
-        offset = 0.5f * (la - lb) / (2.0f * lc - la - lb);
+    float32_t moment = 0.0f;
+    float32_t total = 0.0f;
+    for (int32_t k = -half_width; k <= half_width; k++) {
+        const float32_t p = folded_power(cwc, power_spectrum, centre + k);
+        moment += (float32_t)k * p;
+        total += p;
     }
+    return total > 0.0f ? moment / total : 0.0f;
+}
 
-    float32_t angle = ((float32_t)peak + offset) * radians_per_bin;
+float32_t __not_in_flash_func(cyclic_weighted_centroid_refine_peak)(
+    const CyclicWeightedCentroid_t *cwc,
+    const float32_t *power_spectrum,
+    const CyclicWeightedCentroidResult_t *result,
+    uint32_t half_width
+) {
+    const int32_t size = (int32_t)cwc->size;
+    const int32_t w = (int32_t)half_width;
+
+    // Re-centre on the energy, then measure around the new centre
+    int32_t centre = (int32_t)result->ubin;
+    centre += (int32_t)lroundf(window_offset(cwc, power_spectrum, centre, w));
+    centre = ((centre % size) + size) % size;
+    const float32_t offset = window_offset(cwc, power_spectrum, centre, w);
+
+    float32_t angle = ((float32_t)centre + offset) * (2.0f * PI / (float32_t)size);
     if (angle < 0.0f) angle += 2.0f * PI;
     if (angle >= 2.0f * PI) angle -= 2.0f * PI;
     return angle;

@@ -30,7 +30,7 @@ void chirp_symbol_rx_config_init(
 // Used to track a single received chirp symbol and its associated properties. 
 //
 typedef struct {
-    float32_t angle;      // Angle of the received symbol (centroid peak, refined to sub-bin precision)
+    float32_t angle;      // Angle of the received symbol (centroid peak, refined by the energy around it)
     float32_t magnitude;  // Centroid magnitude of the received symbol
     float32_t strength;   // Centroid strength of the received symbol
     uint32_t symbol_index; // Index of the received symbol in the chirp modulation scheme

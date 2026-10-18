@@ -56,6 +56,7 @@ by the transmitted and decoded symbols and receiver statistics.
 | `z` / `x` | Decrease / increase the receive alignment delay by one sample |
 | `t` | Cycle timing tracking: off → decision → pilot (see below) |
 | `c` / `v` | Previous / next page of the spectrum display |
+| `l` | Toggle CSV logging (replaces the display; see below) |
 
 The status lines show:
 
@@ -78,10 +79,20 @@ The status lines show:
 Each frame must start at a symbol boundary. A window that is *d* samples off
 shifts the decoded position by *d*/16 of a symbol, so the decoder's angle error
 gives the timing error directly (one sample ≈ 2π/1024 rad).
-`symbol_timing_tracker` turns that into delay corrections each frame, learning
-any steady drift (e.g. clock mismatch between two boards) once it is close to
-lock. Frames without a clear tone are ignored, and pressing `z`/`x` while
-tracking simply moves it to the new delay, from where it re-locks.
+
+Each FFT bin after de-chirping corresponds to 16 samples of delay, so the
+spectrum around a symbol is effectively the channel's impulse response.
+Through the air, echoes spread it over about three bins, so the decoder
+measures the symbol's position as the energy centroid of ±4 bins around the
+peak (re-centred once) rather than fitting the single strongest bin. Logged
+sweeps showed this agrees across all 64 symbols to within about 2 samples.
+
+`symbol_timing_tracker` turns the error into delay corrections each frame.
+It can also learn a steady drift (e.g. clock mismatch between two boards), but
+that is disabled (`TRACK_BETA` = 0) while one board both transmits and receives,
+as there is no drift to learn and it only picked up noise. Frames without a
+clear tone are ignored, and pressing `z`/`x` while tracking simply moves it to
+the new delay, from where it re-locks.
 
 * **decision** – uses the error from the nearest symbol, as a real receiver
   must. It aligns to the symbol grid (±8 samples pull-in), but because a
@@ -91,6 +102,38 @@ tracking simply moves it to the new delay, from where it re-locks.
   It locks from any delay with the correct symbol labels.
 
 The gains are `TRACK_*` constants near the top of `main.c`.
+
+### Logging
+
+Pressing `l` replaces the display with one CSV line per received frame
+(about 43 lines per second), starting with `#` comment lines describing the
+configuration and a column header. Each line holds the transmitted symbol, the
+decoded symbol (angle, error, magnitude, strength), the tracker state, the
+missed/dropped counters, and the FFT power of the 128 bins either side of DC
+(`b-64` … `b63`) that the decoder uses.
+
+[tools/capture_log.py](tools/capture_log.py) captures a log without needing a
+terminal program (standard library only):
+
+```sh
+# chirp mode, pilot tracking, 30 s
+python3 tools/capture_log.py --keys 4tt --seconds 30 pilot.csv
+
+# chirp mode, tracking off, step through all 64 symbols for 1 s each
+python3 tools/capture_log.py --keys 4 --sweep 1 sweep.csv
+```
+
+It reports gaps in the frame numbers; if the board cannot keep up, the
+`dropped` column will also increase.
+
+[tools/analyse_log.py](tools/analyse_log.py) summarises a log per transmitted
+symbol (skipping the frames just after each symbol change): decode accuracy,
+the decoded position relative to the transmitted symbol in samples, the
+decoder's error, and magnitude.
+
+```sh
+python3 tools/analyse_log.py sweep.csv
+```
 
 ---
 
@@ -139,7 +182,7 @@ whose position is estimated with a circular weighted centroid.
 I2S RX DMA block (q31)
   → float conversion
   → rx_sample_window      align the frame to symbol timing (delay)
-  → chirp_decoder         de-chirp × FFT → magnitudes → centroid → sub-bin peak
+  → chirp_decoder         de-chirp × FFT → magnitudes → centroid → energy-refined peak
   → chirp_symbol_rx       angle → symbol index + error
   → symbol_timing_tracker timing error → next frame's delay
   → RxFrameRecord_t       pushed to spsc_ring → core 0
@@ -159,7 +202,7 @@ the display; it is intended to feed logging to a host and packet decoding later.
 | `chirp_encoder.c/.h` | Symbol → transmitted chirp samples |
 | `chirp_decoder.c/.h` | Received samples → symbol (de-chirp, FFT, centroid) |
 | `chirp_symbol_rx.c/.h` | Symbol index and error from a centroid angle |
-| `cyclic_weighted_centroid.c/.h` | Circular weighted centroid of a spectrum band, with sub-bin peak interpolation |
+| `cyclic_weighted_centroid.c/.h` | Circular weighted centroid of a spectrum band, with energy-window peak refinement |
 | `rx_sample_window.c/.h` | Double-buffered receive window with adjustable alignment delay |
 | `symbol_timing_tracker.c/.h` | Second-order loop keeping the receive window aligned to the symbols |
 | `spsc_ring.c/.h` | Lock-free single-producer/single-consumer queue between cores |
@@ -167,6 +210,8 @@ the display; it is intended to feed logging to a host and packet decoding later.
 | `fft_visualise.c/.h` | Paged terminal bar graph of a spectrum |
 | `running_moving_average.h`, `window_moving_average.h` | Averaging helpers |
 | `audio_i2s_stereo.pio` | Alternative PIO program (not currently built) |
+| `tools/capture_log.py` | Captures the CSV log over USB serial, optionally sweeping all symbols |
+| `tools/analyse_log.py` | Per-symbol statistics from a CSV log |
 
 ---
 
