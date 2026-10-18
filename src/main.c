@@ -35,6 +35,7 @@ static const float32_t chirp_rate = BW / T;
 static const float32_t chirp_vol = 0.005f;
 
 #define DISPLAY_PERIOD_MS 100
+#define LOG_BAND_BINS (2u * MAX_SYMBOLS) // FFT bins logged per frame: -MAX_SYMBOLS .. MAX_SYMBOLS-1
 #define TONE_STARTUP_STEPS 32
 #define RX_RECORD_QUEUE_CAPACITY 64u // Must be a power of two
 
@@ -81,6 +82,7 @@ static volatile uint32_t rx_records_dropped = 0; // Records lost because the que
 //
 typedef struct {
     uint32_t frame;          // RX block count when this frame was decoded
+    uint32_t mode;           // enum test_mode in effect for this frame
     uint32_t delay;          // Alignment delay in samples used for this frame
     uint32_t tx_symbol;      // Symbol being transmitted at the time (useful for loopback/testing)
     float32_t peak;          // Peak absolute sample value in the frame, [0, 1]
@@ -88,6 +90,8 @@ typedef struct {
     uint32_t tracking;       // enum tracking_mode in effect for this frame
     float32_t timing_error;  // Timing error in samples (positive: delay should increase)
     float32_t timing_rate;   // Tracker's drift estimate, samples per frame
+    float32_t band_power[LOG_BAND_BINS]; // FFT power |X|^2 of bins -MAX_SYMBOLS .. MAX_SYMBOLS-1
+                                         // (the band the centroid uses; bin = index mod FFT_SIZE)
 } RxFrameRecord_t;
 
 static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
@@ -262,8 +266,11 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
 
     rx_sample_window_read(&rx_window, rx_frame);
 
-    RxFrameRecord_t record = {
+    // Static: records are large (band_power) and core 1's stack is small
+    static RxFrameRecord_t record;
+    record = (RxFrameRecord_t){
         .frame = frame,
+        .mode = current_mode,
         .delay = rx_sample_window_get_delay(&rx_window),
         .tx_symbol = tx_symbol,
         .peak = peak_abs(rx_frame, FFT_SIZE),
@@ -291,6 +298,11 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
             symbol_timing_tracker_update(&timing_tracker, record.delay, record.timing_error, valid));
     }
     record.timing_rate = timing_tracker.rate;
+
+    // Keep the band around DC (where de-chirped symbols land) with the record
+    for (uint32_t i = 0; i < LOG_BAND_BINS; i++) {
+        record.band_power[i] = chirp_decoder.fft_magnitude_buffer[(FFT_SIZE + i - MAX_SYMBOLS) % FFT_SIZE];
+    }
 
     if (!spsc_ring_push(&rx_record_queue, &record)) {
         rx_records_dropped++;
@@ -394,7 +406,53 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-4 mode  o/p symbol  z/x delay  t tracking  c/v page\n");
+    printf("Keys: 1-4 mode  o/p symbol  z/x delay  t tracking  c/v page  l log\n");
+}
+
+// ---------------------------------------------------------------------------
+// CSV logging (core 0). One line per received frame; lines starting with '#'
+// are comments, so the output can be loaded directly by most CSV readers.
+// ---------------------------------------------------------------------------
+static bool logging = false;
+
+static void print_log_header(void) {
+    printf("# chirp receiver log v1\n");
+    printf("# sample_rate=%.1f fft_size=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol=%u\n",
+        FS, (unsigned)FFT_SIZE, (unsigned)MAX_SYMBOLS, F0, BW, (unsigned)(FFT_SIZE / MAX_SYMBOLS));
+    printf("# track_alpha=%g track_beta=%g track_max_rate=%g track_rate_window=%g track_min_magnitude=%g\n",
+        TRACK_ALPHA, TRACK_BETA, TRACK_MAX_RATE, TRACK_RATE_WINDOW, TRACK_MIN_MAGNITUDE);
+    printf("# delay: window delay used for this frame (samples); timing_error: samples, positive = increase delay\n");
+    printf("# angle/error_angle: radians; b<k>: FFT power |X|^2 of bin k (k mod fft_size)\n");
+    printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
+           "timing_error,timing_rate,rx_missed,tx_missed,dropped");
+    for (int32_t k = -(int32_t)MAX_SYMBOLS; k < (int32_t)MAX_SYMBOLS; k++) {
+        printf(",b%ld", (long)k);
+    }
+    printf("\n");
+}
+
+static void print_log_record(const RxFrameRecord_t *record) {
+    printf("%lu,%s,%lu,%lu,%s,%lu,%.5f,%+.5f,%.4f,%.4e,%.4f,%+.3f,%+.4f,%lu,%lu,%lu",
+        (unsigned long)record->frame,
+        mode_name((enum test_mode)record->mode),
+        (unsigned long)record->tx_symbol,
+        (unsigned long)record->delay,
+        tracking_name((enum tracking_mode)record->tracking),
+        (unsigned long)record->symbol.symbol_index,
+        record->symbol.angle,
+        record->symbol.error_angle,
+        record->symbol.magnitude,
+        record->symbol.strength,
+        record->peak,
+        record->timing_error,
+        record->timing_rate,
+        (unsigned long)rx_blocks_missed,
+        (unsigned long)tx_blocks_missed,
+        (unsigned long)rx_records_dropped);
+    for (uint32_t i = 0; i < LOG_BAND_BINS; i++) {
+        printf(",%.3e", record->band_power[i]);
+    }
+    printf("\n");
 }
 
 static void handle_key(int ch) {
@@ -436,6 +494,15 @@ static void handle_key(int ch) {
         case 'v':
             fft_visualise_page_next(&fft_visualise);
             break;
+        case 'l':
+            logging = !logging;
+            if (logging) {
+                printf("\033[2J\033[H"); // Clear the display
+                print_log_header();
+            } else {
+                printf("# log end\n");
+            }
+            break;
         default:
             break;
     }
@@ -466,7 +533,8 @@ int main() {
         &rx_window,
         rx_window_storage,
         FFT_SIZE,
-        967 // Initial delay in samples to phase align with the input signal
+        // 961 is about best. but using 960 for now to see some errors.
+        960 // Initial delay in samples to phase align with the input signal
     );
 
     fft_visualise_init(
@@ -485,7 +553,9 @@ int main() {
     // Start core 1
     multicore_launch_core1(core1_main);
 
-    RxFrameRecord_t latest_record = {0};
+    // Static: records are large (band_power) and the stack is small
+    static RxFrameRecord_t latest_record;
+    static RxFrameRecord_t record;
     uint32_t records_received = 0;
     uint32_t last_display_ms = 0;
 
@@ -496,15 +566,18 @@ int main() {
         }
 
         // Drain every record from the receiver, keeping the latest for display
-        RxFrameRecord_t record;
+        // and logging each one when logging is on
         while (spsc_ring_pop(&rx_record_queue, &record)) {
+            if (logging) {
+                print_log_record(&record);
+            }
             latest_record = record;
             records_received++;
         }
 
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
-        if (now_ms - last_display_ms >= DISPLAY_PERIOD_MS) {
+        if (!logging && now_ms - last_display_ms >= DISPLAY_PERIOD_MS) {
             const float32_t *spectrum = frame_snapshot_acquire(&spectrum_snapshot);
             if (spectrum != NULL) {
                 draw_display(spectrum, &latest_record, records_received);
