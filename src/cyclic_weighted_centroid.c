@@ -162,22 +162,35 @@ static inline float32_t folded_power(
     return power_spectrum[i] + power_spectrum[cwc->fft_size - cwc->size + i];
 }
 
-// Power-weighted mean position, in bins relative to centre, of the folded bins
-// within +/- half_width of centre. Returns 0 if the window holds no power.
-static float32_t __not_in_flash_func(window_offset)(
+// Number of times the window is moved to its own power-weighted mean
+#define CWC_REFINE_ITERATIONS 4
+
+//
+// Power-weighted mean position (in bins) of the folded spectrum inside the
+// window [centre - half_width, centre + half_width]. The window slides
+// continuously: bins only partly inside it get a proportional weight, so the
+// result changes smoothly with centre. Returns centre if the window holds no power.
+//
+static float32_t __not_in_flash_func(window_mean)(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    int32_t centre,
-    int32_t half_width
+    float32_t centre,
+    float32_t half_width
 ) {
+    const float32_t lo = centre - half_width;
+    const float32_t hi = centre + half_width;
     float32_t moment = 0.0f;
     float32_t total = 0.0f;
-    for (int32_t k = -half_width; k <= half_width; k++) {
-        const float32_t p = folded_power(cwc, power_spectrum, centre + k);
+    for (int32_t k = (int32_t)floorf(lo); k <= (int32_t)ceilf(hi); k++) {
+        float32_t weight = 1.0f;
+        if ((float32_t)k < lo) weight = 1.0f - (lo - (float32_t)k);
+        if ((float32_t)k > hi) weight = 1.0f - ((float32_t)k - hi);
+        if (weight <= 0.0f) continue;
+        const float32_t p = weight * folded_power(cwc, power_spectrum, k);
         moment += (float32_t)k * p;
         total += p;
     }
-    return total > 0.0f ? moment / total : 0.0f;
+    return total > 0.0f ? moment / total : centre;
 }
 
 float32_t __not_in_flash_func(cyclic_weighted_centroid_refine_peak)(
@@ -186,17 +199,15 @@ float32_t __not_in_flash_func(cyclic_weighted_centroid_refine_peak)(
     const CyclicWeightedCentroidResult_t *result,
     uint32_t half_width
 ) {
-    const int32_t size = (int32_t)cwc->size;
-    const int32_t w = (int32_t)half_width;
+    // Mean shift: start at the peak bin and repeatedly move the window to the
+    // power-weighted mean of what it contains
+    float32_t centre = (float32_t)result->ubin;
+    for (uint32_t i = 0; i < CWC_REFINE_ITERATIONS; i++) {
+        centre = window_mean(cwc, power_spectrum, centre, (float32_t)half_width);
+    }
 
-    // Re-centre on the energy, then measure around the new centre
-    int32_t centre = (int32_t)result->ubin;
-    centre += (int32_t)lroundf(window_offset(cwc, power_spectrum, centre, w));
-    centre = ((centre % size) + size) % size;
-    const float32_t offset = window_offset(cwc, power_spectrum, centre, w);
-
-    float32_t angle = ((float32_t)centre + offset) * (2.0f * PI / (float32_t)size);
+    float32_t angle = centre * (2.0f * PI / (float32_t)cwc->size);
+    angle = fmodf(angle, 2.0f * PI);
     if (angle < 0.0f) angle += 2.0f * PI;
-    if (angle >= 2.0f * PI) angle -= 2.0f * PI;
     return angle;
 }

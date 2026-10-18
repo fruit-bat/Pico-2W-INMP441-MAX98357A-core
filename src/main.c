@@ -146,7 +146,7 @@ static void init_audio_system(void) {
         &arm_cfft_sR_f32_len1024, // The 1024-point complex instance is globally defined by CMSIS-DSP
         4, // Power exponent for weighting
         MAX_SYMBOLS,
-        4, // Bins either side of the peak used to refine its position (timing)
+        3, // Bins either side of the peak used to refine its position (timing)
         complex_dechirp_vector,
         fft_output_buffer,
         fft_magnitude_buffer,

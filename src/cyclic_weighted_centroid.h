@@ -202,11 +202,12 @@ void cyclic_weighted_centroid_finalize(
  *
  * With a high power_exponent the centroid locks onto the strongest bin, which
  * makes it robust but insensitive to offsets of less than about half a bin.
- * This function starts from that peak bin (result->ubin) and computes the
- * power-weighted mean position (exponent 1) of the bins within +/- half_width
- * of it. It then re-centres the window on the nearest bin to that mean and
- * computes the mean again, so the result does not depend on which of several
- * similar bins happened to be strongest.
+ * This function starts from that peak bin (result->ubin) and repeatedly moves
+ * a window of +/- half_width bins to the power-weighted mean position
+ * (exponent 1) of the bins inside it (a mean shift). The window slides
+ * continuously, with bins partly inside it weighted proportionally, so the
+ * result changes smoothly with the spectrum and does not depend on which of
+ * several similar bins happened to be strongest.
  *
  * This copes with spread-out peaks such as an acoustic channel with echoes,
  * where energy arrives over several bins; a 3-point peak fit is unstable there.
@@ -216,7 +217,7 @@ void cyclic_weighted_centroid_finalize(
  * @param cwc             The centroid configuration.
  * @param power_spectrum  The power spectrum the centroid was computed from.
  * @param result          A finalized centroid result.
- * @param half_width      Window half-width in bins (e.g. 4).
+ * @param half_width      Window half-width in bins (e.g. 3).
  * @return Refined angle in radians, in [0, 2*pi). With no power in the window
  *         the centroid angle of the peak bin is returned.
  */

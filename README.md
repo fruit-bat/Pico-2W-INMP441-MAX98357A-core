@@ -83,9 +83,11 @@ gives the timing error directly (one sample ≈ 2π/1024 rad).
 Each FFT bin after de-chirping corresponds to 16 samples of delay, so the
 spectrum around a symbol is effectively the channel's impulse response.
 Through the air, echoes spread it over about three bins, so the decoder
-measures the symbol's position as the energy centroid of ±4 bins around the
-peak (re-centred once) rather than fitting the single strongest bin. Logged
-sweeps showed this agrees across all 64 symbols to within about 2 samples.
+measures the symbol's position as the energy centroid of a ±3-bin window
+around the peak, sliding the window to its own centroid a few times (a mean
+shift) rather than fitting the single strongest bin. Logged sweeps showed this
+agrees across symbols to within about 2–3 samples, with no frame-to-frame
+flipping when echoes give the peak two humps.
 
 `symbol_timing_tracker` turns the error into delay corrections each frame.
 It can also learn a steady drift (e.g. clock mismatch between two boards), but
