@@ -105,7 +105,8 @@ static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     const ChirpSymbolRxConfig_t *config, // Configuration for symbol decoding
     ChirpSymbolRx_t *symbol_rx // Output structure to hold the decoded symbol properties
 ) {
-    // Calculate the centroid of the FFT magnitude spectrum
+    // Calculate the centroid of the FFT magnitude spectrum; only its magnitude
+    // and strength are used, as measures of how clear the symbol is
     CyclicWeightedCentroidVector_t cwc_vector;
     cyclic_weighted_centroid_init_vector(&cwc_vector);
     cyclic_weighted_centroid_accumulate_forwards(
@@ -124,11 +125,15 @@ static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     CyclicWeightedCentroidResult_t cwc_result;
     cyclic_weighted_centroid_finalize(&state->cwc, &cwc_vector, &cwc_result);
 
+    // Decide the symbol from the strongest folded bin; in noise this is far
+    // more reliable than the centroid angle
+    const uint32_t peak_bin = cyclic_weighted_centroid_peak_bin(&state->cwc, magnitude_buffer);
+
     // Refine the peak position to sub-bin precision from the energy around it;
     // this is what makes small timing errors measurable, even when echoes
     // spread the peak over several bins
     const float32_t angle = cyclic_weighted_centroid_refine_peak(
-        &state->cwc, magnitude_buffer, &cwc_result, state->peak_half_width);
+        &state->cwc, magnitude_buffer, peak_bin, state->peak_half_width);
 
     // Set the properties of the received chirp symbol based on the refined angle
     chirp_symbol_rx_set(config, symbol_rx, angle, cwc_result.magnitude, cwc_result.strength);

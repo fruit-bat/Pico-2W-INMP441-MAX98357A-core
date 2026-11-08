@@ -162,6 +162,22 @@ static inline float32_t folded_power(
     return power_spectrum[i] + power_spectrum[cwc->fft_size - cwc->size + i];
 }
 
+uint32_t __not_in_flash_func(cyclic_weighted_centroid_peak_bin)(
+    const CyclicWeightedCentroid_t *cwc,
+    const float32_t *power_spectrum
+) {
+    uint32_t peak_bin = 0;
+    float32_t peak_power = folded_power(cwc, power_spectrum, 0);
+    for (uint32_t i = 1; i < cwc->size; i++) {
+        const float32_t p = folded_power(cwc, power_spectrum, (int32_t)i);
+        if (p > peak_power) {
+            peak_power = p;
+            peak_bin = i;
+        }
+    }
+    return peak_bin;
+}
+
 // Number of times the window is moved to its own power-weighted mean
 #define CWC_REFINE_ITERATIONS 4
 
@@ -196,12 +212,12 @@ static float32_t __not_in_flash_func(window_mean)(
 float32_t __not_in_flash_func(cyclic_weighted_centroid_refine_peak)(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    const CyclicWeightedCentroidResult_t *result,
+    uint32_t start_bin,
     uint32_t half_width
 ) {
     // Mean shift: start at the peak bin and repeatedly move the window to the
     // power-weighted mean of what it contains
-    float32_t centre = (float32_t)result->ubin;
+    float32_t centre = (float32_t)start_bin;
     for (uint32_t i = 0; i < CWC_REFINE_ITERATIONS; i++) {
         centre = window_mean(cwc, power_spectrum, centre, (float32_t)half_width);
     }

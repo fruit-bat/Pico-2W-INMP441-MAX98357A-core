@@ -197,12 +197,29 @@ void cyclic_weighted_centroid_finalize(
 );
 
 /**
- * Refines the centroid to sub-bin precision using the energy in a window
- * around the peak.
+ * Finds the strongest bin of the folded spectrum.
  *
- * With a high power_exponent the centroid locks onto the strongest bin, which
- * makes it robust but insensitive to offsets of less than about half a bin.
- * This function starts from that peak bin (result->ubin) and repeatedly moves
+ * Bins are folded exactly as in the accumulate functions, i.e. bin i and its
+ * mirrored bin (fft_size - size + i) are combined, and the index of the largest
+ * combined power is returned. As a symbol decision this beats the centroid
+ * angle in noise: the centroid is pulled off the peak by the noise floor in
+ * every other bin, while the maximum is not.
+ *
+ * @param cwc             The centroid configuration.
+ * @param power_spectrum  Source power spectrum values.
+ * @return Folded bin index in [0, size).
+ */
+uint32_t cyclic_weighted_centroid_peak_bin(
+    const CyclicWeightedCentroid_t *cwc,
+    const float32_t *power_spectrum
+);
+
+/**
+ * Refines a peak to sub-bin precision using the energy in a window around it.
+ *
+ * Picking the strongest bin is robust but insensitive to offsets of less than
+ * about half a bin. This function starts from a peak bin (e.g. from
+ * cyclic_weighted_centroid_peak_bin) and repeatedly moves
  * a window of +/- half_width bins to the power-weighted mean position
  * (exponent 1) of the bins inside it (a mean shift). The window slides
  * continuously, with bins partly inside it weighted proportionally, so the
@@ -215,16 +232,16 @@ void cyclic_weighted_centroid_finalize(
  * mirrored bin (fft_size - size + i) are combined.
  *
  * @param cwc             The centroid configuration.
- * @param power_spectrum  The power spectrum the centroid was computed from.
- * @param result          A finalized centroid result.
+ * @param power_spectrum  Source power spectrum values.
+ * @param start_bin       Folded bin index to start from, in [0, size).
  * @param half_width      Window half-width in bins (e.g. 3).
  * @return Refined angle in radians, in [0, 2*pi). With no power in the window
- *         the centroid angle of the peak bin is returned.
+ *         the angle of start_bin is returned.
  */
 float32_t cyclic_weighted_centroid_refine_peak(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    const CyclicWeightedCentroidResult_t *result,
+    uint32_t start_bin,
     uint32_t half_width
 );
 
