@@ -1,0 +1,227 @@
+/**
+ * @file test_chirp_codec.c
+ *
+ * Host tests for the chirp encoder and decoder, using the same parameters as
+ * the firmware (see main.c). Received frames come from the analytic channel
+ * model in chirp_channel.c.
+ */
+
+#include <stdio.h>
+#include <math.h>
+#include "arm_math.h"
+#include "arm_const_structs.h"
+#include "chirp_decoder.h"
+#include "chirp_encoder.h"
+#include "chirp_symbol_rx.h"
+#include "chirp_channel.h"
+#include "test_util.h"
+
+int test_failures = 0;
+int test_checks = 0;
+
+// Firmware parameters (main.c)
+#define N   1024u    // FFT_SIZE: samples per symbol
+#define M   64u      // MAX_SYMBOLS
+#define SAMPLES_PER_STEP (N / M) // Cyclic shift between adjacent symbols
+static const double FS = 44100.0;
+static const double F0 = 15000.0;
+static const double VOLUME = 0.005;
+
+static float complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(N)];
+static float fft_output_buffer[CHIRP_DECODER_COMPLEX_LEN(N)];
+static float fft_magnitude_buffer[N];
+static float cos_table[M];
+static float sin_table[M];
+
+static ChirpDecoderState_t decoder;
+static ChirpEncoder_t encoder;
+static ChirpSymbolRxConfig_t rx_config;
+static ChirpChannelTx_t tx_model;
+
+static float frame[N];
+
+static void setup(void) {
+    const double bw = FS / N * M;      // One FFT bin per symbol
+    const double t = (double)N / FS;   // Symbol duration
+    const ChirpParams_t params = {
+        .sample_rate = (float32_t)FS,
+        .f0 = (float32_t)F0,
+        .chirp_rate = (float32_t)(bw / t),
+    };
+    chirp_decoder_init(&decoder, &params, N, &arm_cfft_sR_f32_len1024,
+        4, M, 3,
+        complex_dechirp_vector, fft_output_buffer, fft_magnitude_buffer,
+        cos_table, sin_table);
+    chirp_encoder_init(&encoder, decoder.complex_dechirp_vector, N, M, (float32_t)VOLUME);
+    chirp_symbol_rx_config_init(&rx_config, M);
+
+    tx_model = (ChirpChannelTx_t){
+        .sample_rate = FS,
+        .f0 = F0,
+        .chirp_rate = bw / t,
+        .samples_per_symbol = N,
+        .number_of_symbols = M,
+        .volume = VOLUME,
+    };
+}
+
+// Decoded position relative to the nearest symbol, in samples
+static double timing_error_samples(const ChirpSymbolRx_t *rx) {
+    return rx->error_angle * rx_config.symbols_per_radian * SAMPLES_PER_STEP;
+}
+
+static void decode(const float *samples, ChirpSymbolRx_t *rx) {
+    chirp_decoder_real_chirp_to_symbol(&decoder, samples, &rx_config, rx);
+}
+
+// ---------------------------------------------------------------------------
+
+// The encoder's table-driven output matches the analytic chirp
+static void test_encoder_matches_model(void) {
+    const ChirpChannel_t ideal = { .offset = 0.0, .clock_scale = 1.0, .noise_rms = 0.0 };
+    double worst = 0.0;
+    for (uint32_t s = 0; s < M; s++) {
+        static float enc_out[N];
+        chirp_encoder_symbol_to_samples(&encoder, s, enc_out);
+        chirp_channel_rx_frame(&tx_model, &ideal, &s, 1, 0, frame);
+        for (uint32_t i = 0; i < N; i++) {
+            const double d = fabs((double)enc_out[i] - (double)frame[i]);
+            if (d > worst) worst = d;
+        }
+    }
+    printf("  worst |encoder - model| = %.3g (%.3g of full scale)\n", worst, worst / VOLUME);
+    CHECK(worst < 1e-3 * VOLUME);
+}
+
+// Every symbol decodes to itself when aligned
+static void test_round_trip_all_symbols(void) {
+    double worst_err = 0.0, min_mag = 1.0;
+    for (uint32_t s = 0; s < M; s++) {
+        static float enc_out[N];
+        ChirpSymbolRx_t rx;
+        chirp_encoder_symbol_to_samples(&encoder, s, enc_out);
+        decode(enc_out, &rx);
+        CHECK_EQ_U(rx.symbol_index, s);
+        const double e = fabs(timing_error_samples(&rx));
+        if (e > worst_err) worst_err = e;
+        if (rx.magnitude < min_mag) min_mag = rx.magnitude;
+    }
+    printf("  worst |timing error| = %.4f samples, min magnitude = %.4f\n", worst_err, min_mag);
+    CHECK(worst_err < 0.2);
+}
+
+// A repeated symbol read with the window offset by d samples decodes as the
+// same symbol, with a timing error that should be d samples (|d| < half a step).
+//
+// Known limitation of the current sub-bin estimator (power-weighted mean shift
+// over +/-3 bins): for symbols near 0 and M-1 the frame is almost one unbroken
+// tone, whose narrow sinc^2 peak pulls the estimate towards the bin centre, so
+// small offsets are badly under-reported (ratio measured/d down to ~0.01 at
+// d = 0.5). Middle symbols wrap part way through the frame, giving two shorter
+// tones with wider peaks, and are close to linear. So for now this only checks
+// what the tracking loop relies on: the decision is right and the error has
+// the right sign without overshooting much (0 < measured/d < 1.5).
+static void test_timing_offset_repeated_symbol(void) {
+    printf("  offset  mean      ratio min  ratio max  (measured/offset over all symbols)\n");
+    for (double d = -7.5; d <= 7.5; d += 0.5) {
+        if (d == 0.0) continue;
+        double mean = 0.0, ratio_min = 1e9, ratio_max = -1e9;
+        for (uint32_t s = 0; s < M; s++) {
+            const uint32_t stream[3] = { s, s, s };
+            const ChirpChannel_t ch = { .offset = d, .clock_scale = 1.0, .noise_rms = 0.0 };
+            ChirpSymbolRx_t rx;
+            chirp_channel_rx_frame(&tx_model, &ch, stream, 3, 1, frame);
+            decode(frame, &rx);
+            CHECK_EQ_U(rx.symbol_index, s);
+            const double measured = timing_error_samples(&rx);
+            const double ratio = measured / d;
+            mean += measured / M;
+            if (ratio < ratio_min) ratio_min = ratio;
+            if (ratio > ratio_max) ratio_max = ratio;
+        }
+        printf("  %+5.1f   %+7.3f   %6.3f     %6.3f\n", d, mean, ratio_min, ratio_max);
+        CHECK(ratio_min > 0.0);
+        CHECK(ratio_max < 1.5);
+    }
+}
+
+// Random symbols (so the window straddles two different symbols): decisions
+// stay correct for offsets up to nearly half a step
+static void test_timing_offset_random_symbols(void) {
+    enum { COUNT = 200 };
+    static uint32_t stream[COUNT];
+    chirp_channel_seed(1);
+    for (uint32_t i = 0; i < COUNT; i++) stream[i] = chirp_channel_rand_u32() % M;
+
+    printf("  offset  errors  mean timing  rms timing\n");
+    for (double d = -7.0; d <= 7.0; d += 1.0) {
+        const ChirpChannel_t ch = { .offset = d, .clock_scale = 1.0, .noise_rms = 0.0 };
+        uint32_t errors = 0;
+        double sum = 0.0, sum_sq = 0.0;
+        for (uint32_t k = 1; k < COUNT - 1; k++) {
+            ChirpSymbolRx_t rx;
+            chirp_channel_rx_frame(&tx_model, &ch, stream, COUNT, k, frame);
+            decode(frame, &rx);
+            if (rx.symbol_index != stream[k]) errors++;
+            const double e = timing_error_samples(&rx);
+            sum += e;
+            sum_sq += e * e;
+        }
+        const double n = COUNT - 2;
+        printf("  %+5.1f   %4u    %+7.3f      %6.3f\n", d, errors, sum / n, sqrt(sum_sq / n - (sum / n) * (sum / n)));
+        CHECK_EQ_U(errors, 0);
+    }
+}
+
+// Symbol error rate against SNR (signal power / total white noise power over
+// the full band). The chirp's processing gain lets it decode well below 0 dB.
+//
+// Baseline: error free down to -6 dB. Known ~6 dB loss for middle symbols: a
+// cyclically shifted chirp wraps part way through the frame, and the two
+// pieces de-chirp into bins s and s-M. The decoder folds those by adding
+// powers, which for s = M/2 keeps half the energy and doubles the noise.
+// Adding them as complex values after a fixed phase rotation (~-107.5 degrees
+// when aligned) would recover it.
+static void test_noise(void) {
+    enum { COUNT = 500 };
+    static uint32_t stream[COUNT];
+    chirp_channel_seed(2);
+    for (uint32_t i = 0; i < COUNT; i++) stream[i] = chirp_channel_rand_u32() % M;
+
+    const double signal_rms = VOLUME / sqrt(2.0);
+    printf("  SNR dB  errors/%u  rms timing (correct symbols)\n", COUNT - 2);
+    for (int snr_db = 0; snr_db >= -24; snr_db -= 3) {
+        const ChirpChannel_t ch = {
+            .offset = 0.0,
+            .clock_scale = 1.0,
+            .noise_rms = signal_rms / pow(10.0, snr_db / 20.0),
+        };
+        uint32_t errors = 0, good = 0;
+        double sum_sq = 0.0;
+        for (uint32_t k = 1; k < COUNT - 1; k++) {
+            ChirpSymbolRx_t rx;
+            chirp_channel_rx_frame(&tx_model, &ch, stream, COUNT, k, frame);
+            decode(frame, &rx);
+            if (rx.symbol_index != stream[k]) {
+                errors++;
+            } else {
+                const double e = timing_error_samples(&rx);
+                sum_sq += e * e;
+                good++;
+            }
+        }
+        printf("  %+4d    %5u      %6.3f\n", snr_db, errors, good ? sqrt(sum_sq / good) : 0.0);
+        if (snr_db >= -6) CHECK_EQ_U(errors, 0);
+    }
+}
+
+int main(void) {
+    setup();
+    RUN_TEST(test_encoder_matches_model);
+    RUN_TEST(test_round_trip_all_symbols);
+    RUN_TEST(test_timing_offset_repeated_symbol);
+    RUN_TEST(test_timing_offset_random_symbols);
+    RUN_TEST(test_noise);
+    printf("\n%d checks, %d failures\n", test_checks, test_failures);
+    return test_failures ? 1 : 0;
+}
