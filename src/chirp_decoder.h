@@ -21,9 +21,9 @@
 //
 //        folded[k] = |X[k] + R * X[fft_size - number_of_bins + k]|^2
 //
-//      folded[k] is written into fft_magnitude_buffer[k] and the mirrored bins
-//      fft_size - number_of_bins .. fft_size - 1 are set to 0; every other bin
-//      holds the plain power |X|^2.
+//      folded[k] is written into folded_power_buffer[k], which the symbol
+//      decision and timing estimate use. fft_magnitude_buffer keeps the plain
+//      power |X|^2 of every de-chirped bin (for display and logging).
 //
 // The decoder never allocates memory. The caller provides all buffers (typically
 // as static arrays) and the decoder state only holds pointers to them.
@@ -33,13 +33,15 @@
 //   complex_dechirp_vector : CHIRP_DECODER_COMPLEX_LEN(fft_size)
 //   fft_output_buffer      : CHIRP_DECODER_COMPLEX_LEN(fft_size)
 //   fft_magnitude_buffer   : fft_size
-//   cos_table, sin_table   : number_of_bins (bins spanned by the chirp bandwidth)
+//   folded_power_buffer    : number_of_bins (bins spanned by the chirp bandwidth)
+//   cos_table, sin_table   : number_of_bins
 //
 #define CHIRP_DECODER_COMPLEX_LEN(fft_size) ((fft_size) * 2u)
 
 typedef struct {
     uint32_t fft_size;
     float32_t *fft_magnitude_buffer;        // Preallocated buffer for FFT magnitude results (length = fft_size)
+    float32_t *folded_power_buffer;         // Preallocated buffer for the coherently folded power (length = number_of_bins)
     float32_t *fft_output_buffer;           // Preallocated buffer for FFT complex output (length = fft_size * 2, interleaved real/imag)
     float32_t *complex_dechirp_vector;      // Preallocated buffer for the complex de-chirp vector (length = fft_size * 2, interleaved real/imag)
     const arm_cfft_instance_f32 *cfft_instance; // Pointer to the CMSIS-DSP CFFT instance for the specified FFT size
@@ -76,6 +78,7 @@ void chirp_decoder_init(
     float32_t *complex_dechirp_vector,     // length = fft_size * 2
     float32_t *fft_output_buffer,          // length = fft_size * 2
     float32_t *fft_magnitude_buffer,       // length = fft_size
+    float32_t *folded_power_buffer,        // length = number_of_bins
     float32_t *cos_table,                  // length = number_of_bins
     float32_t *sin_table                   // length = number_of_bins
 );

@@ -90,8 +90,9 @@ typedef struct {
     uint32_t tracking;       // enum tracking_mode in effect for this frame
     float32_t timing_error;  // Timing error in samples (positive: delay should increase)
     float32_t timing_rate;   // Tracker's drift estimate, samples per frame
-    float32_t band_power[LOG_BAND_BINS]; // FFT power |X|^2 of bins -MAX_SYMBOLS .. MAX_SYMBOLS-1
-                                         // (the band the centroid uses; bin = index mod FFT_SIZE)
+    float32_t band_power[LOG_BAND_BINS]; // De-chirped FFT power |X|^2 of bins -MAX_SYMBOLS .. MAX_SYMBOLS-1
+                                         // (bin = index mod FFT_SIZE)
+    float32_t folded_power[MAX_SYMBOLS]; // Coherently folded power the decoder decides from, bins 0 .. MAX_SYMBOLS-1
 } RxFrameRecord_t;
 
 static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
@@ -117,6 +118,7 @@ static float32_t rx_frame[FFT_SIZE];
 static float32_t complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
 static float32_t fft_output_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
 static float32_t fft_magnitude_buffer[FFT_SIZE];
+static float32_t folded_power_buffer[MAX_SYMBOLS];
 static float32_t cos_table[MAX_SYMBOLS];
 static float32_t sin_table[MAX_SYMBOLS];
 
@@ -150,6 +152,7 @@ static void init_audio_system(void) {
         complex_dechirp_vector,
         fft_output_buffer,
         fft_magnitude_buffer,
+        folded_power_buffer,
         cos_table,
         sin_table
     );
@@ -304,6 +307,7 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
     for (uint32_t i = 0; i < LOG_BAND_BINS; i++) {
         record.band_power[i] = chirp_decoder.fft_magnitude_buffer[(FFT_SIZE + i - MAX_SYMBOLS) % FFT_SIZE];
     }
+    memcpy(record.folded_power, chirp_decoder.folded_power_buffer, sizeof(record.folded_power));
 
     if (!spsc_ring_push(&rx_record_queue, &record)) {
         rx_records_dropped++;
@@ -417,17 +421,21 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
 static bool logging = false;
 
 static void print_log_header(void) {
-    printf("# chirp receiver log v1\n");
+    printf("# chirp receiver log v2\n");
     printf("# sample_rate=%.1f fft_size=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol=%u\n",
         FS, (unsigned)FFT_SIZE, (unsigned)MAX_SYMBOLS, F0, BW, (unsigned)(FFT_SIZE / MAX_SYMBOLS));
     printf("# track_alpha=%g track_beta=%g track_max_rate=%g track_rate_window=%g track_min_magnitude=%g\n",
         TRACK_ALPHA, TRACK_BETA, TRACK_MAX_RATE, TRACK_RATE_WINDOW, TRACK_MIN_MAGNITUDE);
     printf("# delay: window delay used for this frame (samples); timing_error: samples, positive = increase delay\n");
-    printf("# angle/error_angle: radians; b<k>: FFT power |X|^2 of bin k (k mod fft_size)\n");
+    printf("# angle/error_angle: radians; b<k>: de-chirped FFT power |X|^2 of bin k (k mod fft_size)\n");
+    printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");
     printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
            "timing_error,timing_rate,rx_missed,tx_missed,dropped");
     for (int32_t k = -(int32_t)MAX_SYMBOLS; k < (int32_t)MAX_SYMBOLS; k++) {
         printf(",b%ld", (long)k);
+    }
+    for (uint32_t k = 0; k < MAX_SYMBOLS; k++) {
+        printf(",f%lu", (unsigned long)k);
     }
     printf("\n");
 }
@@ -452,6 +460,9 @@ static void print_log_record(const RxFrameRecord_t *record) {
         (unsigned long)rx_records_dropped);
     for (uint32_t i = 0; i < LOG_BAND_BINS; i++) {
         printf(",%.3e", record->band_power[i]);
+    }
+    for (uint32_t i = 0; i < MAX_SYMBOLS; i++) {
+        printf(",%.3e", record->folded_power[i]);
     }
     printf("\n");
 }

@@ -30,6 +30,7 @@ void chirp_decoder_init(
     float32_t *complex_dechirp_vector,
     float32_t *fft_output_buffer,
     float32_t *fft_magnitude_buffer,
+    float32_t *folded_power_buffer,
     float32_t *cos_table,
     float32_t *sin_table
 ) {
@@ -38,6 +39,7 @@ void chirp_decoder_init(
     state->complex_dechirp_vector = complex_dechirp_vector;
     state->fft_output_buffer = fft_output_buffer;
     state->fft_magnitude_buffer = fft_magnitude_buffer;
+    state->folded_power_buffer = folded_power_buffer;
     state->peak_half_width = peak_half_width;
 
     generate_complex_dechirp_vector(complex_dechirp_vector, fft_size, params);
@@ -65,7 +67,6 @@ void chirp_decoder_init(
 
     cyclic_weighted_centroid_init(
         &state->cwc,
-        fft_size,
         power_exponent,
         number_of_bins,
         cos_table,
@@ -73,7 +74,8 @@ void chirp_decoder_init(
     );
 }
 
-// FFT of the de-chirped signal already in fft_output_buffer -> magnitudes
+// FFT of the de-chirped signal already in fft_output_buffer -> plain power of
+// every bin (fft_magnitude_buffer) and the folded power (returned)
 static float32_t* __not_in_flash_func(dechirped_to_magnitudes)(
     ChirpDecoderState_t *state
 ) {
@@ -90,7 +92,7 @@ static float32_t* __not_in_flash_func(dechirped_to_magnitudes)(
     arm_cmplx_mag_squared_f32(state->fft_output_buffer, state->fft_magnitude_buffer, state->fft_size);
 
     // Fold coherently: add the wrapped piece (bin k - size) to bin k after
-    // rotating it into phase, and clear the mirrored bins it came from
+    // rotating it into phase
     const uint32_t size = (uint32_t)state->cwc.size;
     const float32_t *x = state->fft_output_buffer;
     const float32_t rr = state->fold_rotation_re;
@@ -100,11 +102,10 @@ static float32_t* __not_in_flash_func(dechirped_to_magnitudes)(
         const float32_t br = x[2 * m], bi = x[2 * m + 1];
         const float32_t re = x[2 * k] + (rr * br - ri * bi);
         const float32_t im = x[2 * k + 1] + (rr * bi + ri * br);
-        state->fft_magnitude_buffer[k] = re * re + im * im;
-        state->fft_magnitude_buffer[m] = 0.0f;
+        state->folded_power_buffer[k] = re * re + im * im;
     }
 
-    return &state->fft_magnitude_buffer[0];
+    return state->folded_power_buffer;
 }
 
 static float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)(
@@ -153,7 +154,7 @@ static float32_t* __not_in_flash_func(chirp_decoder_real_chirp_to_magnitudes)(
 
 static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     ChirpDecoderState_t *state,
-    const float32_t* magnitude_buffer, // Input magnitude spectrum (length = fft_size)
+    const float32_t* magnitude_buffer, // Folded power spectrum (length = number_of_bins)
     const ChirpSymbolRxConfig_t *config, // Configuration for symbol decoding
     ChirpSymbolRx_t *symbol_rx // Output structure to hold the decoded symbol properties
 ) {
@@ -161,13 +162,7 @@ static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     // and strength are used, as measures of how clear the symbol is
     CyclicWeightedCentroidVector_t cwc_vector;
     cyclic_weighted_centroid_init_vector(&cwc_vector);
-    cyclic_weighted_centroid_accumulate_forwards(
-        &state->cwc,
-        magnitude_buffer,
-        state->cwc.power_exponent,
-        &cwc_vector
-    );
-    cyclic_weighted_centroid_accumulate_backwards(
+    cyclic_weighted_centroid_accumulate(
         &state->cwc,
         magnitude_buffer,
         state->cwc.power_exponent,

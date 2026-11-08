@@ -56,6 +56,33 @@ static void test_round_trip_all_symbols(void) {
     CHECK(worst_err < 0.2);
 }
 
+// fft_magnitude_buffer keeps the plain de-chirped power; folded_power_buffer
+// holds the coherent fold. Symbol M/2 wraps half way through the frame, so its
+// two pieces land in bins M/2 and N - M/2 with a quarter of the full tone's
+// power each, and folding them coherently recovers the full tone: exactly the
+// coherent sum (sqrt(a) + sqrt(b))^2 of the two raw bins, which is within a
+// few percent of the full tone (the band-pass edges trim the chirp's spectral
+// tails slightly, ~0.1 dB).
+static void test_spectrum_buffers(void) {
+    const uint32_t s = M / 2;
+    const uint32_t stream[3] = { s, s, s };
+    const ChirpChannel_t ch = { .offset = 0.0, .clock_scale = 1.0, .noise_rms = 0.0 };
+    ChirpSymbolRx_t rx;
+    chirp_channel_rx_frame(&rig_tx_model, &ch, stream, 3, 1, frame);
+    rig_decode(frame, &rx);
+
+    const double full = pow(N * VOLUME / 2.0, 2.0); // Band-pass keeps half the real amplitude
+    const double raw_a = rig_decoder.fft_magnitude_buffer[s];
+    const double raw_b = rig_decoder.fft_magnitude_buffer[N - M + s];
+    const double folded = rig_decoder.folded_power_buffer[s];
+    printf("  raw %.4f, %.4f of full tone; folded %.4f\n", raw_a / full, raw_b / full, folded / full);
+    CHECK_NEAR(raw_a / full, 0.25, 0.02);
+    CHECK_NEAR(raw_b / full, 0.25, 0.02);
+    const double coherent_sum = pow(sqrt(raw_a) + sqrt(raw_b), 2.0);
+    CHECK_NEAR(folded / coherent_sum, 1.0, 0.002);
+    CHECK_NEAR(folded / full, 1.0, 0.05);
+}
+
 // A repeated symbol read with the window offset by d samples decodes as the
 // same symbol, with a timing error that should be d samples (|d| < half a step).
 //
@@ -162,6 +189,7 @@ int main(void) {
     rig_setup();
     RUN_TEST(test_encoder_matches_model);
     RUN_TEST(test_round_trip_all_symbols);
+    RUN_TEST(test_spectrum_buffers);
     RUN_TEST(test_timing_offset_repeated_symbol);
     RUN_TEST(test_timing_offset_random_symbols);
     RUN_TEST(test_noise);

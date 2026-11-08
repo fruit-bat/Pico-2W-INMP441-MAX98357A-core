@@ -1,18 +1,15 @@
 
-#include <stdbool.h>
 #include "cyclic_weighted_centroid.h"
 #include "pico/stdlib.h"
 
 void cyclic_weighted_centroid_init(
     CyclicWeightedCentroid_t *cwc,
-    size_t fft_size,
     uint32_t power_exponent,
     size_t size,
     float32_t *cos_table,
     float32_t *sin_table
 ) {
     cwc->size = size;
-    cwc->fft_size = fft_size;
     cwc->cos_table = cos_table;
     cwc->sin_table = sin_table;
     cwc->power_exponent = power_exponent;
@@ -59,13 +56,12 @@ static inline float32_t weight_of(float32_t value, uint32_t k) {
 
 //
 // Accumulation loop. Always inlined so that each call below, with constant
-// k and direction, compiles to its own loop with no per-bin branching.
+// k, compiles to its own loop with no per-bin branching.
 //
 static inline __attribute__((always_inline)) void accumulate(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
     uint32_t k,
-    bool backwards,
     CyclicWeightedCentroidVector_t *result
 ) {
     float32_t x = result->x;
@@ -73,11 +69,10 @@ static inline __attribute__((always_inline)) void accumulate(
     float32_t weight_sum = result->weight_sum;
 
     for (size_t i = 0; i < cwc->size; i++) {
-        const float32_t value = backwards ? power_spectrum[cwc->fft_size - 1 - i] : power_spectrum[i];
-        const size_t index = backwards ? cwc->size - 1 - i : i;
+        const float32_t value = power_spectrum[i];
         const float32_t weight = weight_of(value > 0.0f ? value : 0.0f, k);
-        x += weight * cwc->cos_table[index];
-        y += weight * cwc->sin_table[index];
+        x += weight * cwc->cos_table[i];
+        y += weight * cwc->sin_table[i];
         weight_sum += weight;
     }
 
@@ -89,38 +84,19 @@ static inline __attribute__((always_inline)) void accumulate(
 //
 // Chooses the weighting method once per call rather than once per bin.
 //
-static void __not_in_flash_func(accumulate_dispatch)(
+void __not_in_flash_func(cyclic_weighted_centroid_accumulate)(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
     uint32_t power_exponent,
-    bool backwards,
     CyclicWeightedCentroidVector_t *result
 ) {
     switch (power_exponent) {
-        case 1:  accumulate(cwc, power_spectrum, 1, backwards, result); break;
-        case 2:  accumulate(cwc, power_spectrum, 2, backwards, result); break;
-        case 3:  accumulate(cwc, power_spectrum, 3, backwards, result); break;
-        case 4:  accumulate(cwc, power_spectrum, 4, backwards, result); break;
-        default: accumulate(cwc, power_spectrum, power_exponent, backwards, result); break; // int_pow
+        case 1:  accumulate(cwc, power_spectrum, 1, result); break;
+        case 2:  accumulate(cwc, power_spectrum, 2, result); break;
+        case 3:  accumulate(cwc, power_spectrum, 3, result); break;
+        case 4:  accumulate(cwc, power_spectrum, 4, result); break;
+        default: accumulate(cwc, power_spectrum, power_exponent, result); break; // int_pow
     }
-}
-
-void __not_in_flash_func(cyclic_weighted_centroid_accumulate_backwards)(
-    CyclicWeightedCentroid_t *cwc, 
-    const float32_t *power_spectrum,
-    uint32_t power_exponent,
-    CyclicWeightedCentroidVector_t *result
-) {
-    accumulate_dispatch(cwc, power_spectrum, power_exponent, true, result);
-}
-
-void __not_in_flash_func(cyclic_weighted_centroid_accumulate_forwards)(
-    CyclicWeightedCentroid_t *cwc, 
-    const float32_t *power_spectrum, 
-    uint32_t power_exponent,
-    CyclicWeightedCentroidVector_t *result
-) {
-    accumulate_dispatch(cwc, power_spectrum, power_exponent, false, result);
 }
 
 void __not_in_flash_func(cyclic_weighted_centroid_finalize)(
@@ -151,15 +127,14 @@ void __not_in_flash_func(cyclic_weighted_centroid_finalize)(
 }
 
 
-// Power of bin index (mod size), combined with its mirrored negative-frequency bin
-static inline float32_t folded_power(
+// Power of bin index, taken mod size (the spectrum is circular)
+static inline float32_t circular_power(
     const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
     int32_t index
 ) {
     const int32_t size = (int32_t)cwc->size;
-    const uint32_t i = (uint32_t)(((index % size) + size) % size);
-    return power_spectrum[i] + power_spectrum[cwc->fft_size - cwc->size + i];
+    return power_spectrum[((index % size) + size) % size];
 }
 
 uint32_t __not_in_flash_func(cyclic_weighted_centroid_peak_bin)(
@@ -167,9 +142,9 @@ uint32_t __not_in_flash_func(cyclic_weighted_centroid_peak_bin)(
     const float32_t *power_spectrum
 ) {
     uint32_t peak_bin = 0;
-    float32_t peak_power = folded_power(cwc, power_spectrum, 0);
+    float32_t peak_power = power_spectrum[0];
     for (uint32_t i = 1; i < cwc->size; i++) {
-        const float32_t p = folded_power(cwc, power_spectrum, (int32_t)i);
+        const float32_t p = power_spectrum[i];
         if (p > peak_power) {
             peak_power = p;
             peak_bin = i;
@@ -182,7 +157,7 @@ uint32_t __not_in_flash_func(cyclic_weighted_centroid_peak_bin)(
 #define CWC_REFINE_ITERATIONS 4
 
 //
-// Power-weighted mean position (in bins) of the folded spectrum inside the
+// Power-weighted mean position (in bins) of the circular spectrum inside the
 // window [centre - half_width, centre + half_width]. The window slides
 // continuously: bins only partly inside it get a proportional weight, so the
 // result changes smoothly with centre. Returns centre if the window holds no power.
@@ -202,7 +177,7 @@ static float32_t __not_in_flash_func(window_mean)(
         if ((float32_t)k < lo) weight = 1.0f - (lo - (float32_t)k);
         if ((float32_t)k > hi) weight = 1.0f - ((float32_t)k - hi);
         if (weight <= 0.0f) continue;
-        const float32_t p = weight * folded_power(cwc, power_spectrum, k);
+        const float32_t p = weight * circular_power(cwc, power_spectrum, k);
         moment += (float32_t)k * p;
         total += p;
     }
