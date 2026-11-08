@@ -8,71 +8,17 @@
 
 #include <stdio.h>
 #include <math.h>
-#include "arm_math.h"
-#include "arm_const_structs.h"
-#include "chirp_decoder.h"
-#include "chirp_encoder.h"
-#include "chirp_symbol_rx.h"
-#include "chirp_channel.h"
+#include "chirp_test_rig.h"
 #include "test_util.h"
 
 int test_failures = 0;
 int test_checks = 0;
 
-// Firmware parameters (main.c)
-#define N   1024u    // FFT_SIZE: samples per symbol
-#define M   64u      // MAX_SYMBOLS
-#define SAMPLES_PER_STEP (N / M) // Cyclic shift between adjacent symbols
-static const double FS = 44100.0;
-static const double F0 = 15000.0;
-static const double VOLUME = 0.005;
-
-static float complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(N)];
-static float fft_output_buffer[CHIRP_DECODER_COMPLEX_LEN(N)];
-static float fft_magnitude_buffer[N];
-static float cos_table[M];
-static float sin_table[M];
-
-static ChirpDecoderState_t decoder;
-static ChirpEncoder_t encoder;
-static ChirpSymbolRxConfig_t rx_config;
-static ChirpChannelTx_t tx_model;
+#define N RIG_N
+#define M RIG_M
+#define VOLUME RIG_VOLUME
 
 static float frame[N];
-
-static void setup(void) {
-    const double bw = FS / N * M;      // One FFT bin per symbol
-    const double t = (double)N / FS;   // Symbol duration
-    const ChirpParams_t params = {
-        .sample_rate = (float32_t)FS,
-        .f0 = (float32_t)F0,
-        .chirp_rate = (float32_t)(bw / t),
-    };
-    chirp_decoder_init(&decoder, &params, N, &arm_cfft_sR_f32_len1024,
-        4, M, 3,
-        complex_dechirp_vector, fft_output_buffer, fft_magnitude_buffer,
-        cos_table, sin_table);
-    chirp_encoder_init(&encoder, decoder.complex_dechirp_vector, N, M, (float32_t)VOLUME);
-    chirp_symbol_rx_config_init(&rx_config, M);
-
-    tx_model = (ChirpChannelTx_t){
-        .sample_rate = FS,
-        .f0 = F0,
-        .chirp_rate = bw / t,
-        .samples_per_symbol = N,
-        .number_of_symbols = M,
-        .volume = VOLUME,
-    };
-}
-
-// Decoded position relative to the nearest symbol, in samples
-static double timing_error_samples(const ChirpSymbolRx_t *rx) {
-    return rx->error_angle * rx_config.symbols_per_radian * SAMPLES_PER_STEP;
-}
-
-static void decode(const float *samples, ChirpSymbolRx_t *rx) {
-    chirp_decoder_real_chirp_to_symbol(&decoder, samples, &rx_config, rx);
-}
 
 // ---------------------------------------------------------------------------
 
@@ -82,8 +28,8 @@ static void test_encoder_matches_model(void) {
     double worst = 0.0;
     for (uint32_t s = 0; s < M; s++) {
         static float enc_out[N];
-        chirp_encoder_symbol_to_samples(&encoder, s, enc_out);
-        chirp_channel_rx_frame(&tx_model, &ideal, &s, 1, 0, frame);
+        chirp_encoder_symbol_to_samples(&rig_encoder, s, enc_out);
+        chirp_channel_rx_frame(&rig_tx_model, &ideal, &s, 1, 0, frame);
         for (uint32_t i = 0; i < N; i++) {
             const double d = fabs((double)enc_out[i] - (double)frame[i]);
             if (d > worst) worst = d;
@@ -99,10 +45,10 @@ static void test_round_trip_all_symbols(void) {
     for (uint32_t s = 0; s < M; s++) {
         static float enc_out[N];
         ChirpSymbolRx_t rx;
-        chirp_encoder_symbol_to_samples(&encoder, s, enc_out);
-        decode(enc_out, &rx);
+        chirp_encoder_symbol_to_samples(&rig_encoder, s, enc_out);
+        rig_decode(enc_out, &rx);
         CHECK_EQ_U(rx.symbol_index, s);
-        const double e = fabs(timing_error_samples(&rx));
+        const double e = fabs(rig_timing_error_samples(&rx));
         if (e > worst_err) worst_err = e;
         if (rx.magnitude < min_mag) min_mag = rx.magnitude;
     }
@@ -130,10 +76,10 @@ static void test_timing_offset_repeated_symbol(void) {
             const uint32_t stream[3] = { s, s, s };
             const ChirpChannel_t ch = { .offset = d, .clock_scale = 1.0, .noise_rms = 0.0 };
             ChirpSymbolRx_t rx;
-            chirp_channel_rx_frame(&tx_model, &ch, stream, 3, 1, frame);
-            decode(frame, &rx);
+            chirp_channel_rx_frame(&rig_tx_model, &ch, stream, 3, 1, frame);
+            rig_decode(frame, &rx);
             CHECK_EQ_U(rx.symbol_index, s);
-            const double measured = timing_error_samples(&rx);
+            const double measured = rig_timing_error_samples(&rx);
             const double ratio = measured / d;
             mean += measured / M;
             if (ratio < ratio_min) ratio_min = ratio;
@@ -160,10 +106,10 @@ static void test_timing_offset_random_symbols(void) {
         double sum = 0.0, sum_sq = 0.0;
         for (uint32_t k = 1; k < COUNT - 1; k++) {
             ChirpSymbolRx_t rx;
-            chirp_channel_rx_frame(&tx_model, &ch, stream, COUNT, k, frame);
-            decode(frame, &rx);
+            chirp_channel_rx_frame(&rig_tx_model, &ch, stream, COUNT, k, frame);
+            rig_decode(frame, &rx);
             if (rx.symbol_index != stream[k]) errors++;
-            const double e = timing_error_samples(&rx);
+            const double e = rig_timing_error_samples(&rx);
             sum += e;
             sum_sq += e * e;
         }
@@ -200,12 +146,12 @@ static void test_noise(void) {
         double sum_sq = 0.0;
         for (uint32_t k = 1; k < COUNT - 1; k++) {
             ChirpSymbolRx_t rx;
-            chirp_channel_rx_frame(&tx_model, &ch, stream, COUNT, k, frame);
-            decode(frame, &rx);
+            chirp_channel_rx_frame(&rig_tx_model, &ch, stream, COUNT, k, frame);
+            rig_decode(frame, &rx);
             if (rx.symbol_index != stream[k]) {
                 errors++;
             } else {
-                const double e = timing_error_samples(&rx);
+                const double e = rig_timing_error_samples(&rx);
                 sum_sq += e * e;
                 good++;
             }
@@ -216,7 +162,7 @@ static void test_noise(void) {
 }
 
 int main(void) {
-    setup();
+    rig_setup();
     RUN_TEST(test_encoder_matches_model);
     RUN_TEST(test_round_trip_all_symbols);
     RUN_TEST(test_timing_offset_repeated_symbol);

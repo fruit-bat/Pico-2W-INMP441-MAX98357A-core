@@ -51,6 +51,8 @@ add_library(chirp_dsp STATIC
     ${SRC_DIR}/chirp_encoder.c
     ${SRC_DIR}/chirp_symbol_rx.c
     ${SRC_DIR}/cyclic_weighted_centroid.c
+    ${SRC_DIR}/rx_sample_window.c
+    ${SRC_DIR}/symbol_timing_tracker.c
 )
 target_include_directories(chirp_dsp PUBLIC
     ${SRC_DIR}
@@ -58,12 +60,23 @@ target_include_directories(chirp_dsp PUBLIC
 )
 target_link_libraries(chirp_dsp PUBLIC cmsisdsp_host m)
 
+# Shared test support: channel model and firmware-configured codec
+add_library(test_support STATIC
+    chirp_channel.c
+    chirp_test_rig.c
+)
+target_include_directories(test_support PUBLIC ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(test_support PRIVATE -Wall -Wextra)
+target_link_libraries(test_support PUBLIC chirp_dsp)
+
 enable_testing()
 
-add_executable(test_chirp_codec
-    test_chirp_codec.c
-    chirp_channel.c
-)
+add_executable(test_chirp_codec test_chirp_codec.c)
 target_compile_options(test_chirp_codec PRIVATE -Wall -Wextra)
-target_link_libraries(test_chirp_codec PRIVATE chirp_dsp)
+target_link_libraries(test_chirp_codec PRIVATE test_support)
 add_test(NAME chirp_codec COMMAND test_chirp_codec)
+
+add_executable(test_timing test_timing.c)
+target_compile_options(test_timing PRIVATE -Wall -Wextra)
+target_link_libraries(test_timing PRIVATE test_support)
+add_test(NAME timing COMMAND test_timing)
