@@ -60,13 +60,14 @@ static void test_round_trip_all_symbols(void) {
 // same symbol, with a timing error that should be d samples (|d| < half a step).
 //
 // Known limitation of the current sub-bin estimator (power-weighted mean shift
-// over +/-3 bins): for symbols near 0 and M-1 the frame is almost one unbroken
-// tone, whose narrow sinc^2 peak pulls the estimate towards the bin centre, so
-// small offsets are badly under-reported (ratio measured/d down to ~0.01 at
-// d = 0.5). Middle symbols wrap part way through the frame, giving two shorter
-// tones with wider peaks, and are close to linear. So for now this only checks
-// what the tracking loop relies on: the decision is right and the error has
-// the right sign without overshooting much (0 < measured/d < 1.5).
+// over +/-3 bins): with coherent folding every symbol de-chirps to one
+// full-length tone, whose narrow sinc^2 peak pulls the estimate towards the
+// bin centre, so small offsets are under-reported (measured/d about 0.1 to 0.4
+// within a few samples of lock, approaching 1 near half a step). It is
+// consistent across symbols, so the tracking loop converges, just with a
+// lower effective gain. For now this only checks what the loop relies on: the
+// decision is right and the error has the right sign without overshooting
+// (0 < measured/d < 1.5).
 static void test_timing_offset_repeated_symbol(void) {
     printf("  offset  mean      ratio min  ratio max  (measured/offset over all symbols)\n");
     for (double d = -7.5; d <= 7.5; d += 0.5) {
@@ -122,12 +123,8 @@ static void test_timing_offset_random_symbols(void) {
 // Symbol error rate against SNR (signal power / total white noise power over
 // the full band). The chirp's processing gain lets it decode well below 0 dB.
 //
-// Baseline: error free down to -6 dB. Known ~6 dB loss for middle symbols: a
-// cyclically shifted chirp wraps part way through the frame, and the two
-// pieces de-chirp into bins s and s-M. The decoder folds those by adding
-// powers, which for s = M/2 keeps half the energy and doubles the noise.
-// Adding them as complex values after a fixed phase rotation (~-107.5 degrees
-// when aligned) would recover it.
+// Baseline: error free down to -9 dB (with the band-pass and coherent fold;
+// previously -6 dB, when the wrapped pieces were folded by adding powers).
 static void test_noise(void) {
     enum { COUNT = 500 };
     static uint32_t stream[COUNT];
@@ -157,7 +154,7 @@ static void test_noise(void) {
             }
         }
         printf("  %+4d    %5u      %6.3f\n", snr_db, errors, good ? sqrt(sum_sq / good) : 0.0);
-        if (snr_db >= -6) CHECK_EQ_U(errors, 0);
+        if (snr_db >= -9) CHECK_EQ_U(errors, 0);
     }
 }
 

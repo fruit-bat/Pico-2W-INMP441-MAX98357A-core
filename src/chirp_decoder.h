@@ -7,6 +7,24 @@
 #include "cyclic_weighted_centroid.h"
 
 //
+// Decoding a frame:
+//
+//   1. (Real input only) Band-pass: FFT, keep only the bins of the chirp band
+//      (positive frequencies f0 .. f0 + bandwidth), inverse FFT. This gives a
+//      complex band-limited signal, removing out-of-band noise and the
+//      negative-frequency image before de-chirping.
+//   2. De-chirp (multiply by the conjugate up-chirp) and FFT.
+//   3. Fold coherently. A symbol is a cyclically shifted chirp, so it wraps
+//      part way through the frame and its two pieces de-chirp into bins k and
+//      k - number_of_bins. They are added as complex values after a fixed phase
+//      rotation that lines them up (exact when aligned to the symbol grid):
+//
+//        folded[k] = |X[k] + R * X[fft_size - number_of_bins + k]|^2
+//
+//      folded[k] is written into fft_magnitude_buffer[k] and the mirrored bins
+//      fft_size - number_of_bins .. fft_size - 1 are set to 0; every other bin
+//      holds the plain power |X|^2.
+//
 // The decoder never allocates memory. The caller provides all buffers (typically
 // as static arrays) and the decoder state only holds pointers to them.
 //
@@ -27,6 +45,10 @@ typedef struct {
     const arm_cfft_instance_f32 *cfft_instance; // Pointer to the CMSIS-DSP CFFT instance for the specified FFT size
     CyclicWeightedCentroid_t cwc;           // Centroid configuration for symbol decoding
     uint32_t peak_half_width;               // Bins either side of the peak used to refine its position
+    uint32_t band_first_bin;                // First FFT bin kept by the band-pass (real input)
+    uint32_t band_last_bin;                 // Last FFT bin kept by the band-pass (inclusive)
+    float32_t fold_rotation_re;             // R: rotation applied to the wrapped piece before folding
+    float32_t fold_rotation_im;
 } ChirpDecoderState_t;
 
 //
@@ -66,9 +88,9 @@ ChirpSymbolRx_t* chirp_decoder_complex_chirp_to_symbol(
     ChirpSymbolRx_t *symbol_rx // Output structure to hold the decoded symbol properties
 );
 
-// Real chirp -> Magnitudes -> ChirpSymbolRx_t
-// Equivalent to the complex version with all imaginary parts zero, but avoids
-// staging an interleaved complex input buffer.
+// Real chirp -> Band-pass -> Magnitudes -> ChirpSymbolRx_t
+// The band-pass turns the real input into a complex band-limited signal, which
+// is then decoded as by the complex version.
 ChirpSymbolRx_t* chirp_decoder_real_chirp_to_symbol(
     ChirpDecoderState_t *state,
     const float32_t* real_input_buffer, // Real input samples (length = fft_size)
