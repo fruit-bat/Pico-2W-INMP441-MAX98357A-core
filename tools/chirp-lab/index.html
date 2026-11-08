@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Chirp Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!--
+  Chirp Lab: the firmware's receive path, one stage per section.
+  Structure (see README.md): dsp.js = maths (mirrors chirp_decoder.c),
+  charts.js = plotting, app.js = controls and wiring, this file = layout.
+  Each <figure id="..."> is filled in by the matching function in app.js.
+-->
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Chirp Lab</h1>
+      <p class="sub">One received frame through the firmware's decoder: a cyclically shifted real up-chirp for symbol <i>k</i> plus noise is band-passed, de-chirped by C₀*, transformed with an <span id="nLabel">1024</span>-point FFT, folded coherently into <span id="binsLabel">64</span> bins, and decided.</p>
+    </div>
+    <span class="formula">B = L·M·f<sub>s</sub>/N · T = N/f<sub>s</sub> · 1 symbol = N/M samples = L bins</span>
+  </header>
+
+  <div class="layout">
+    <aside class="rack" id="rack" aria-label="Parameters">
+      <!-- Built by app.js from CONTROLS -->
+    </aside>
+
+    <main style="display:grid; gap:24px; min-width:0">
+      <div class="readouts" aria-live="polite">
+        <div class="ro"><span class="k">Decoded k</span><span class="v" id="roK">–</span><span class="u" id="roKU">–</span></div>
+        <div class="ro"><span class="k">Refined position</span><span class="v" id="roPos">–</span><span class="u" id="roPosU">bins</span></div>
+        <div class="ro"><span class="k">Timing error (decoder)</span><span class="v" id="roTe">–</span><span class="u" id="roTeU">samples</span></div>
+        <div class="ro"><span class="k">True tone offset</span><span class="v" id="roTx">–</span><span class="u" id="roTxU">samples</span></div>
+        <div class="ro"><span class="k">Centroid magnitude</span><span class="v" id="roMag">–</span><span class="u">0 … 1, tracker needs ≥ 0.8</span></div>
+        <div class="ro"><span class="k">Strength</span><span class="v" id="roStr">–</span><span class="u">(|R|²)^(1/(2+p)); scales with level</span></div>
+        <div class="ro"><span class="k">Coherent fold gain</span><span class="v" id="roGain">–</span><span class="u">at the peak, vs power sum</span></div>
+        <div class="ro"><span class="k">Decision margin</span><span class="v" id="roMargin">–</span><span class="u">peak vs next bin (beyond ±1)</span></div>
+      </div>
+
+      <section class="section">
+        <div class="section-head"><h2><span class="stage-no">1</span>Received signal</h2><p>cos chirp shifted by k·N/M samples, window offset and time scale applied, plus white noise</p></div>
+        <div class="grid2">
+          <figure id="figRxTime">
+            <figcaption><div><b>Received frame</b><span class="formula">x[n] against sample</span></div></figcaption>
+            <canvas aria-label="Received real signal against sample index"></canvas>
+          </figure>
+          <figure id="figRxSpec">
+            <figcaption><div><b>Received spectrum</b><span class="formula">|FFT x|² in dB re a full tone, 0 … f<sub>s</sub>/2</span></div>
+              <div class="legend"><span style="--sw:var(--band)">chirp band</span></div></figcaption>
+            <canvas aria-label="Spectrum of the received signal with the chirp band shaded"></canvas>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head"><h2><span class="stage-no">2</span>Band-pass</h2><p>FFT, keep bins <span id="bandLabel">–</span> (the chirp band, positive frequencies only), inverse FFT → complex band-limited signal</p></div>
+        <div class="grid2">
+          <figure id="figBpTime">
+            <figcaption><div><b>Band-limited signal</b><span class="formula">Re, Im against sample</span></div>
+              <div class="legend"><span style="--sw:var(--re)">Re</span><span style="--sw:var(--im)">Im</span></div></figcaption>
+            <canvas aria-label="Real and imaginary parts of the band-limited signal"></canvas>
+          </figure>
+          <figure id="figBpSpec">
+            <figcaption><div><b>Spectrum kept</b><span class="formula">dB re a full tone, −f<sub>s</sub>/2 … f<sub>s</sub>/2</span></div>
+              <div class="legend"><span style="--sw:var(--mark)">before</span><span style="--sw:var(--re)">after</span></div></figcaption>
+            <canvas aria-label="Spectrum before and after the band-pass"></canvas>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head"><h2><span class="stage-no">3</span>De-chirp</h2><p>× C₀* then FFT. The shifted chirp wraps part way through the frame, so its two pieces land in bins kL and kL − B</p></div>
+        <div class="grid2">
+          <figure id="figDcTime">
+            <figcaption><div><b>De-chirped signal</b><span class="formula">Re, Im against sample</span></div>
+              <div class="legend"><span style="--sw:var(--re)">Re</span><span style="--sw:var(--im)">Im</span></div></figcaption>
+            <canvas aria-label="Real and imaginary parts of the de-chirped signal, with the wrap point marked"></canvas>
+          </figure>
+          <figure id="figDcSpec">
+            <figcaption><div><b>De-chirped spectrum</b><span class="formula">|X|² in dB re a full tone against signed bin</span></div>
+              <div class="legend"><span style="--sw:var(--band)">folded range</span></div></figcaption>
+            <canvas aria-label="Spectrum of the de-chirped signal against signed bin"></canvas>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head"><h2><span class="stage-no">4</span>Fold</h2><p>folded[k] = |X[k] + R·X[k − B]|², R = e<sup>j<span id="rotLabel">–</span></sup> lines the two pieces up in phase</p></div>
+        <figure id="figFold">
+          <figcaption><div><b>Folded power</b><span class="formula">fraction of a full tone, bins 0 … B−1</span></div>
+            <div class="legend"><span style="--sw:var(--re)" id="foldLegendA">coherent (firmware)</span><span style="--sw:var(--im)" id="foldLegendB">power sum (old)</span></div></figcaption>
+          <canvas aria-label="Folded power per bin, comparing coherent folding with the old power sum"></canvas>
+        </figure>
+      </section>
+
+      <section class="section">
+        <div class="section-head"><h2><span class="stage-no">5</span>Decide</h2><p>symbol = strongest bin; position refined by mean shift; centroid gives magnitude and strength</p></div>
+        <div class="grid2">
+          <figure id="figPolar" class="polarfig">
+            <figcaption><div><b>Centroid</b><span class="formula">spoke i: (folded/max)<sup>p</sup> at 2πi/B</span></div>
+              <div class="legend"><span style="--sw:var(--im)">mean vector</span><span style="--sw:var(--mark)">true position</span></div></figcaption>
+            <canvas aria-label="Polar plot of the folded power with the centroid vector"></canvas>
+          </figure>
+          <figure id="figRefine">
+            <figcaption><div><b>Peak refinement</b><span class="formula">mean shift, ±half-width window, 4 iterations</span></div>
+              <div class="legend"><span style="--sw:var(--band)">final window</span></div></figcaption>
+            <canvas aria-label="Folded power near the peak with the mean-shift window"></canvas>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head"><h2>Derived parameters</h2><p>as computed by chirp_decoder_init</p></div>
+        <div class="tablewrap">
+          <table class="regions params">
+            <thead><tr><th>Quantity</th><th>Value</th><th>Note</th></tr></thead>
+            <tbody id="paramRows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<script src="dsp.js"></script>
+<script src="charts.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

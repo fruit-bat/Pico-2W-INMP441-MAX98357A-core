@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chirp Lab Checks</title>
+<style>
+  :root { --bg: #f3f5f7; --fg: #14181d; --line: #dde2e8; --good: #1f8a4c; --bad: #c0392b; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #111315; --fg: #eef0f2; --line: #2c3036; --good: #45b877; --bad: #e5604f; } }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.45 ui-monospace, Menlo, monospace; padding: 20px 16px; }
+  table { border-collapse: collapse; width: 100%; max-width: 1000px; }
+  td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .pass { color: var(--good); } .fail { color: var(--bad); font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Chirp lab checks</h1>
+<p>Checks dsp.js against the firmware's behaviour, using numbers from the C host
+tests (tests/test_chirp_codec.c, run with <code>ctest --test-dir tests/build -V</code>).
+If the firmware's decoder changes, update dsp.js and the expected values here.</p>
+<p id="summary"></p>
+<table><thead><tr><th>Result</th><th>Check</th><th>Detail</th></tr></thead><tbody id="rows"></tbody></table>
+
+<script src="dsp.js"></script>
+<script>
+'use strict';
+const D = ChirpDsp;
+const results = [];
+function check(name, ok, detail) { results.push({ name, ok: !!ok, detail }); }
+const near = (a, b, tol) => Math.abs(a - b) <= tol;
+
+// Firmware configuration (main.c) and decoder options (chirp_decoder_init)
+const cfg = D.chirpConfig({ M: 64, L: 1, N: 1024, fs: 44100, f0: 15000 });
+const opts = { bandPass: true, foldMethod: 'coherent', powerExponent: 4, halfWidth: 3 };
+const dv = D.dechirpVector(cfg);
+const silence = new Float64Array(cfg.N);
+const frame = (k, offset = 0) => D.receivedSignal(cfg, { k, offset, ppm: 0, snrDb: null }, silence);
+
+// FFT forward then inverse returns the input
+{
+  const re = Float64Array.from({ length: 256 }, (_, i) => Math.sin(i * 0.37) + 0.1 * i % 3);
+  const im = Float64Array.from({ length: 256 }, (_, i) => Math.cos(i * 0.11));
+  const r = Float64Array.from(re), q = Float64Array.from(im);
+  D.fft(r, q); D.fft(r, q, true);
+  let worst = 0;
+  for (let i = 0; i < 256; i++) worst = Math.max(worst, Math.abs(r[i] - re[i]), Math.abs(q[i] - im[i]));
+  check('FFT round trip (inverse scales by 1/N)', worst < 1e-9, `worst error ${worst.toExponential(2)}`);
+}
+
+// Derived parameters match chirp_decoder_init
+check('Band-pass bins 348 .. 413', cfg.bandFirst === 348 && cfg.bandLast === 413, `${cfg.bandFirst} .. ${cfg.bandLast}`);
+check('Fold rotation about +107.75°', near(cfg.foldTurns * 360, 107.75, 0.05), `${(cfg.foldTurns * 360).toFixed(3)}°`);
+
+// test_spectrum_buffers: symbol 32 wraps half way; raw 0.2465 / 0.2407, folded 0.9745 of a full tone
+{
+  const r = D.decodeFrame(cfg, frame(32), opts, dv);
+  const full = (cfg.N / 2) ** 2; // amplitude 1, band-pass keeps half
+  const a = r.fold.first[32] / full, b = r.fold.second[32] / full, f = r.fold.coherent[32] / full;
+  check('Symbol 32: raw pieces ≈ 0.2465, 0.2407 of full tone', near(a, 0.2465, 0.002) && near(b, 0.2407, 0.002),
+    `${a.toFixed(4)}, ${b.toFixed(4)}`);
+  check('Symbol 32: coherent fold ≈ 0.9745 of full tone', near(f, 0.9745, 0.002), f.toFixed(4));
+  const sum = (Math.sqrt(a) + Math.sqrt(b)) ** 2;
+  check('Symbol 32: fold equals coherent sum of the pieces', near(f / sum, 1, 0.002), (f / sum).toFixed(5));
+}
+
+// test_round_trip_all_symbols: every symbol decodes to itself; worst timing error 0.0697
+{
+  let wrong = 0, worst = 0, minMag = 1;
+  for (let k = 0; k < cfg.M; k++) {
+    const r = D.decodeFrame(cfg, frame(k), opts, dv);
+    if (r.sym.symbolIndex !== k) wrong++;
+    worst = Math.max(worst, Math.abs(r.timingError));
+    minMag = Math.min(minMag, r.centroid.magnitude);
+  }
+  check('All 64 symbols decode when aligned', wrong === 0, `${wrong} wrong`);
+  check('Worst aligned timing error ≈ 0.07 samples', worst < 0.1, `${worst.toFixed(4)} samples`);
+  check('Centroid magnitude ≈ 1 when clean', minMag > 0.999, minMag.toFixed(4));
+}
+
+// test_timing_offset_repeated_symbol: mean measured timing error over all symbols
+{
+  const expected = [[-4, -1.780], [2, 0.510], [7, 6.182]];
+  for (const [d, mean] of expected) {
+    let sum = 0;
+    for (let k = 0; k < cfg.M; k++) sum += D.decodeFrame(cfg, frame(k, d), opts, dv).timingError;
+    const got = sum / cfg.M;
+    check(`Offset ${d > 0 ? '+' : ''}${d}: mean measured ≈ ${mean}`, near(got, mean, 0.03), `${got.toFixed(3)} samples`);
+  }
+}
+
+// The old power-sum fold keeps only the sum of the two pieces' powers: for
+// symbol 32 about half a full tone (0.2465 + 0.2407), the loss the coherent
+// fold removes
+{
+  const r = D.decodeFrame(cfg, frame(32), { ...opts, foldMethod: 'power' }, dv);
+  const f = r.fold.folded[32] / (cfg.N / 2) ** 2;
+  check('Power fold of symbol 32 ≈ 0.4872 of full tone', near(f, 0.4872, 0.003), f.toFixed(4));
+  check('Power fold still decodes symbol 32', r.sym.symbolIndex === 32, `decoded ${r.sym.symbolIndex}`);
+}
+
+const failed = results.filter(r => !r.ok).length;
+document.getElementById('rows').innerHTML = results.map(r =>
+  `<tr><td class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'pass' : 'FAIL'}</td><td>${r.name}</td><td>${r.detail}</td></tr>`).join('');
+const summary = document.getElementById('summary');
+summary.textContent = failed ? `${failed} of ${results.length} checks FAILED` : `All ${results.length} checks passed`;
+summary.className = failed ? 'fail' : 'pass';
+</script>
+</body>
+</html>
