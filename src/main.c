@@ -116,9 +116,12 @@ static float32_t rx_frame[FFT_SIZE];
 
 // Statically allocated storage for the chirp decoder (no malloc)
 static float32_t complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t complex_dechirp_half_vector[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t fft_half_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
 static float32_t fft_output_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
 static float32_t fft_magnitude_buffer[FFT_SIZE];
 static float32_t folded_power_buffer[MAX_SYMBOLS];
+static float32_t fine_power_buffer[CHIRP_DECODER_FINE_LEN(MAX_SYMBOLS)];
 static float32_t cos_table[MAX_SYMBOLS];
 static float32_t sin_table[MAX_SYMBOLS];
 
@@ -150,9 +153,12 @@ static void init_audio_system(void) {
         MAX_SYMBOLS,
         3, // Bins either side of the peak used to refine its position (timing)
         complex_dechirp_vector,
+        complex_dechirp_half_vector,
+        fft_half_buffer,
         fft_output_buffer,
         fft_magnitude_buffer,
         folded_power_buffer,
+        fine_power_buffer,
         cos_table,
         sin_table
     );
@@ -256,7 +262,7 @@ static float32_t __not_in_flash_func(timing_error_samples)(const RxFrameRecord_t
     const float32_t samples_per_radian =
         (float32_t)(FFT_SIZE / MAX_SYMBOLS) * symbol_rx_config.symbols_per_radian;
 
-    float32_t error_angle = record->symbol.error_angle; // Relative to the nearest symbol: +/- half a symbol
+    float32_t error_angle = record->symbol.error_angle; // Relative to the decided symbol (the strongest bin)
     if (mode == TRACK_PILOT) {
         // Relative to the symbol actually sent: +/- half a frame
         error_angle = wrap_pi(record->symbol.angle - (float32_t)record->tx_symbol * symbol_rx_config.radians_per_symbol);

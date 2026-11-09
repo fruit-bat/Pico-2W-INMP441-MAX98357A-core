@@ -22,8 +22,19 @@
 //        folded[k] = |X[k] + R * X[fft_size - number_of_bins + k]|^2
 //
 //      folded[k] is written into folded_power_buffer[k], which the symbol
-//      decision and timing estimate use. fft_magnitude_buffer keeps the plain
-//      power |X|^2 of every de-chirped bin (for display and logging).
+//      decision and the centroid (magnitude, strength) use.
+//      fft_magnitude_buffer keeps the plain power |X|^2 of every de-chirped bin
+//      (for display and logging).
+//   4. Half-bin spectrum for timing. The de-chirped signal is also multiplied
+//      by exp(-j*pi*n/N) (folded into a second de-chirp vector) and FFT'd,
+//      giving the spectrum half way between bins, which is folded the same way
+//      with rotation -R. Interleaved with the whole bins this gives the folded
+//      power every half bin (fine_power_buffer, 2 * number_of_bins points).
+//      The symbol's sub-bin position, i.e. the timing error, is refined by a
+//      mean shift on that. On whole bins alone a clean tone near a bin centre
+//      puts almost all its energy in one bin and the estimate barely follows
+//      small offsets; at half-bin spacing it is close to linear, while the mean
+//      shift still copes with peaks spread by echoes.
 //
 // The decoder never allocates memory. The caller provides all buffers (typically
 // as static arrays) and the decoder state only holds pointers to them.
@@ -32,11 +43,15 @@
 //
 //   complex_dechirp_vector : CHIRP_DECODER_COMPLEX_LEN(fft_size)
 //   fft_output_buffer      : CHIRP_DECODER_COMPLEX_LEN(fft_size)
+//   complex_dechirp_half_vector : CHIRP_DECODER_COMPLEX_LEN(fft_size)
+//   fft_half_buffer        : CHIRP_DECODER_COMPLEX_LEN(fft_size)
 //   fft_magnitude_buffer   : fft_size
 //   folded_power_buffer    : number_of_bins (bins spanned by the chirp bandwidth)
+//   fine_power_buffer      : CHIRP_DECODER_FINE_LEN(number_of_bins)
 //   cos_table, sin_table   : number_of_bins
 //
 #define CHIRP_DECODER_COMPLEX_LEN(fft_size) ((fft_size) * 2u)
+#define CHIRP_DECODER_FINE_LEN(number_of_bins) ((number_of_bins) * 2u)
 
 typedef struct {
     uint32_t fft_size;
@@ -44,13 +59,16 @@ typedef struct {
     float32_t *folded_power_buffer;         // Preallocated buffer for the coherently folded power (length = number_of_bins)
     float32_t *fft_output_buffer;           // Preallocated buffer for FFT complex output (length = fft_size * 2, interleaved real/imag)
     float32_t *complex_dechirp_vector;      // Preallocated buffer for the complex de-chirp vector (length = fft_size * 2, interleaved real/imag)
+    float32_t *complex_dechirp_half_vector; // De-chirp vector times exp(-j*pi*n/N): shifts bins by half a bin (length = fft_size * 2)
+    float32_t *fft_half_buffer;             // FFT buffer for the half-bin spectrum (length = fft_size * 2)
+    float32_t *fine_power_buffer;           // Folded power every half bin: [2k] = bin k, [2k+1] = bin k + 1/2 (length = number_of_bins * 2)
     const arm_cfft_instance_f32 *cfft_instance; // Pointer to the CMSIS-DSP CFFT instance for the specified FFT size
     CyclicWeightedCentroid_t cwc;           // Centroid configuration for symbol decoding
     uint32_t peak_half_width;               // Bins either side of the peak used to refine its position
     uint32_t band_first_bin;                // First FFT bin kept by the band-pass (real input)
     uint32_t band_last_bin;                 // Last FFT bin kept by the band-pass (inclusive)
     float32_t fold_rotation_re;             // R: rotation applied to the wrapped piece before folding
-    float32_t fold_rotation_im;
+    float32_t fold_rotation_im;             // (the half-bin spectrum uses -R)
 } ChirpDecoderState_t;
 
 //
@@ -76,9 +94,12 @@ void chirp_decoder_init(
     uint32_t number_of_bins,               // Number of FFT bins spanned by the chirp bandwidth
     uint32_t peak_half_width,              // Bins either side of the peak used to refine its position (e.g. 3)
     float32_t *complex_dechirp_vector,     // length = fft_size * 2
+    float32_t *complex_dechirp_half_vector, // length = fft_size * 2
+    float32_t *fft_half_buffer,            // length = fft_size * 2
     float32_t *fft_output_buffer,          // length = fft_size * 2
     float32_t *fft_magnitude_buffer,       // length = fft_size
     float32_t *folded_power_buffer,        // length = number_of_bins
+    float32_t *fine_power_buffer,          // length = number_of_bins * 2
     float32_t *cos_table,                  // length = number_of_bins
     float32_t *sin_table                   // length = number_of_bins
 );

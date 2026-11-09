@@ -7,11 +7,12 @@
  *   receivedSignal()  test signal: cyclically shifted real chirp + noise
  *   bandPass()        chirp_decoder_real_chirp_to_magnitudes, step 1
  *   dechirp()         multiply by the conjugate base chirp (complex_dechirp_vector)
- *   fold()            dechirped_to_magnitudes: coherent fold of bins k and k - B
+ *   fold()            fold_power: coherent fold of bins k and k - B
+ *   finePower()       dechirp_and_fold: folded power every half bin
  *   centroid()        cyclic_weighted_centroid_accumulate / _finalize
  *   peakBin()         cyclic_weighted_centroid_peak_bin
  *   refinePeak()      cyclic_weighted_centroid_refine_peak (mean shift)
- *   symbolFromAngle() chirp_symbol_rx_set
+ *   decideSymbol()    chirp_decoder_magnitudes_to_symbol + chirp_symbol_rx_set
  *
  * If the firmware changes, change the matching function here and update
  * check.html, which compares these functions against numbers from the C tests.
@@ -146,16 +147,28 @@
     return TAU * (cfg.f0 * t + 0.5 * cfg.chirpRate * t * t);
   }
 
-  /** Conjugate base chirp, generate_complex_dechirp_vector: [cos φ, −sin φ] */
-  function dechirpVector(cfg) {
+  /**
+   * Conjugate base chirp, generate_complex_dechirp_vector: [cos φ, −sin φ],
+   * optionally shifted by shiftBins bins (0.5 for the half-bin spectrum: FFT
+   * bin k then holds the spectrum at k + ½).
+   */
+  function dechirpVector(cfg, shiftBins = 0) {
     const re = new Float64Array(cfg.N), im = new Float64Array(cfg.N);
     for (let n = 0; n < cfg.N; n++) {
-      const ph = chirpPhase(cfg, n);
+      const ph = chirpPhase(cfg, n) + TAU * shiftBins * n / cfg.N;
       re[n] = Math.cos(ph);
       im[n] = -Math.sin(ph);
     }
     return { re, im };
   }
+
+  /** Both de-chirp vectors the decoder uses: { whole, half } */
+  function dechirpVectors(cfg) {
+    return { whole: dechirpVector(cfg, 0), half: dechirpVector(cfg, 0.5) };
+  }
+
+  /** Echo profile used by tests/test_chirp_codec.c (delay in samples, gain) */
+  const TEST_ECHOES = [{ delay: 3, gain: 0.6 }, { delay: 7, gain: 0.4 }, { delay: 15, gain: 0.3 }, { delay: 31, gain: 0.2 }];
 
   // ---------------------------------------------------------------------------
   // Test signal (tests/chirp_channel.c)
@@ -170,6 +183,7 @@
    * offset > 0: the receive window starts late (samples, may be fractional).
    * ppm: time scale — clock mismatch or Doppler, which are the same thing here.
    * snrDb: signal power over white noise power across the full band; null = no noise.
+   * echoes: optional [{ delay (samples), gain }], delayed copies (multipath).
    * noise: standard normal draws from makeNoise().
    */
   function receivedSignal(cfg, sig, noise) {
@@ -178,9 +192,12 @@
     const scale = 1 + (sig.ppm || 0) * 1e-6;
     const sigma = sig.snrDb == null ? 0 : Math.SQRT1_2 / 10 ** (sig.snrDb / 20);
     const shift = sig.k * N / M;
+    const paths = [{ delay: 0, gain: 1 }, ...(sig.echoes || [])];
     for (let j = 0; j < N; j++) {
       const u = j * scale + (sig.offset || 0);
-      x[j] = Math.cos(chirpPhase(cfg, mod(u + shift, N))) + sigma * noise[j];
+      let v = 0;
+      for (const p of paths) v += p.gain * Math.cos(chirpPhase(cfg, mod(u - p.delay + shift, N)));
+      x[j] = v + sigma * noise[j];
     }
     return x;
   }
@@ -225,11 +242,13 @@
    * N − bins + k.
    *   'coherent' (firmware): |X[k] + R·X[N−bins+k]|²
    *   'power'    (old):      |X[k]|² + |X[N−bins+k]|²
+   * half = true for the half-bin spectrum, which is folded with −R.
    * Returns { folded, coherent, power, first, second } (first/second: the raw
    * powers of the two pieces).
    */
-  function fold(cfg, X, method = 'coherent') {
-    const { N, bins, foldRe: rr, foldIm: ri } = cfg;
+  function fold(cfg, X, method = 'coherent', half = false) {
+    const { N, bins } = cfg;
+    const rr = half ? -cfg.foldRe : cfg.foldRe, ri = half ? -cfg.foldIm : cfg.foldIm;
     const coherent = new Float64Array(bins), power = new Float64Array(bins);
     const first = new Float64Array(bins), second = new Float64Array(bins);
     for (let k = 0; k < bins; k++) {
@@ -242,6 +261,16 @@
       power[k] = first[k] + second[k];
     }
     return { folded: method === 'power' ? power : coherent, coherent, power, first, second };
+  }
+
+  /**
+   * Folded power every half bin (dechirp_and_fold): [2k] = whole bin k,
+   * [2k+1] = k + ½, from the whole-bin fold and the half-bin fold.
+   */
+  function finePower(wholeFolded, halfFolded) {
+    const fine = new Float64Array(2 * wholeFolded.length);
+    for (let k = 0; k < wholeFolded.length; k++) { fine[2 * k] = wholeFolded[k]; fine[2 * k + 1] = halfFolded[k]; }
+    return fine;
   }
 
   /**
@@ -304,13 +333,17 @@
   }
 
   /**
-   * Nearest symbol to an angle and the residual (chirp_symbol_rx_set).
-   * Returns { symbolIndex, errorAngle (radians), fractional (symbols) }.
+   * The symbol is the strongest bin; the error is the refined angle relative
+   * to it, wrapped to [−π, π) (chirp_decoder_magnitudes_to_symbol,
+   * chirp_symbol_rx_set). Deciding from the strongest bin rather than by
+   * rounding the refined angle is much more reliable in noise.
+   * Returns { symbolIndex, errorAngle (radians) }.
    */
-  function symbolFromAngle(angle, M) {
-    const fsym = angle * M / TAU;
-    const m = Math.round(fsym);
-    return { symbolIndex: mod(m, M), errorAngle: angle - m * TAU / M, fractional: fsym };
+  function decideSymbol(peak, angle, M, bins) {
+    const symbolIndex = mod(Math.floor((peak * M + Math.floor(bins / 2)) / bins), M);
+    let errorAngle = angle - symbolIndex * TAU / M;
+    errorAngle = mod(errorAngle + Math.PI, TAU) - Math.PI;
+    return { symbolIndex, errorAngle };
   }
 
   /** Decoder angle error to samples (main.c timing_error_samples) */
@@ -322,29 +355,36 @@
 
   /**
    * opts: { bandPass: bool, foldMethod: 'coherent' | 'power',
+   *         refineGrid: 'half' (firmware) | 'whole' (old),
    *         powerExponent: integer (firmware 4), halfWidth: bins (firmware 3) }
-   * Returns every intermediate result, for plotting.
+   * dvs: from dechirpVectors(cfg) (pass it in to avoid recomputing).
+   * Returns every intermediate result, for plotting. refined.centre is in bins.
    */
-  function decodeFrame(cfg, x, opts, dv = dechirpVector(cfg)) {
+  function decodeFrame(cfg, x, opts, dvs = dechirpVectors(cfg)) {
     const bp = bandPass(cfg, x, opts.bandPass);
-    const dc = dechirp(bp, dv);
+    const dc = dechirp(bp, dvs.whole);
     const X = spectrumOf(dc.re, dc.im);
     const raw = powerOf(X);
     const f = fold(cfg, X, opts.foldMethod);
+    const dcHalf = dechirp(bp, dvs.half);
+    const fHalf = fold(cfg, spectrumOf(dcHalf.re, dcHalf.im), opts.foldMethod, true);
+    const fine = finePower(f.folded, fHalf.folded);
     const c = centroid(f.folded, opts.powerExponent);
     const peak = peakBin(f.folded);
-    const refined = refinePeak(f.folded, peak, opts.halfWidth);
-    const sym = symbolFromAngle(refined.angle, cfg.M);
+    const half = opts.refineGrid !== 'whole';
+    const r = half ? refinePeak(fine, 2 * peak, 2 * opts.halfWidth) : refinePeak(f.folded, peak, opts.halfWidth);
+    const refined = half ? { ...r, centre: r.centre / 2, steps: r.steps.map(v => v / 2) } : r;
+    const sym = decideSymbol(peak, refined.angle, cfg.M, cfg.bins);
     return {
-      bp, dc, X, raw, fold: f, centroid: c, peak, refined, sym,
+      bp, dc, X, raw, fold: f, foldHalf: fHalf, fine, centroid: c, peak, refined, sym,
       timingError: errorAngleToSamples(sym.errorAngle, cfg.N),
     };
   }
 
   const api = {
     TAU, mod, makeNoise, fft, spectrumOf, powerOf,
-    chirpConfig, chirpPhase, dechirpVector, receivedSignal,
-    bandPass, dechirp, fold, centroid, peakBin, refinePeak, symbolFromAngle, errorAngleToSamples,
+    chirpConfig, chirpPhase, dechirpVector, dechirpVectors, TEST_ECHOES, receivedSignal,
+    bandPass, dechirp, fold, finePower, centroid, peakBin, refinePeak, decideSymbol, errorAngleToSamples,
     decodeFrame,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

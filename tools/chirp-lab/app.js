@@ -37,11 +37,13 @@
     { key: 'ppm', label: 'Time scale / ppm', type: 'number', def: 0, step: 50, range: [-3000, 3000], hint: 'clock mismatch or Doppler; 1000 ppm ≈ 0.34 m/s' },
     { key: 'snr', label: 'SNR / dB', type: 'number', def: 0, step: 1, range: [-30, 30], hint: 'signal vs white noise over the full band' },
     { key: 'noiseOn', label: 'Add noise', type: 'check', def: true },
+    { key: 'echoes', label: 'Add echoes', type: 'check', def: false, hint: 'delays 3, 7, 15, 31 samples; gains 0.6, 0.4, 0.3, 0.2' },
     { buttons: [{ id: 'reroll', label: 'New noise', primary: true }] },
 
     { section: 'Decoder' },
     { key: 'bandPass', label: 'Band-pass before de-chirp', type: 'check', def: true },
     { key: 'foldMethod', label: 'Fold', type: 'select', def: 'coherent', options: [['coherent', 'Coherent'], ['power', 'Power sum (old)']] },
+    { key: 'refineGrid', label: 'Refine on', type: 'select', def: 'half', options: [['half', 'Half bins'], ['whole', 'Whole bins (old)']] },
     { key: 'p', label: 'Centroid exponent <i>p</i>', type: 'number', def: 4, step: 1, int: true, min: 0, range: [0, 8] },
     { key: 'halfWidth', label: 'Refine half-width / bins', type: 'number', def: 3, step: 1, int: true, min: 1, range: [1, 8] },
 
@@ -167,14 +169,16 @@
     const cfg = D.chirpConfig({ M: s.M, L: s.L, N: s.N, fs: s.fs, f0: s.f0 });
 
     const dvKey = [s.N, s.fs, s.f0, s.L, s.M].join('|');
-    if (dvCache.key !== dvKey) dvCache = { key: dvKey, dv: D.dechirpVector(cfg) };
+    if (dvCache.key !== dvKey) dvCache = { key: dvKey, dv: D.dechirpVectors(cfg) };
     const noiseKey = s.N + '|' + s.seed;
     if (noiseCache.key !== noiseKey) noiseCache = { key: noiseKey, z: D.makeNoise(s.N, s.seed) };
 
     const k = D.mod(s.k, s.M);
-    const x = D.receivedSignal(cfg, { k, offset: s.offset, ppm: s.ppm, snrDb: s.noiseOn ? s.snr : null }, noiseCache.z);
+    const x = D.receivedSignal(cfg, {
+      k, offset: s.offset, ppm: s.ppm, snrDb: s.noiseOn ? s.snr : null, echoes: s.echoes ? D.TEST_ECHOES : [],
+    }, noiseCache.z);
     const r = D.decodeFrame(cfg, x, {
-      bandPass: s.bandPass, foldMethod: s.foldMethod, powerExponent: s.p, halfWidth: s.halfWidth,
+      bandPass: s.bandPass, foldMethod: s.foldMethod, refineGrid: s.refineGrid, powerExponent: s.p, halfWidth: s.halfWidth,
     }, dvCache.dv);
 
     // Where the tone should be, in bins: symbol, window offset, and the
@@ -284,12 +288,14 @@
       tip: i => `<div>bin ${i}</div><div>folded ${(f[i] / full).toFixed(4)} of full tone</div><div>weight ${weights[i].toFixed(4)}</div>`,
     });
 
-    const hw = s.halfWidth, centre = r.refined.centre;
-    const xs = range(r.peak - hw - 4, r.peak + hw + 4);
-    const ys = xs.map(i => f[D.mod(i, B)] / full);
+    // Refinement works on the half-bin spectrum (firmware) or whole bins (old)
+    const hw = s.halfWidth, centre = r.refined.centre, half = s.refineGrid !== 'whole';
+    const step = half ? 0.5 : 1;
+    const xs = Float64Array.from({ length: Math.round((2 * hw + 8) / step) + 1 }, (_, i) => r.peak - hw - 4 + i * step);
+    const ys = half ? xs.map(v => r.fine[D.mod(Math.round(2 * v), 2 * B)] / full) : xs.map(v => f[D.mod(v, B)] / full);
     const tp = truePos + B * Math.round((centre - truePos) / B);
     Charts.xy($('figRefine'), {
-      series: [{ x: xs, y: ys, name: 'folded', color: 're', mode: 'bars' }],
+      series: [{ x: xs, y: ys, name: half ? 'folded, every ½ bin' : 'folded', color: 're', mode: 'bars', barWidth: step }],
       xDomain: [xs[0] - 0.5, xs[xs.length - 1] + 0.5], yDomain: [0, Charts.niceTop(ys)], xLabel: 'bin',
       bands: [{ from: centre - hw, to: centre + hw }],
       markers: [{ x: centre, label: `refined ${centre.toFixed(2)}` }, { x: tp, label: `true ${tp.toFixed(2)}` }],
@@ -307,8 +313,8 @@
     $('roPosU').textContent = `bins · peak bin ${r.peak}`;
 
     // Where the tone's energy really is (offset plus Doppler bias), relative to
-    // the nearest symbol. The decoder's estimate falls short of this for small
-    // offsets: the mean shift is pulled towards the bin centre.
+    // the nearest symbol. With echoes the decoder reads the energy-weighted
+    // arrival instead, about 2 samples later for the test profile.
     const step = cfg.samplesPerSymbol;
     const biasSamples = dopplerBins * cfg.N / cfg.bins;
     let expected = s.offset + biasSamples;
@@ -316,7 +322,7 @@
     $('roTe').textContent = signed(r.timingError, 2);
     $('roTeU').textContent = 'samples, what the tracker sees';
     $('roTx').textContent = signed(expected, 2);
-    $('roTxU').textContent = `offset ${signed(s.offset, 2)} + Doppler ${signed(biasSamples, 2)}; decoder under-reads small values`;
+    $('roTxU').textContent = `offset ${signed(s.offset, 2)} + Doppler ${signed(biasSamples, 2)}${s.echoes ? '; direct path only' : ''}`;
 
     $('roMag').textContent = r.centroid.magnitude.toFixed(3);
     $('roMag').className = 'v ' + (r.centroid.magnitude >= 0.8 ? 'good' : 'warn');

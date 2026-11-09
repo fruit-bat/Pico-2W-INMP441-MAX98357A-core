@@ -279,8 +279,9 @@ static void test_loop_acquire_matched_clocks(void) {
         char label[40];
         snprintf(label, sizeof label, "offset %+.0f", offsets[i]);
         print_result(label, &r);
-        CHECK(r.converged_block >= 0 && r.converged_block < 50);
+        CHECK(r.converged_block >= 0 && r.converged_block < 20);
         CHECK_NEAR(r.measured_mean, 0.0, 0.5);
+        CHECK_NEAR(r.true_mean, 0.0, 0.25);
         CHECK_EQ_U(r.symbol_errors, 0);
         CHECK(r.rotation == 0);
     }
@@ -299,8 +300,8 @@ static void test_loop_acquire_zero_preamble(void) {
         char label[40];
         snprintf(label, sizeof label, "zeros, offset %+.0f", offsets[i]);
         print_result(label, &r);
-        CHECK(r.converged_block >= 0 && r.converged_block < 50);
-        CHECK_NEAR(r.true_mean, 0.0, 0.5);
+        CHECK(r.converged_block >= 0 && r.converged_block < 20);
+        CHECK_NEAR(r.true_mean, 0.0, 0.25);
         CHECK_EQ_U(r.symbol_errors, 0);
     }
 }

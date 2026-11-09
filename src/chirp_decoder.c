@@ -3,15 +3,23 @@
 #include "chirp_decoder.h"
 #include "pico/stdlib.h"
 
+//
+// Conjugate up-chirp, optionally with an extra frequency shift of
+// shift_bins FFT bins (the half-bin vector uses 0.5: multiplying by
+// exp(-j*2*pi*0.5*n/N) moves every bin down by half a bin, so the FFT's bin k
+// then holds the spectrum at k + 1/2).
+//
 static void generate_complex_dechirp_vector(
     float32_t *complex_dechirp_vector,
     uint32_t fft_size,
-    const ChirpParams_t *params
+    const ChirpParams_t *params,
+    float32_t shift_bins
 ) {
     for (uint32_t n = 0; n < fft_size; n++) {
         const float32_t t = (float32_t)n / params->sample_rate;
-        // The standard Up-Chirp phase equation
-        const float32_t phase = 2.0f * PI * (params->f0 * t + 0.5f * params->chirp_rate * t * t);
+        // The standard Up-Chirp phase equation, plus the shift
+        const float32_t phase = 2.0f * PI * (params->f0 * t + 0.5f * params->chirp_rate * t * t)
+                              + 2.0f * PI * shift_bins * (float32_t)n / (float32_t)fft_size;
 
         // Complex Conjugate: [Cos(phase), -Sin(phase)]
         complex_dechirp_vector[2 * n]     = cosf(phase);
@@ -28,9 +36,12 @@ void chirp_decoder_init(
     uint32_t number_of_bins,
     uint32_t peak_half_width,
     float32_t *complex_dechirp_vector,
+    float32_t *complex_dechirp_half_vector,
+    float32_t *fft_half_buffer,
     float32_t *fft_output_buffer,
     float32_t *fft_magnitude_buffer,
     float32_t *folded_power_buffer,
+    float32_t *fine_power_buffer,
     float32_t *cos_table,
     float32_t *sin_table
 ) {
@@ -40,9 +51,13 @@ void chirp_decoder_init(
     state->fft_output_buffer = fft_output_buffer;
     state->fft_magnitude_buffer = fft_magnitude_buffer;
     state->folded_power_buffer = folded_power_buffer;
+    state->complex_dechirp_half_vector = complex_dechirp_half_vector;
+    state->fft_half_buffer = fft_half_buffer;
+    state->fine_power_buffer = fine_power_buffer;
     state->peak_half_width = peak_half_width;
 
-    generate_complex_dechirp_vector(complex_dechirp_vector, fft_size, params);
+    generate_complex_dechirp_vector(complex_dechirp_vector, fft_size, params, 0.0f);
+    generate_complex_dechirp_vector(complex_dechirp_half_vector, fft_size, params, 0.5f);
 
     // Band-pass: the FFT bins covering the chirp band f0 .. f0 + bandwidth
     const double bin_hz = (double)params->sample_rate / (double)fft_size;
@@ -56,9 +71,11 @@ void chirp_decoder_init(
     // chirp cyclically shifted to land on bin p de-chirps into a tone at bin p
     // (before the wrap) and one at p - B (after it), B = bandwidth in bins. For
     // the two to join up into one continuous tone the wrapped piece needs
-    // rotating by exp(j*2*pi*(f0*N/fs - B/2 + p)); for integer p (aligned to
-    // the bin grid) the p term drops out. Computed in double: f0*N/fs is
-    // several hundred cycles and only its fractional part matters.
+    // rotating by exp(j*2*pi*(f0*N/fs - B/2 + f)), where f is the frequency
+    // (in bins) the spectrum is evaluated at. On whole bins the f term drops
+    // out; half way between bins it is exp(j*pi) = -1, so the half-bin
+    // spectrum uses -R. Computed in double: f0*N/fs is several hundred cycles
+    // and only its fractional part matters.
     const double bins_in_band = bandwidth / bin_hz;
     double turns = (double)params->f0 * (double)fft_size / (double)params->sample_rate - 0.5 * bins_in_band;
     turns -= floor(turns);
@@ -74,36 +91,60 @@ void chirp_decoder_init(
     );
 }
 
-// FFT of the de-chirped signal already in fft_output_buffer -> plain power of
-// every bin (fft_magnitude_buffer) and the folded power (returned)
-static float32_t* __not_in_flash_func(dechirped_to_magnitudes)(
-    ChirpDecoderState_t *state
+//
+// Folds a de-chirped spectrum x (fft_size complex bins) into number_of_bins
+// powers, out[k * stride] = |x[k] + R * x[fft_size - number_of_bins + k]|^2:
+// the symbol's wrapped piece (bin k - number_of_bins) is rotated into phase
+// with the first piece and added.
+//
+static void __not_in_flash_func(fold_power)(
+    const ChirpDecoderState_t *state,
+    const float32_t *x,
+    float32_t rr,
+    float32_t ri,
+    float32_t *out,
+    uint32_t stride
 ) {
-    // Execute the Complex FFT.
-    // Note: arm_cfft_f32 processes data IN-PLACE.
-    arm_cfft_f32(
-        state->cfft_instance,
-        state->fft_output_buffer,
-        0,                          // '0' means Forward FFT (1 would mean Inverse)
-        1                           // The bit reversal flag is hardcoded to 1 in modern CMSIS-DSP
-    );
-
-    // Calculate the squared magnitudes for all bins.
-    arm_cmplx_mag_squared_f32(state->fft_output_buffer, state->fft_magnitude_buffer, state->fft_size);
-
-    // Fold coherently: add the wrapped piece (bin k - size) to bin k after
-    // rotating it into phase
     const uint32_t size = (uint32_t)state->cwc.size;
-    const float32_t *x = state->fft_output_buffer;
-    const float32_t rr = state->fold_rotation_re;
-    const float32_t ri = state->fold_rotation_im;
     for (uint32_t k = 0; k < size; k++) {
         const uint32_t m = state->fft_size - size + k;
         const float32_t br = x[2 * m], bi = x[2 * m + 1];
         const float32_t re = x[2 * k] + (rr * br - ri * bi);
         const float32_t im = x[2 * k + 1] + (rr * bi + ri * br);
-        state->folded_power_buffer[k] = re * re + im * im;
+        out[k * stride] = re * re + im * im;
     }
+}
+
+//
+// De-chirp a complex signal z (may be fft_output_buffer itself), FFT and fold:
+//   - fft_magnitude_buffer: plain power of every de-chirped bin
+//   - folded_power_buffer:  folded power on whole bins (returned)
+//   - fine_power_buffer:    folded power every half bin
+//
+static float32_t* __not_in_flash_func(dechirp_and_fold)(
+    ChirpDecoderState_t *state,
+    const float32_t *z
+) {
+    const uint32_t n = state->fft_size;
+    const uint32_t size = (uint32_t)state->cwc.size;
+
+    // Half-bin path first, as the whole-bin de-chirp may overwrite z
+    arm_cmplx_mult_cmplx_f32(z, state->complex_dechirp_half_vector, state->fft_half_buffer, n);
+    arm_cmplx_mult_cmplx_f32(z, state->complex_dechirp_vector, state->fft_output_buffer, n);
+
+    // Whole bins
+    arm_cfft_f32(state->cfft_instance, state->fft_output_buffer, 0, 1);
+    arm_cmplx_mag_squared_f32(state->fft_output_buffer, state->fft_magnitude_buffer, n);
+    fold_power(state, state->fft_output_buffer,
+        state->fold_rotation_re, state->fold_rotation_im, state->folded_power_buffer, 1);
+    for (uint32_t k = 0; k < size; k++) {
+        state->fine_power_buffer[2 * k] = state->folded_power_buffer[k];
+    }
+
+    // Half way between bins, folded with -R
+    arm_cfft_f32(state->cfft_instance, state->fft_half_buffer, 0, 1);
+    fold_power(state, state->fft_half_buffer,
+        -state->fold_rotation_re, -state->fold_rotation_im, &state->fine_power_buffer[1], 2);
 
     return state->folded_power_buffer;
 }
@@ -112,15 +153,7 @@ static float32_t* __not_in_flash_func(chirp_decoder_complex_chirp_to_magnitudes)
     ChirpDecoderState_t *state,
     const float32_t* complex_input_buffer // Interleaved complex input: [Real, Imag, Real, Imag...]
 ) {
-    // Complex Element-wise Multiplication (De-chirp).
-    // Multiplies complex_input by complex_dechirp and saves to fft_output_buffer.
-    arm_cmplx_mult_cmplx_f32(
-        complex_input_buffer,
-        state->complex_dechirp_vector,
-        state->fft_output_buffer,
-        state->fft_size);
-
-    return dechirped_to_magnitudes(state);
+    return dechirp_and_fold(state, complex_input_buffer);
 }
 
 static float32_t* __not_in_flash_func(chirp_decoder_real_chirp_to_magnitudes)(
@@ -146,10 +179,7 @@ static float32_t* __not_in_flash_func(chirp_decoder_real_chirp_to_magnitudes)(
     memset(&buf[2u * (last + 1u)], 0, 2u * (n - last - 1u) * sizeof(*buf));
     arm_cfft_f32(state->cfft_instance, buf, 1, 1);
 
-    // De-chirp in place
-    arm_cmplx_mult_cmplx_f32(buf, state->complex_dechirp_vector, buf, n);
-
-    return dechirped_to_magnitudes(state);
+    return dechirp_and_fold(state, buf);
 }
 
 static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
@@ -176,14 +206,18 @@ static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     // more reliable than the centroid angle
     const uint32_t peak_bin = cyclic_weighted_centroid_peak_bin(&state->cwc, magnitude_buffer);
 
-    // Refine the peak position to sub-bin precision from the energy around it;
-    // this is what makes small timing errors measurable, even when echoes
-    // spread the peak over several bins
+    // Refine the peak position to sub-bin precision from the energy around
+    // it, on the half-bin spectrum (2 points per bin); this is what makes
+    // small timing errors measurable, even when echoes spread the peak over
+    // several bins
     const float32_t angle = cyclic_weighted_centroid_refine_peak(
-        &state->cwc, magnitude_buffer, peak_bin, state->peak_half_width);
+        state->fine_power_buffer, 2u * state->cwc.size, 2u * peak_bin, 2u * state->peak_half_width);
 
-    // Set the properties of the received chirp symbol based on the refined angle
-    chirp_symbol_rx_set(config, symbol_rx, angle, cwc_result.magnitude, cwc_result.strength);
+    // The symbol is the strongest bin (bins map onto symbols evenly; with one
+    // bin per symbol they are the same); the refined angle gives the timing
+    const uint32_t bins = (uint32_t)state->cwc.size;
+    const uint32_t symbol = (peak_bin * config->number_of_symbols + bins / 2u) / bins;
+    chirp_symbol_rx_set(config, symbol_rx, symbol, angle, cwc_result.magnitude, cwc_result.strength);
 
     return symbol_rx;
 }
