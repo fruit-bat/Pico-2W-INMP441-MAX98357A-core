@@ -45,7 +45,7 @@
     { key: 'foldMethod', label: 'Fold', type: 'select', def: 'coherent', options: [['coherent', 'Coherent'], ['power', 'Power sum (old)']] },
     { key: 'refineGrid', label: 'Refine on', type: 'select', def: 'half', options: [['half', 'Half bins'], ['whole', 'Whole bins (old)']] },
     { key: 'p', label: 'Centroid exponent <i>p</i>', type: 'number', def: 4, step: 1, int: true, min: 0, range: [0, 8] },
-    { key: 'halfWidth', label: 'Refine half-width / bins', type: 'number', def: 3, step: 1, int: true, min: 1, range: [1, 8] },
+    { key: 'halfWidth', label: 'Refine half-width / bins', type: 'number', def: 1, step: 1, int: true, min: 1, range: [1, 8] },
 
     { section: 'Display' },
     { key: 'dcView', label: 'De-chirped spectrum', type: 'select', def: 'band', options: [['band', 'Folded range'], ['full', 'Full']] },

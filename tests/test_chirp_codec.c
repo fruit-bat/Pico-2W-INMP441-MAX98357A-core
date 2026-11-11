@@ -116,9 +116,10 @@ static void test_timing_offset_repeated_symbol(void) {
 }
 
 // Multipath: echoes spread the de-chirped peak over several bins. The timing
-// estimate stays monotonic with slope ~1 and consistent across symbols; it is
-// offset by roughly the echoes' energy-weighted delay, which is where the
-// tracking loop will settle.
+// estimate stays monotonic with slope ~1 and consistent across symbols. With
+// the +/-1 bin refine window it follows the strongest peak, so echoes more
+// than a bin away barely move it (offset 0 reads about +0.4 samples here);
+// echoes within a bin still pull it a little.
 static void test_timing_with_echoes(void) {
     static const ChirpEcho_t echoes[] = { { 3.0, 0.6 }, { 7.0, 0.4 }, { 15.0, 0.3 }, { 31.0, 0.2 } };
     printf("  offset  mean      sd over symbols\n");

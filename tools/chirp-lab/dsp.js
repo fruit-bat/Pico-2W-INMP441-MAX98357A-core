@@ -356,7 +356,7 @@
   /**
    * opts: { bandPass: bool, foldMethod: 'coherent' | 'power',
    *         refineGrid: 'half' (firmware) | 'whole' (old),
-   *         powerExponent: integer (firmware 4), halfWidth: bins (firmware 3) }
+   *         powerExponent: integer (firmware 4), halfWidth: bins (firmware 1) }
    * dvs: from dechirpVectors(cfg) (pass it in to avoid recomputing).
    * Returns every intermediate result, for plotting. refined.centre is in bins.
    */

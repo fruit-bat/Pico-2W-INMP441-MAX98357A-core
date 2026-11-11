@@ -151,7 +151,11 @@ static void init_audio_system(void) {
         &arm_cfft_sR_f32_len1024, // The 1024-point complex instance is globally defined by CMSIS-DSP
         4, // Power exponent for weighting
         MAX_SYMBOLS,
-        3, // Bins either side of the peak used to refine its position (timing)
+        1, // Bins either side of the peak used to refine its position (timing). Keep this to
+           // the peak's main lobe (+/-1 bin): the symbol is decided from the strongest bin, so
+           // the timing must measure that same peak. A wider window measures the centre of the
+           // peak plus nearby echoes instead, and with an echo 1-3 bins away the tracker
+           // pushes the peak off its bin and hunts (see test_loop_echoes).
         complex_dechirp_vector,
         complex_dechirp_half_vector,
         fft_half_buffer,

@@ -25,7 +25,7 @@ void rig_setup(void) {
         .chirp_rate = (float32_t)(bw / t),
     };
     chirp_decoder_init(&rig_decoder, &params, RIG_N, &arm_cfft_sR_f32_len1024,
-        4, RIG_M, 3,
+        4, RIG_M, 1,
         complex_dechirp_vector, complex_dechirp_half_vector, fft_half_buffer,
         fft_output_buffer, fft_magnitude_buffer, folded_power_buffer, fine_power_buffer,
         cos_table, sin_table);

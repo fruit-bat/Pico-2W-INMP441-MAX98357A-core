@@ -31,7 +31,7 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
 // Firmware configuration (main.c) and decoder options (chirp_decoder_init)
 const cfg = D.chirpConfig({ M: 64, L: 1, N: 1024, fs: 44100, f0: 15000 });
-const opts = { bandPass: true, foldMethod: 'coherent', refineGrid: 'half', powerExponent: 4, halfWidth: 3 };
+const opts = { bandPass: true, foldMethod: 'coherent', refineGrid: 'half', powerExponent: 4, halfWidth: 1 };
 const dv = D.dechirpVectors(cfg);
 const silence = new Float64Array(cfg.N);
 const frame = (k, offset = 0, echoes = []) => D.receivedSignal(cfg, { k, offset, ppm: 0, snrDb: null, echoes }, silence);
@@ -79,7 +79,7 @@ check('Fold rotation about +107.75°', near(cfg.foldTurns * 360, 107.75, 0.05), 
 
 // test_timing_offset_repeated_symbol: mean measured timing error over all symbols
 {
-  const expected = [[-4, -3.977], [2, 2.029], [7, 7.016]];
+  const expected = [[-4, -3.994], [2, 1.982], [7, 7.021]];
   for (const [d, mean] of expected) {
     let sum = 0;
     for (let k = 0; k < cfg.M; k++) sum += D.decodeFrame(cfg, frame(k, d), opts, dv).timingError;
@@ -88,8 +88,8 @@ check('Fold rotation about +107.75°', near(cfg.foldTurns * 360, 107.75, 0.05), 
   }
 }
 
-// test_timing_with_echoes: offset 0 reads about -2.09 samples (the echoes'
-// energy-weighted delay), slope ~1 between offsets -4 and +4
+// test_timing_with_echoes: offset 0 reads about +0.39 samples (the +/-1 bin
+// refine window mostly ignores the echoes), slope ~1 between offsets -4 and +4
 {
   const meanAt = d => {
     let sum = 0, n = 0;
@@ -97,8 +97,8 @@ check('Fold rotation about +107.75°', near(cfg.foldTurns * 360, 107.75, 0.05), 
     return sum / n;
   };
   const m0 = meanAt(0), slope = (meanAt(4) - meanAt(-4)) / 8;
-  check('Echoes: offset 0 reads ≈ −2.09 samples', near(m0, -2.093, 0.05), `${m0.toFixed(3)} samples`);
-  check('Echoes: slope ≈ 1', near(slope, 0.999, 0.03), slope.toFixed(3));
+  check('Echoes: offset 0 reads ≈ +0.39 samples', near(m0, 0.390, 0.05), `${m0.toFixed(3)} samples`);
+  check('Echoes: slope ≈ 1', near(slope, 0.975, 0.03), slope.toFixed(3));
 }
 
 // The decision is the strongest bin, whatever the refined angle says
