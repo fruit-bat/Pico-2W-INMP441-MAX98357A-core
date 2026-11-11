@@ -333,14 +333,17 @@
   }
 
   /**
-   * The symbol is the strongest bin; the error is the refined angle relative
-   * to it, wrapped to [−π, π) (chirp_decoder_magnitudes_to_symbol,
-   * chirp_symbol_rx_set). Deciding from the strongest bin rather than by
-   * rounding the refined angle is much more reliable in noise.
+   * The symbol is the one nearest the refined angle; the error is the angle
+   * relative to it, wrapped to [−π, π) (chirp_decoder_magnitudes_to_symbol,
+   * chirp_symbol_rx_set). Deciding from the strongest bin is ~3 dB better in
+   * clean noise but flips between lobes on a multipath channel (as measured on
+   * the desk), making the tracker hunt. The peak argument is kept for that
+   * comparison but unused.
    * Returns { symbolIndex, errorAngle (radians) }.
    */
   function decideSymbol(peak, angle, M, bins) {
-    const symbolIndex = mod(Math.floor((peak * M + Math.floor(bins / 2)) / bins), M);
+    // Nearest symbol to the refined centre (C: lroundf(angle * symbols_per_radian) % M)
+    const symbolIndex = mod(Math.round(angle * M / TAU), M);
     let errorAngle = angle - symbolIndex * TAU / M;
     errorAngle = mod(errorAngle + Math.PI, TAU) - Math.PI;
     return { symbolIndex, errorAngle };
@@ -356,7 +359,7 @@
   /**
    * opts: { bandPass: bool, foldMethod: 'coherent' | 'power',
    *         refineGrid: 'half' (firmware) | 'whole' (old),
-   *         powerExponent: integer (firmware 4), halfWidth: bins (firmware 1) }
+   *         powerExponent: integer (firmware 4), halfWidth: bins (firmware 3) }
    * dvs: from dechirpVectors(cfg) (pass it in to avoid recomputing).
    * Returns every intermediate result, for plotting. refined.centre is in bins.
    */

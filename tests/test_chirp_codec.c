@@ -217,7 +217,10 @@ static void test_noise(void) {
             }
         }
         printf("  %+4d    %5u      %6.3f\n", snr_db, errors, good ? sqrt(sum_sq / good) : 0.0);
-        if (snr_db >= -12) CHECK_EQ_U(errors, 0);
+        // Error-free to -9 dB. Deciding from the strongest bin instead would
+        // reach -12 dB on this clean channel, but on the real (multipath) desk
+        // channel it made the tracker hunt; see chirp_decoder.c
+        if (snr_db >= -9) CHECK_EQ_U(errors, 0);
     }
 }
 
