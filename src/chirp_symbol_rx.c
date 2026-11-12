@@ -13,6 +13,7 @@ void chirp_symbol_rx_config_init(
 void __not_in_flash_func(chirp_symbol_rx_set)(
     const ChirpSymbolRxConfig_t *config,
     ChirpSymbolRx_t *symbol_rx,
+    uint32_t symbol_index,
     float32_t angle,
     float32_t magnitude,
     float32_t strength) 
@@ -20,12 +21,11 @@ void __not_in_flash_func(chirp_symbol_rx_set)(
     symbol_rx->angle = angle;
     symbol_rx->magnitude = magnitude;
     symbol_rx->strength = strength;
+    symbol_rx->symbol_index = symbol_index % config->number_of_symbols;
 
-    const float32_t fsym = angle * config->symbols_per_radian;
-    const int32_t n = (int32_t)config->number_of_symbols;
-    const float32_t m = lroundf(fsym);
-    const int32_t usym = (int32_t)m % n;
-    symbol_rx->symbol_index = (uint32_t)(usym < 0 ? usym + n : usym);
-    symbol_rx->error_angle = angle - (m * config->radians_per_symbol);
+    float32_t error = angle - (float32_t)symbol_rx->symbol_index * config->radians_per_symbol;
+    while (error >= PI) error -= 2.0f * PI;
+    while (error < -PI) error += 2.0f * PI;
+    symbol_rx->error_angle = error;
 }
 

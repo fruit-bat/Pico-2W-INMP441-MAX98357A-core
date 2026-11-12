@@ -57,6 +57,10 @@ void chirp_channel_rx_frame(
         const double rx_index = (double)frame * (double)n + (double)j;
         const double u = rx_index * channel->clock_scale + channel->offset;
         double x = chirp_channel_tx_sample(tx, symbols, symbol_count, u);
+        for (uint32_t e = 0; e < channel->echo_count; e++) {
+            x += channel->echoes[e].gain *
+                 chirp_channel_tx_sample(tx, symbols, symbol_count, u - channel->echoes[e].delay);
+        }
         if (channel->noise_rms > 0.0) {
             x += channel->noise_rms * chirp_channel_gaussian();
         }

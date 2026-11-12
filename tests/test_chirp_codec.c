@@ -84,22 +84,16 @@ static void test_spectrum_buffers(void) {
 }
 
 // A repeated symbol read with the window offset by d samples decodes as the
-// same symbol, with a timing error that should be d samples (|d| < half a step).
-//
-// Known limitation of the current sub-bin estimator (power-weighted mean shift
-// over +/-3 bins): with coherent folding every symbol de-chirps to one
-// full-length tone, whose narrow sinc^2 peak pulls the estimate towards the
-// bin centre, so small offsets are under-reported (measured/d about 0.1 to 0.4
-// within a few samples of lock, approaching 1 near half a step). It is
-// consistent across symbols, so the tracking loop converges, just with a
-// lower effective gain. For now this only checks what the loop relies on: the
-// decision is right and the error has the right sign without overshooting
-// (0 < measured/d < 1.5).
+// same symbol, with a timing error of d samples (|d| < half a step). The
+// decoder refines the peak by a mean shift on the folded spectrum sampled
+// every half bin, which keeps this close to linear for every symbol (on whole
+// bins alone small offsets were under-reported by up to 5x).
 static void test_timing_offset_repeated_symbol(void) {
-    printf("  offset  mean      ratio min  ratio max  (measured/offset over all symbols)\n");
+    printf("  offset  mean      ratio min  ratio max  worst |error|  (over all symbols)\n");
+    double worst_all = 0.0;
     for (double d = -7.5; d <= 7.5; d += 0.5) {
         if (d == 0.0) continue;
-        double mean = 0.0, ratio_min = 1e9, ratio_max = -1e9;
+        double mean = 0.0, ratio_min = 1e9, ratio_max = -1e9, worst = 0.0;
         for (uint32_t s = 0; s < M; s++) {
             const uint32_t stream[3] = { s, s, s };
             const ChirpChannel_t ch = { .offset = d, .clock_scale = 1.0, .noise_rms = 0.0 };
@@ -112,11 +106,51 @@ static void test_timing_offset_repeated_symbol(void) {
             mean += measured / M;
             if (ratio < ratio_min) ratio_min = ratio;
             if (ratio > ratio_max) ratio_max = ratio;
+            if (fabs(measured - d) > worst) worst = fabs(measured - d);
         }
-        printf("  %+5.1f   %+7.3f   %6.3f     %6.3f\n", d, mean, ratio_min, ratio_max);
-        CHECK(ratio_min > 0.0);
-        CHECK(ratio_max < 1.5);
+        printf("  %+5.1f   %+7.3f   %6.3f     %6.3f     %6.3f\n", d, mean, ratio_min, ratio_max, worst);
+        if (worst > worst_all) worst_all = worst;
     }
+    printf("  worst |measured - offset| over all = %.3f samples\n", worst_all);
+    CHECK(worst_all < 0.25);
+}
+
+// Multipath: echoes spread the de-chirped peak over several bins. The timing
+// estimate stays monotonic with slope ~1 and consistent across symbols. With
+// the +/-1 bin refine window it follows the strongest peak, so echoes more
+// than a bin away barely move it (offset 0 reads about +0.4 samples here);
+// echoes within a bin still pull it a little.
+static void test_timing_with_echoes(void) {
+    static const ChirpEcho_t echoes[] = { { 3.0, 0.6 }, { 7.0, 0.4 }, { 15.0, 0.3 }, { 31.0, 0.2 } };
+    printf("  offset  mean      sd over symbols\n");
+    double prev = -1e9, first_mean = 0.0, last_mean = 0.0;
+    const double d_lo = -4.0, d_hi = 4.0;
+    for (double d = d_lo; d <= d_hi; d += 1.0) {
+        double sum = 0.0, sum_sq = 0.0;
+        for (uint32_t s = 0; s < M; s += 3) {
+            const uint32_t stream[3] = { s, s, s };
+            const ChirpChannel_t ch = { .offset = d, .clock_scale = 1.0, .echoes = echoes,
+                                        .echo_count = sizeof echoes / sizeof echoes[0] };
+            ChirpSymbolRx_t rx;
+            chirp_channel_rx_frame(&rig_tx_model, &ch, stream, 3, 1, frame);
+            rig_decode(frame, &rx);
+            CHECK_EQ_U(rx.symbol_index, s);
+            const double e = rig_timing_error_samples(&rx);
+            sum += e;
+            sum_sq += e * e;
+        }
+        const double n = (M + 2) / 3;
+        const double mean = sum / n, sd = sqrt(fmax(0.0, sum_sq / n - mean * mean));
+        printf("  %+5.1f   %+7.3f   %6.3f\n", d, mean, sd);
+        CHECK(mean > prev);   // Monotonic
+        CHECK(sd < 0.2);      // Consistent across symbols
+        prev = mean;
+        if (d == d_lo) first_mean = mean;
+        last_mean = mean;
+    }
+    const double slope = (last_mean - first_mean) / (d_hi - d_lo);
+    printf("  slope %.3f\n", slope);
+    CHECK_NEAR(slope, 1.0, 0.15);
 }
 
 // Random symbols (so the window straddles two different symbols): decisions
@@ -150,8 +184,10 @@ static void test_timing_offset_random_symbols(void) {
 // Symbol error rate against SNR (signal power / total white noise power over
 // the full band). The chirp's processing gain lets it decode well below 0 dB.
 //
-// Baseline: error free down to -9 dB (with the band-pass and coherent fold;
-// previously -6 dB, when the wrapped pieces were folded by adding powers).
+// Baseline: error free down to -12 dB. History: -6 dB with the wrapped
+// pieces folded by adding powers; -9 dB with the band-pass and coherent fold;
+// -12 dB once the symbol was decided from the strongest bin rather than by
+// rounding the refined angle.
 static void test_noise(void) {
     enum { COUNT = 500 };
     static uint32_t stream[COUNT];
@@ -181,7 +217,7 @@ static void test_noise(void) {
             }
         }
         printf("  %+4d    %5u      %6.3f\n", snr_db, errors, good ? sqrt(sum_sq / good) : 0.0);
-        if (snr_db >= -9) CHECK_EQ_U(errors, 0);
+        if (snr_db >= -12) CHECK_EQ_U(errors, 0);
     }
 }
 
@@ -191,6 +227,7 @@ int main(void) {
     RUN_TEST(test_round_trip_all_symbols);
     RUN_TEST(test_spectrum_buffers);
     RUN_TEST(test_timing_offset_repeated_symbol);
+    RUN_TEST(test_timing_with_echoes);
     RUN_TEST(test_timing_offset_random_symbols);
     RUN_TEST(test_noise);
     printf("\n%d checks, %d failures\n", test_checks, test_failures);

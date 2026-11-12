@@ -2,9 +2,12 @@
 #include "chirp_test_rig.h"
 
 static float32_t complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(RIG_N)];
+static float32_t complex_dechirp_half_vector[CHIRP_DECODER_COMPLEX_LEN(RIG_N)];
+static float32_t fft_half_buffer[CHIRP_DECODER_COMPLEX_LEN(RIG_N)];
 static float32_t fft_output_buffer[CHIRP_DECODER_COMPLEX_LEN(RIG_N)];
 static float32_t fft_magnitude_buffer[RIG_N];
 static float32_t folded_power_buffer[RIG_M];
+static float32_t fine_power_buffer[CHIRP_DECODER_FINE_LEN(RIG_M)];
 static float32_t cos_table[RIG_M];
 static float32_t sin_table[RIG_M];
 
@@ -22,8 +25,9 @@ void rig_setup(void) {
         .chirp_rate = (float32_t)(bw / t),
     };
     chirp_decoder_init(&rig_decoder, &params, RIG_N, &arm_cfft_sR_f32_len1024,
-        4, RIG_M, 3,
-        complex_dechirp_vector, fft_output_buffer, fft_magnitude_buffer, folded_power_buffer,
+        4, RIG_M, 1,
+        complex_dechirp_vector, complex_dechirp_half_vector, fft_half_buffer,
+        fft_output_buffer, fft_magnitude_buffer, folded_power_buffer, fine_power_buffer,
         cos_table, sin_table);
     chirp_encoder_init(&rig_encoder, rig_decoder.complex_dechirp_vector, RIG_N, RIG_M, (float32_t)RIG_VOLUME);
     chirp_symbol_rx_config_init(&rig_rx_config, RIG_M);

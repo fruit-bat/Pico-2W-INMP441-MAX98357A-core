@@ -127,13 +127,12 @@ void __not_in_flash_func(cyclic_weighted_centroid_finalize)(
 }
 
 
-// Power of bin index, taken mod size (the spectrum is circular)
+// Power of point index, taken mod size (the spectrum is circular)
 static inline float32_t circular_power(
-    const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
+    int32_t size,
     int32_t index
 ) {
-    const int32_t size = (int32_t)cwc->size;
     return power_spectrum[((index % size) + size) % size];
 }
 
@@ -157,14 +156,14 @@ uint32_t __not_in_flash_func(cyclic_weighted_centroid_peak_bin)(
 #define CWC_REFINE_ITERATIONS 4
 
 //
-// Power-weighted mean position (in bins) of the circular spectrum inside the
+// Power-weighted mean position (in points) of the circular spectrum inside the
 // window [centre - half_width, centre + half_width]. The window slides
 // continuously: bins only partly inside it get a proportional weight, so the
 // result changes smoothly with centre. Returns centre if the window holds no power.
 //
 static float32_t __not_in_flash_func(window_mean)(
-    const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
+    int32_t size,
     float32_t centre,
     float32_t half_width
 ) {
@@ -177,7 +176,7 @@ static float32_t __not_in_flash_func(window_mean)(
         if ((float32_t)k < lo) weight = 1.0f - (lo - (float32_t)k);
         if ((float32_t)k > hi) weight = 1.0f - ((float32_t)k - hi);
         if (weight <= 0.0f) continue;
-        const float32_t p = weight * circular_power(cwc, power_spectrum, k);
+        const float32_t p = weight * circular_power(power_spectrum, size, k);
         moment += (float32_t)k * p;
         total += p;
     }
@@ -185,8 +184,8 @@ static float32_t __not_in_flash_func(window_mean)(
 }
 
 float32_t __not_in_flash_func(cyclic_weighted_centroid_refine_peak)(
-    const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
+    size_t size,
     uint32_t start_bin,
     uint32_t half_width
 ) {
@@ -194,10 +193,10 @@ float32_t __not_in_flash_func(cyclic_weighted_centroid_refine_peak)(
     // power-weighted mean of what it contains
     float32_t centre = (float32_t)start_bin;
     for (uint32_t i = 0; i < CWC_REFINE_ITERATIONS; i++) {
-        centre = window_mean(cwc, power_spectrum, centre, (float32_t)half_width);
+        centre = window_mean(power_spectrum, (int32_t)size, centre, (float32_t)half_width);
     }
 
-    float32_t angle = centre * (2.0f * PI / (float32_t)cwc->size);
+    float32_t angle = centre * (2.0f * PI / (float32_t)size);
     angle = fmodf(angle, 2.0f * PI);
     if (angle < 0.0f) angle += 2.0f * PI;
     return angle;

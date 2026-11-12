@@ -31,10 +31,10 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
 // Firmware configuration (main.c) and decoder options (chirp_decoder_init)
 const cfg = D.chirpConfig({ M: 64, L: 1, N: 1024, fs: 44100, f0: 15000 });
-const opts = { bandPass: true, foldMethod: 'coherent', powerExponent: 4, halfWidth: 3 };
-const dv = D.dechirpVector(cfg);
+const opts = { bandPass: true, foldMethod: 'coherent', refineGrid: 'half', powerExponent: 4, halfWidth: 1 };
+const dv = D.dechirpVectors(cfg);
 const silence = new Float64Array(cfg.N);
-const frame = (k, offset = 0) => D.receivedSignal(cfg, { k, offset, ppm: 0, snrDb: null }, silence);
+const frame = (k, offset = 0, echoes = []) => D.receivedSignal(cfg, { k, offset, ppm: 0, snrDb: null, echoes }, silence);
 
 // FFT forward then inverse returns the input
 {
@@ -63,7 +63,7 @@ check('Fold rotation about +107.75°', near(cfg.foldTurns * 360, 107.75, 0.05), 
   check('Symbol 32: fold equals coherent sum of the pieces', near(f / sum, 1, 0.002), (f / sum).toFixed(5));
 }
 
-// test_round_trip_all_symbols: every symbol decodes to itself; worst timing error 0.0697
+// test_round_trip_all_symbols: every symbol decodes to itself; worst timing error 0.1028
 {
   let wrong = 0, worst = 0, minMag = 1;
   for (let k = 0; k < cfg.M; k++) {
@@ -73,19 +73,39 @@ check('Fold rotation about +107.75°', near(cfg.foldTurns * 360, 107.75, 0.05), 
     minMag = Math.min(minMag, r.centroid.magnitude);
   }
   check('All 64 symbols decode when aligned', wrong === 0, `${wrong} wrong`);
-  check('Worst aligned timing error ≈ 0.07 samples', worst < 0.1, `${worst.toFixed(4)} samples`);
+  check('Worst aligned timing error ≈ 0.10 samples', worst < 0.15, `${worst.toFixed(4)} samples`);
   check('Centroid magnitude ≈ 1 when clean', minMag > 0.999, minMag.toFixed(4));
 }
 
 // test_timing_offset_repeated_symbol: mean measured timing error over all symbols
 {
-  const expected = [[-4, -1.780], [2, 0.510], [7, 6.182]];
+  const expected = [[-4, -3.994], [2, 1.982], [7, 7.021]];
   for (const [d, mean] of expected) {
     let sum = 0;
     for (let k = 0; k < cfg.M; k++) sum += D.decodeFrame(cfg, frame(k, d), opts, dv).timingError;
     const got = sum / cfg.M;
     check(`Offset ${d > 0 ? '+' : ''}${d}: mean measured ≈ ${mean}`, near(got, mean, 0.03), `${got.toFixed(3)} samples`);
   }
+}
+
+// test_timing_with_echoes: offset 0 reads about +0.39 samples (the +/-1 bin
+// refine window mostly ignores the echoes), slope ~1 between offsets -4 and +4
+{
+  const meanAt = d => {
+    let sum = 0, n = 0;
+    for (let k = 0; k < cfg.M; k += 3, n++) sum += D.decodeFrame(cfg, frame(k, d, D.TEST_ECHOES), opts, dv).timingError;
+    return sum / n;
+  };
+  const m0 = meanAt(0), slope = (meanAt(4) - meanAt(-4)) / 8;
+  check('Echoes: offset 0 reads ≈ +0.39 samples', near(m0, 0.390, 0.05), `${m0.toFixed(3)} samples`);
+  check('Echoes: slope ≈ 1', near(slope, 0.975, 0.03), slope.toFixed(3));
+}
+
+// The decision is the strongest bin, whatever the refined angle says
+{
+  const d = D.decideSymbol(10, (10.7 / 64) * D.TAU, 64, 64);
+  check('Decision follows the peak bin, error may exceed half a symbol', d.symbolIndex === 10 && near(D.errorAngleToSamples(d.errorAngle, 1024), 11.2, 1e-9),
+    `symbol ${d.symbolIndex}, error ${D.errorAngleToSamples(d.errorAngle, 1024).toFixed(2)} samples`);
 }
 
 // The old power-sum fold keeps only the sum of the two pieces' powers: for
