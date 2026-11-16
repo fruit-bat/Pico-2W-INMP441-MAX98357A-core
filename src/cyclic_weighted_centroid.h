@@ -4,10 +4,12 @@
 /**
  * @file cyclic_weighted_centroid.h
  *
- * Circular weighted centroid estimator for a narrow band of an FFT power spectrum.
+ * Circular weighted centroid estimator for a circular power spectrum of
+ * 'size' bins, such as the folded spectrum produced by the chirp decoder
+ * (bin size - 1 is adjacent to bin 0).
  *
  * The spectrum is treated as a set of vectors on the unit circle. For a bin at
- * angle theta_i, the vector contribution is:
+ * angle theta_i = 2*pi*i/size, the vector contribution is:
  *
  *   w_i = p_i^k
  *   v_i = w_i * [cos(theta_i), sin(theta_i)]
@@ -19,19 +21,15 @@
  *
  *   R = sum_i w_i * [cos(theta_i), sin(theta_i)]
  *   angle = atan2(R_y, R_x)
- *   magnitude = |R| / sum_i w_i
+ *   magnitude = |R|^2 / (sum_i w_i)^2
  *   strength = (|R|^2)^(1/(2 + k))
  *
- * This is a circular mean, not a raw weighted sum. 
+ * This is a circular mean, not a raw weighted sum.
  *
- * For an FFT, the spectral bins are mirrored about DC, so the same occupied
- * band may appear on both the forward and mirrored negative-frequency side. The
- * API therefore supports accumulation in either direction, using the reflected
- * negative-frequency bins when needed.
- *
- * A good configuration is to choose a bandwidth that is an integer number of FFT
- * bins so a narrowband signal stays centered and does not split across adjacent
- * bins.
+ * Performance: power_exponent is an unsigned integer so the weights are
+ * computed by multiplication only (k = 1..4 have dedicated loops, larger values
+ * use repeated squaring). The choice is made once per accumulate call, not per
+ * bin. k = 0 gives every bin equal weight.
  */
 
 #include <stddef.h>
@@ -45,11 +43,10 @@
  * reused to avoid repeated trigonometric work.
  */
 typedef struct {
-    size_t fft_size;       // FFT length used to generate the source power spectrum
-    size_t size;           // Number of bins included in this centroid window
+    size_t size;           // Number of bins in the circular spectrum
     float32_t *cos_table;  // Precomputed cos(theta_i) values for the selected bins
     float32_t *sin_table;  // Precomputed sin(theta_i) values for the selected bins
-    float32_t power_exponent; // Power used to emphasize stronger bins: w_i = p_i^k
+    uint32_t power_exponent;  // Power used to emphasize stronger bins: w_i = p_i^k
 } CyclicWeightedCentroid_t;
 
 /**
@@ -68,7 +65,7 @@ typedef struct {
  * Final centroid result.
  *
  * angle: angular position of the centroid in radians, normalized into [0, 2*pi)
- * magnitude: length of the normalized centroid vector; a value in [0, 1].
+ * magnitude: squared length of the normalized centroid vector; a value in [0, 1].
  *            This measures directional concentration, not signal level.
  * strength:  power-adjusted size of the unnormalized resultant. This retains
  *            information about how much weighted energy is present and is
@@ -89,16 +86,14 @@ typedef struct {
  * Initializes the centroid calculator.
  *
  * @param cwc          Target configuration object.
- * @param fft_size     FFT length used to interpret the spectrum indexing.
  * @param power_exponent Exponent used for weighting, where weight = p^k.
- * @param size         Number of bins to process in the centroid window.
+ * @param size         Number of bins in the circular spectrum.
  * @param cos_table    Preallocated cosine table of length at least size.
  * @param sin_table    Preallocated sine table of length at least size.
  */
 void cyclic_weighted_centroid_init(
     CyclicWeightedCentroid_t *cwc,
-    size_t fft_size,
-    float32_t power_exponent,
+    uint32_t power_exponent,
     size_t size,
     float32_t *cos_table,
     float32_t *sin_table
@@ -114,37 +109,17 @@ void cyclic_weighted_centroid_init_vector(
 );
 
 /**
- * Accumulates the mirrored negative-frequency portion of the spectrum.
- *
- * The caller passes a pointer into the FFT magnitude/power spectrum and the
- * function walks the mirrored portion from the upper end of the array toward the
- * center. This matches the convention where negative-frequency bins are located
- * near the end of the FFT buffer.
+ * Accumulates the weighted bin vectors of a spectrum.
  *
  * @param cwc             Centroid configuration containing the bin mapping.
- * @param power_spectrum  Source power spectrum values.
+ * @param power_spectrum  Source power spectrum values (length = size).
  * @param power_exponent  Exponent used for the current accumulation pass.
  * @param result          Vector accumulator to add the weighted bin contributions to.
  */
-void cyclic_weighted_centroid_accumulate_backwards(
-    CyclicWeightedCentroid_t *cwc,
+void cyclic_weighted_centroid_accumulate(
+    const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
-    float32_t power_exponent,
-    CyclicWeightedCentroidVector_t *result
-);
-
-/**
- * Accumulates the forward (positive-frequency) part of the spectrum.
- *
- * @param cwc             Centroid configuration containing the bin mapping.
- * @param power_spectrum  Source power spectrum values.
- * @param power_exponent  Exponent used for the current accumulation pass.
- * @param result          Vector accumulator to add the weighted bin contributions to.
- */
-void cyclic_weighted_centroid_accumulate_forwards(
-    CyclicWeightedCentroid_t *cwc,
-    const float32_t *power_spectrum,
-    float32_t power_exponent,
+    uint32_t power_exponent,
     CyclicWeightedCentroidVector_t *result
 );
 
@@ -161,12 +136,16 @@ void cyclic_weighted_centroid_accumulate_forwards(
  *   C = R / sum_i w_i
  *
  * The final angle is computed using atan2(C_y, C_x) so the correct quadrant is
- * preserved even when the vector is near the axes. The magnitude is then:
+ * preserved even when the vector is near the axes. The magnitude is the
+ * squared length of the normalized centroid (the square root is skipped to
+ * save cycles; ordering is preserved, but thresholds must be squared too):
  *
- *   |C| = sqrt(C_x^2 + C_y^2)
+ *   |C|^2 = C_x^2 + C_y^2 = (R_x^2 + R_y^2) / (sum_i w_i)^2
  *
  * This gives a value in the range [0, 1] for a unit-circle interpretation,
  * which remains meaningful even if power_exponent changes.
+ *
+ * If the total weight is zero (e.g. silence), every result field is set to 0.
  *
  * Strength is calculated from the unnormalized resultant before normalization:
  *
@@ -185,6 +164,57 @@ void cyclic_weighted_centroid_finalize(
     CyclicWeightedCentroid_t *cwc,
     CyclicWeightedCentroidVector_t *vector,
     CyclicWeightedCentroidResult_t *result
+);
+
+/**
+ * Finds the strongest bin of the spectrum.
+ *
+ * As a symbol decision this beats the centroid
+ * angle in noise: the centroid is pulled off the peak by the noise floor in
+ * every other bin, while the maximum is not.
+ *
+ * @param cwc             The centroid configuration.
+ * @param power_spectrum  Source power spectrum values (length = size).
+ * @return Bin index in [0, size).
+ */
+uint32_t cyclic_weighted_centroid_peak_bin(
+    const CyclicWeightedCentroid_t *cwc,
+    const float32_t *power_spectrum
+);
+
+/**
+ * Refines a peak to sub-bin precision using the energy in a window around it.
+ *
+ * Picking the strongest bin is robust but insensitive to offsets of less than
+ * about half a bin. This function starts from a peak bin (e.g. from
+ * cyclic_weighted_centroid_peak_bin) and repeatedly moves
+ * a window of +/- half_width bins to the power-weighted mean position
+ * (exponent 1) of the bins inside it (a mean shift). The window slides
+ * continuously, with bins partly inside it weighted proportionally, so the
+ * result changes smoothly with the spectrum and does not depend on which of
+ * several similar bins happened to be strongest.
+ *
+ * This copes with spread-out peaks such as an acoustic channel with echoes,
+ * where energy arrives over several bins; a 3-point peak fit is unstable there.
+ * The window wraps around the circular spectrum.
+ *
+ * The spectrum need not be the one the centroid uses: for a clean tone the
+ * mean of whole-bin samples barely follows small shifts (nearly all the
+ * energy sits in one bin), so the chirp decoder passes a spectrum sampled
+ * every half bin (size = 2 * bins), which makes the estimate close to linear.
+ *
+ * @param power_spectrum  Source power spectrum values (length = size).
+ * @param size            Number of points in the circular spectrum.
+ * @param start_bin       Point to start from, in [0, size).
+ * @param half_width      Window half-width in points (e.g. 3 bins = 6 points at half-bin spacing).
+ * @return Refined angle in radians, in [0, 2*pi), with size points per turn.
+ *         With no power in the window the angle of start_bin is returned.
+ */
+float32_t cyclic_weighted_centroid_refine_peak(
+    const float32_t *power_spectrum,
+    size_t size,
+    uint32_t start_bin,
+    uint32_t half_width
 );
 
 #endif // CYCLIC_WEIGHTED_CENTROID_H

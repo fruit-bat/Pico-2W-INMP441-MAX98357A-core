@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 #include "pico/stdlib.h"
 #include "pico/time.h"
@@ -9,29 +10,41 @@
 #include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
 #include "arm_const_structs.h"
 
-#include "cyclic_weighted_centroid.h"
+#include "chirp_decoder.h"
+#include "chirp_encoder.h"
+#include "chirp_symbol_rx.h"
+#include "fft_visualise.h"
+#include "frame_snapshot.h"
+#include "rx_sample_window.h"
+#include "spsc_ring.h"
+#include "symbol_timing_tracker.h"
 
 #define MAX_SYMBOLS 64u
 // TODO Should we consider separating 'max symbols' from 'bins in bandwidth' ?
 // TODO perhaps hwe need 'bins per symbol' and 'bins per bandwidth' as separate parameters.
 
-const float32_t FS = I2S_SAMPLE_RATE;
-const float32_t BPB = FS / (float32_t)I2S_BUFFER_SIZE; // Bandwidth per FFT bin
-const float32_t BW = BPB * MAX_SYMBOLS; // Total bandwidth for the chirp signal
-const float32_t F0 = 15000.0f;
-const float32_t F1 = F0 + BW;
-const float32_t T  = (float32_t)I2S_BUFFER_SIZE / FS;
-const float32_t chirp_rate = BW / T;
-const float32_t chirp_vol = 0.005f;
+// Currently must be 1024
+#define FFT_SIZE I2S_BUFFER_SIZE
 
+static const float32_t FS = I2S_SAMPLE_RATE;
+static const float32_t BPB = FS / (float32_t)FFT_SIZE; // Bandwidth per FFT bin
+static const float32_t BW = BPB * MAX_SYMBOLS; // Total bandwidth for the chirp signal
+static const float32_t F0 = 15000.0f;
+static const float32_t T  = (float32_t)FFT_SIZE / FS;
+static const float32_t chirp_rate = BW / T;
+static const float32_t chirp_vol = 0.005f;
 
-inline float32_t chirp_phase(float32_t t) {
-    return 2.0f * PI * (F0 * t + 0.5f * chirp_rate * t * t);
-}
-
-#define MIC_LEVEL_PRINT_PERIOD_MS 100
-#define BAR_WIDTH 100
+#define DISPLAY_PERIOD_MS 100
+#define LOG_BAND_BINS (2u * MAX_SYMBOLS) // FFT bins logged per frame: -MAX_SYMBOLS .. MAX_SYMBOLS-1
 #define TONE_STARTUP_STEPS 32
+#define RX_RECORD_QUEUE_CAPACITY 64u // Must be a power of two
+
+// Symbol timing tracking (see symbol_timing_tracker.h)
+#define TRACK_ALPHA          0.25f // Proportional gain
+#define TRACK_BETA           0.0f  // Drift (rate) gain; 0 while TX and RX share a clock (nothing to learn)
+#define TRACK_MAX_RATE       0.5f  // Max drift, samples per frame
+#define TRACK_RATE_WINDOW    4.0f  // Only learn drift when |error| <= this many samples
+#define TRACK_MIN_MAGNITUDE  0.8f  // Ignore frames whose centroid magnitude is below this (no clear tone)
 
 enum test_mode {
     MODE_LOOPBACK = 0,
@@ -40,190 +53,176 @@ enum test_mode {
     MODE_TONE_CHIRP = 3,
 };
 
-extern volatile uint32_t g_i2s_tx_dma_count;
-extern volatile uint32_t g_i2s_rx_dma_count;
+enum tracking_mode {
+    TRACK_OFF = 0,      // Delay only changes with the z/x keys
+    TRACK_DECISION = 1, // Track using each frame's error from the nearest symbol (no knowledge of TX);
+                        // aligns to the symbol grid, but symbol labels may be offset by a constant
+    TRACK_PILOT = 2,    // Track using the error from the known transmitted symbol (testing only);
+                        // locks from any delay with correct symbol labels
+};
 
+// ---------------------------------------------------------------------------
+// Shared between cores.
+// Core 0 (UI) writes these single-word controls; core 1 (DSP) reads them.
+// ---------------------------------------------------------------------------
 static volatile enum test_mode current_mode = MODE_TONE_440;
-static volatile bool loopback_enabled = true;
-static int32_t shared_dsp_buffer[I2S_BUFFER_SIZE];
-static int32_t rx_dsp_buffer[I2S_BUFFER_SIZE];
-static volatile float mic_peak_value = 0;
-static float tone_phase = 0.0f;
-static uint32_t tone_step_index = 0;
+static volatile uint32_t tx_symbol = 0;        // Symbol transmitted in chirp modes
+static volatile uint32_t tone_step_index = 0;  // Reset by core 0 to restart the tone ramp
+static volatile enum tracking_mode tracking_mode = TRACK_OFF;
 
-// So we can phase align with the input signal
-static volatile uint32_t rx_sample_delay = 967;
-// A couple of mic buffers so we can phase shift
-static float rx_float_buf[2][I2S_BUFFER_SIZE];
-static uint32_t rx_float_buf_idx = 0;
+// Core 1 writes these counters; core 0 reads them.
+static volatile uint32_t rx_blocks_missed = 0;  // RX blocks not processed in time
+static volatile uint32_t tx_blocks_missed = 0;  // TX blocks not refilled in time
+static volatile uint32_t rx_records_dropped = 0; // Records lost because the queue was full
 
-// Currently must be 1024
-#define FFT_SIZE I2S_BUFFER_SIZE
+//
+// One record per received frame, passed from core 1 to core 0.
+// This is the receiver's output: today it is displayed, later it can be
+// streamed to a host or fed to a packet decoder.
+//
+typedef struct {
+    uint32_t frame;          // RX block count when this frame was decoded
+    uint32_t mode;           // enum test_mode in effect for this frame
+    uint32_t delay;          // Alignment delay in samples used for this frame
+    uint32_t tx_symbol;      // Symbol being transmitted at the time (useful for loopback/testing)
+    float32_t peak;          // Peak absolute sample value in the frame, [0, 1]
+    ChirpSymbolRx_t symbol;  // Decoded symbol
+    uint32_t tracking;       // enum tracking_mode in effect for this frame
+    float32_t timing_error;  // Timing error in samples (positive: delay should increase)
+    float32_t timing_rate;   // Tracker's drift estimate, samples per frame
+    float32_t band_power[LOG_BAND_BINS]; // De-chirped FFT power |X|^2 of bins -MAX_SYMBOLS .. MAX_SYMBOLS-1
+                                         // (bin = index mod FFT_SIZE)
+    float32_t folded_power[MAX_SYMBOLS]; // Coherently folded power the decoder decides from, bins 0 .. MAX_SYMBOLS-1
+} RxFrameRecord_t;
 
-float32_t fft_output_buffer[FFT_SIZE * 2]; // Complex output: real + imag interleaved
-float32_t fft_magnitude_buffer[FFT_SIZE]; 
+static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
+static SpscRing_t rx_record_queue;
 
-static float32_t complex_dechirp_vector[FFT_SIZE * 2];
+// Consistent copy of the latest FFT magnitude spectrum for display
+static float32_t spectrum_snapshot_buffer[FFT_SIZE];
+static FrameSnapshot_t spectrum_snapshot;
 
-// Space for the centroid calculation tables
+// Double-buffered mic input so we can phase align with the input signal.
+// Core 1 writes samples; core 0 may adjust the delay.
+static float32_t rx_window_storage[RX_SAMPLE_WINDOW_STORAGE_LEN(FFT_SIZE)];
+static RxSampleWindow_t rx_window;
+
+// ---------------------------------------------------------------------------
+// Core 1 only.
+// ---------------------------------------------------------------------------
+
+// The aligned frame passed to the decoder
+static float32_t rx_frame[FFT_SIZE];
+
+// Statically allocated storage for the chirp decoder (no malloc)
+static float32_t complex_dechirp_vector[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t complex_dechirp_half_vector[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t fft_half_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t fft_output_buffer[CHIRP_DECODER_COMPLEX_LEN(FFT_SIZE)];
+static float32_t fft_magnitude_buffer[FFT_SIZE];
+static float32_t folded_power_buffer[MAX_SYMBOLS];
+static float32_t fine_power_buffer[CHIRP_DECODER_FINE_LEN(MAX_SYMBOLS)];
 static float32_t cos_table[MAX_SYMBOLS];
 static float32_t sin_table[MAX_SYMBOLS];
-// Centroid configuration
-static CyclicWeightedCentroid_t cwc;
-// Centroid result vector
-static CyclicWeightedCentroidVector_t cwc_vector;
-static CyclicWeightedCentroidResult_t cwc_result;
 
+static ChirpDecoderState_t chirp_decoder;
+static ChirpEncoder_t chirp_encoder;
+static ChirpSymbolRxConfig_t symbol_rx_config;
+static SymbolTimingTracker_t timing_tracker;
 
+static float tone_phase = 0.0f;
 
+// ---------------------------------------------------------------------------
+// Core 0 only.
+// ---------------------------------------------------------------------------
+static FftVisualise_t fft_visualise;
 
+static void init_audio_system(void) {
+    const ChirpParams_t chirp_params = {
+        .sample_rate = FS,
+        .f0 = F0,
+        .chirp_rate = chirp_rate,
+    };
 
-void generate_complex_dechirp_vector() {
-
-    const float32_t sample_rate = FS;
-    const float32_t f_min = F0;
-    const float32_t T = (float32_t)FFT_SIZE / sample_rate;
-    
-    for (uint32_t n = 0; n < FFT_SIZE; n++) {
-        float32_t t = (float32_t)n / sample_rate;
-        // The standard Up-Chirp phase equation
-        float32_t phase = chirp_phase(t);
-        
-        // Complex Conjugate: [Cos(phase), -Sin(phase)]
-        complex_dechirp_vector[2 * n]     = cosf(phase);  
-        complex_dechirp_vector[2 * n + 1] = -sinf(phase); 
-    }
-}
-
-void generate_modulated_chirp(float32_t *tx_audio_buffer, uint32_t symbol_val) {
-    uint32_t shift = (float32_t)symbol_val * FS / BW; // Shift in samples for the symbol value
-    for (int n = 0; n < I2S_BUFFER_SIZE; n++) {
-        tx_audio_buffer[n] = complex_dechirp_vector[((n + shift) % I2S_BUFFER_SIZE) * 2] * chirp_vol; // Apply the complex de-chirp and scale by volume
-    }
-}
-
-// The 1024-point complex instance is globally defined by CMSIS-DSP
-const arm_cfft_instance_f32 *cfft_instance = &arm_cfft_sR_f32_len1024;
-
-void init_audio_system(void) {
-    generate_complex_dechirp_vector();
-
-    // Initialize the centroid configuration
-    cyclic_weighted_centroid_init(
-        &cwc,
+    chirp_decoder_init(
+        &chirp_decoder,
+        &chirp_params,
         FFT_SIZE,
-        4.0f, // Power exponent for weighting
+        &arm_cfft_sR_f32_len1024, // The 1024-point complex instance is globally defined by CMSIS-DSP
+        4, // Power exponent for weighting
         MAX_SYMBOLS,
+        1, // Bins either side of the peak used to refine its position (timing). Keep this to
+           // the peak's main lobe (+/-1 bin): the symbol is decided from the strongest bin, so
+           // the timing must measure that same peak. A wider window measures the centre of the
+           // peak plus nearby echoes instead, and with an echo 1-3 bins away the tracker
+           // pushes the peak off its bin and hunts (see test_loop_echoes).
+        complex_dechirp_vector,
+        complex_dechirp_half_vector,
+        fft_half_buffer,
+        fft_output_buffer,
+        fft_magnitude_buffer,
+        folded_power_buffer,
+        fine_power_buffer,
         cos_table,
         sin_table
     );
+
+    // The transmitter shares the decoder's chirp table
+    chirp_encoder_init(
+        &chirp_encoder,
+        chirp_decoder.complex_dechirp_vector,
+        FFT_SIZE,
+        MAX_SYMBOLS,
+        chirp_vol
+    );
+
+    chirp_symbol_rx_config_init(&symbol_rx_config, MAX_SYMBOLS);
+
+    symbol_timing_tracker_init(
+        &timing_tracker,
+        FFT_SIZE,
+        TRACK_ALPHA,
+        TRACK_BETA,
+        TRACK_MAX_RATE,
+        TRACK_RATE_WINDOW,
+        rx_sample_window_get_delay(&rx_window)
+    );
 }
 
-float32_t* __not_in_flash_func(fft_mic_input_buffer)() {
-
-    static float32_t complex_input_buffer[FFT_SIZE * 2]; // Interleaved complex input: [Real, Imag, Real, Imag...]    
-
-    // 1. Stage real mic data into the complex array layout
-    for (uint32_t i = 0; i < FFT_SIZE; i++) {
-
-        uint32_t rxb_idx = (rx_float_buf_idx + (rx_sample_delay > i ? 1 : 0)) % 2;
-        uint32_t rxs_idx = (FFT_SIZE - rx_sample_delay + i) % FFT_SIZE;
-
-        float32_t rx_sample = rx_float_buf[rxb_idx][rxs_idx];
-
-        complex_input_buffer[2 * i]     = rx_sample; // Real part
-        complex_input_buffer[2 * i + 1] = 0.0f;      // Imaginary part
+static const char *tracking_name(enum tracking_mode mode) {
+    switch (mode) {
+        case TRACK_OFF:      return "off";
+        case TRACK_DECISION: return "decision";
+        case TRACK_PILOT:    return "pilot";
     }
-
-    // 2. Complex Element-wise Multiplication (De-chirp)
-    // Multiplies complex_input by complex_dechirp and saves to fft_output_buffer
-    arm_cmplx_mult_cmplx_f32(complex_input_buffer, complex_dechirp_vector, fft_output_buffer, FFT_SIZE);
-
-    // 3. Execute the Complex FFT
-    // Note: arm_cfft_f32 processes data IN-PLACE. 
-    // The last parameter '0' means Forward FFT (1 would mean Inverse)
-    // The bit reversal flag is hardcoded to 1 in modern CMSIS-DSP
-    arm_cfft_f32(cfft_instance, fft_output_buffer, 0, 1);
-
-    // 4. Calculate magnitudes for all 1024 bins
-    // No more complex packing layouts or splitting DC/Nyquist!
-    arm_cmplx_mag_squared_f32(fft_output_buffer, fft_magnitude_buffer, FFT_SIZE);
-
-    return &fft_magnitude_buffer[0];
+    return "unknown";
 }
 
-static int visualize_fft_start = 0;
-const static int visualize_fft_page_size = 50;
-
-void visualize_fft(float32_t *magnitude_buf) {
-    // 1. Send ANSI escape codes: Clear screen and reset cursor to top-left
-    // This stops the terminal from scrolling and keeps the graph stationary
-    printf("\033[2J\033[H");
-    
-    printf("=== RP2350 FFT SPECTRUM ANALYZER (%2.1f kHz / 1024-pt) ===\n\n", FS/1000.0f);
-
-    for (int i = visualize_fft_start * visualize_fft_page_size;
-         i < (visualize_fft_page_size * (1 + visualize_fft_start)); 
-         i += 1) { 
-        
-        // Average 4 adjacent bins together to make the display stable
-        float32_t avg_mag = magnitude_buf[i];
-        
-        // Calculate the actual center frequency for this display line
-        int center_freq = (int)((i) * FS / (float32_t)FFT_SIZE);
-
-        // Convert the raw magnitude into a character width.
-        // The INMP441 is sensitive; you may need to tweak this '150.0f' multiplier
-        // up or down depending on how loud you are speaking!
-        int bar_length = (int)(avg_mag * 1500.0f); 
-        
-        // Cap the bar length to fit comfortably in a standard 80-character terminal
-        if (bar_length > 120) bar_length = 120;
-        if (bar_length < 0)  bar_length = 0;
-
-        // Print the frequency label cleanly padded to 5 characters
-        printf("%5d Hz | ", center_freq);
-        
-        // Draw the amplitude bar
-        for (int b = 0; b < bar_length; b++) {
-            printf("#");
-        }
-        
-        printf("\n");
+static const char *mode_name(enum test_mode mode) {
+    switch (mode) {
+        case MODE_LOOPBACK:   return "loopback";
+        case MODE_MIC_LEVEL:  return "mic-level";
+        case MODE_TONE_440:   return "tone-440";
+        case MODE_TONE_CHIRP: return "chirp";
     }
-}
-
-
-
-static void print_bar(float percent) {
-    int count = (percent * BAR_WIDTH) / 100;
-    printf("[MIC] %3.2f%% |", percent);
-    for (int i = 0; i < BAR_WIDTH; ++i) {
-        putchar(i < count ? '#' : ' ');
-    }
-    printf("|\n");
-}
-
-static void __not_in_flash_func(update_mic_level_stats)(const float *buffer) {
-    float sum_sq = 0.0f;
-    float peak = 0;
-
-    for (size_t i = 0; i < I2S_BUFFER_SIZE; ++i) {
-        float sample = buffer[i];
-        float mag = fabsf(sample);
-        if (mag > peak) {
-            peak = mag;
-        }
-    }
-    mic_peak_value = peak;
+    return "unknown";
 }
 
 static void set_mode(enum test_mode mode) {
     current_mode = mode;
-    loopback_enabled = (mode == MODE_LOOPBACK);
-    printf("[MODE] Selected mode: %s\n",
-           mode == MODE_LOOPBACK ? "loopback" :
-           mode == MODE_MIC_LEVEL ? "mic-level" : "tone-440");
+    tone_step_index = 0;
+    printf("[MODE] Selected mode: %s\n", mode_name(mode));
+}
+
+static float32_t __not_in_flash_func(peak_abs)(const float32_t *buffer, uint32_t size) {
+    float32_t peak = 0.0f;
+    for (uint32_t i = 0; i < size; ++i) {
+        const float32_t mag = fabsf(buffer[i]);
+        if (mag > peak) {
+            peak = mag;
+        }
+    }
+    return peak;
 }
 
 static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
@@ -231,9 +230,10 @@ static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
     const float two_pi = 2.0f * (float)M_PI;
     float gain = 0.1f;
 
-    if (tone_step_index < TONE_STARTUP_STEPS) {
-        gain *= (float)tone_step_index / (float)TONE_STARTUP_STEPS;
-        tone_step_index++;
+    const uint32_t step = tone_step_index;
+    if (step < TONE_STARTUP_STEPS) {
+        gain *= (float)step / (float)TONE_STARTUP_STEPS;
+        tone_step_index = step + 1;
     }
 
     for (size_t i = 0; i < I2S_BUFFER_SIZE; ++i) {
@@ -247,112 +247,286 @@ static void __not_in_flash_func(fill_tone_buffer)(float *buffer) {
     }
 }
 
-
-// Interrupt Hook: Invoked automatically when the INMP441 fills a memory chunk
-void __not_in_flash_func(i2s_callback_rx_ready)() {
-    //update_mic_level_stats(buffer);
-    float32_t* fft_result = fft_mic_input_buffer();
-    
-    // Calculate the centroid of the FFT magnitude spectrum
-    cyclic_weighted_centroid_init_vector(&cwc_vector);
-    cyclic_weighted_centroid_accumulate_forwards(
-        &cwc, 
-        fft_result, 
-        cwc.power_exponent, 
-        &cwc_vector
-    );
-    cyclic_weighted_centroid_accumulate_backwards(
-        &cwc, 
-        fft_result, 
-        cwc.power_exponent, 
-        &cwc_vector
-    );
-    cyclic_weighted_centroid_finalize(&cwc, &cwc_vector, &cwc_result);
+// Wraps an angle into [-pi, pi)
+static float32_t __not_in_flash_func(wrap_pi)(float32_t a) {
+    while (a >= PI) a -= 2.0f * PI;
+    while (a < -PI) a += 2.0f * PI;
+    return a;
 }
 
-static uint32_t symbol_index = 0; // Current symbol index for chirp modulation
+//
+// Core 1: timing error in samples for a decoded frame (positive: increase the delay).
+//
+// A symbol is the base chirp cyclically shifted by FFT_SIZE / MAX_SYMBOLS
+// samples per symbol step, so an angle error converts directly into samples.
+// A late window (delay too large) reduces the effective shift and so the
+// decoded angle, giving a negative error.
+//
+static float32_t __not_in_flash_func(timing_error_samples)(const RxFrameRecord_t *record, enum tracking_mode mode) {
+    const float32_t samples_per_radian =
+        (float32_t)(FFT_SIZE / MAX_SYMBOLS) * symbol_rx_config.symbols_per_radian;
 
-// Interrupt Hook: Invoked automatically when the MAX98357A requests audio bytes
-void __not_in_flash_func(i2s_callback_tx_demanded)(float *buffer) {
-    const size_t size = I2S_BUFFER_SIZE;
+    float32_t error_angle = record->symbol.error_angle; // Relative to the decided symbol (the strongest bin)
+    if (mode == TRACK_PILOT) {
+        // Relative to the symbol actually sent: +/- half a frame
+        error_angle = wrap_pi(record->symbol.angle - (float32_t)record->tx_symbol * symbol_rx_config.radians_per_symbol);
+    }
+    return error_angle * samples_per_radian;
+}
+
+// Core 1: decode the newest block in the RX window and publish the result.
+static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
+    static enum tracking_mode last_tracking = TRACK_OFF;
+
+    rx_sample_window_read(&rx_window, rx_frame);
+
+    // Static: records are large (band_power) and core 1's stack is small
+    static RxFrameRecord_t record;
+    record = (RxFrameRecord_t){
+        .frame = frame,
+        .mode = current_mode,
+        .delay = rx_sample_window_get_delay(&rx_window),
+        .tx_symbol = tx_symbol,
+        .peak = peak_abs(rx_frame, FFT_SIZE),
+    };
+
+    chirp_decoder_real_chirp_to_symbol(
+        &chirp_decoder,
+        rx_frame,
+        &symbol_rx_config,
+        &record.symbol
+    );
+
+    // Symbol timing tracking; the new delay applies from the next frame
+    const enum tracking_mode tracking = tracking_mode;
+    if (tracking != last_tracking) {
+        symbol_timing_tracker_reset(&timing_tracker, record.delay);
+        last_tracking = tracking;
+    }
+    record.tracking = tracking;
+    record.timing_error = timing_error_samples(&record, tracking);
+    if (tracking != TRACK_OFF) {
+        const bool valid = record.symbol.magnitude >= TRACK_MIN_MAGNITUDE;
+        rx_sample_window_set_delay(
+            &rx_window,
+            symbol_timing_tracker_update(&timing_tracker, record.delay, record.timing_error, valid));
+    }
+    record.timing_rate = timing_tracker.rate;
+
+    // Keep the band around DC (where de-chirped symbols land) with the record
+    for (uint32_t i = 0; i < LOG_BAND_BINS; i++) {
+        record.band_power[i] = chirp_decoder.fft_magnitude_buffer[(FFT_SIZE + i - MAX_SYMBOLS) % FFT_SIZE];
+    }
+    memcpy(record.folded_power, chirp_decoder.folded_power_buffer, sizeof(record.folded_power));
+
+    if (!spsc_ring_push(&rx_record_queue, &record)) {
+        rx_records_dropped++;
+    }
+
+    frame_snapshot_offer(&spectrum_snapshot, chirp_decoder.fft_magnitude_buffer);
+}
+
+// Core 1: produce the next block of audio to transmit.
+static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
     switch (current_mode) {
-
         case MODE_LOOPBACK:
-            generate_modulated_chirp(buffer, symbol_index);
+        case MODE_TONE_CHIRP:
+            chirp_encoder_symbol_to_samples(&chirp_encoder, tx_symbol, buffer);
             break;
 
         case MODE_MIC_LEVEL:
-            for (size_t i = 0; i < size; ++i) {
-                buffer[i] = 0.0f;
-            }
+            memset(buffer, 0, I2S_BUFFER_SIZE * sizeof(*buffer));
             break;
 
         case MODE_TONE_440:
             fill_tone_buffer(buffer);
             break;
-
-        case MODE_TONE_CHIRP:
-            generate_modulated_chirp(buffer, symbol_index);
-            break;
     }
 }
 
+// Core 1: real-time audio loop. Services each DMA block as it completes.
+static void __not_in_flash_func(core1_main)(void) {
+    static float32_t tx_block[I2S_BUFFER_SIZE];
 
-void core1_main() {
-    static int32_t *tx_buffer = NULL;
-    static int32_t *rx_buffer = NULL;
-    static float float_buf[I2S_BUFFER_SIZE];
+    init_audio_system();
 
-    init_audio_system(); // Initialize the FFT instance once at startup
+    uint32_t last_tx_count = i2s_core_get_tx_block_count();
+    uint32_t last_rx_count = i2s_core_get_rx_block_count();
 
-    while(1) {
-        int32_t *t_tx_buffer = get_tx_buffer();
-        int32_t *t_rx_buffer = get_rx_buffer();
+    while (1) {
+        const uint32_t tx_count = i2s_core_get_tx_block_count();
+        if (tx_count != last_tx_count) {
+            tx_blocks_missed += tx_count - last_tx_count - 1;
+            last_tx_count = tx_count;
 
-        switch (current_mode) {
-            case MODE_LOOPBACK: {
+            int32_t *tx_buffer = get_tx_buffer();
+            fill_tx_block(tx_block);
 
-                if (tx_buffer != t_tx_buffer) {
-                    i2s_callback_tx_demanded(float_buf);
-                    // arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
-                    memset(t_tx_buffer, 0, I2S_BUFFER_SIZE * sizeof(int32_t)); // Clear TX buffer for loopback
-                    tx_buffer = t_tx_buffer;
-                    // Copy TX buffer to RX buffer for loopback
-                    rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
-                    memcpy(
-                        (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
-                        (float32_t *)float_buf, 
-                        I2S_BUFFER_SIZE * sizeof(float32_t));
-                    i2s_callback_rx_ready();
-                    rx_buffer = t_rx_buffer;
-                }
-
-                break;
-            }
-            default: {
-
-                if (tx_buffer != t_tx_buffer) {
-                    i2s_callback_tx_demanded(float_buf);
-                    // fast vector conversion using optimized CMSIS assembly loops
-                    arm_float_to_q31((float32_t *)float_buf, (q31_t *)t_tx_buffer, I2S_BUFFER_SIZE);
-                    tx_buffer = t_tx_buffer;
-                }
-
-                if (rx_buffer != t_rx_buffer) {
-                    rx_float_buf_idx = 1 - rx_float_buf_idx; // Toggle between 0 and 1
-                    // fast vector conversion using optimized CMSIS assembly loops
-                    arm_q31_to_float(
-                        (q31_t *)t_rx_buffer, 
-                        (float32_t *)&rx_float_buf[rx_float_buf_idx][0], 
-                        I2S_BUFFER_SIZE);
-
-                    i2s_callback_rx_ready();
-                    rx_buffer = t_rx_buffer;
-                }
-
-                break;
+            if (current_mode == MODE_LOOPBACK) {
+                // Send silence and feed the generated audio straight to the receiver
+                memset(tx_buffer, 0, I2S_BUFFER_SIZE * sizeof(*tx_buffer));
+                memcpy(rx_sample_window_next_block(&rx_window), tx_block, I2S_BUFFER_SIZE * sizeof(*tx_block));
+                process_rx_block(tx_count);
+            } else {
+                // fast vector conversion using optimized CMSIS assembly loops
+                arm_float_to_q31(tx_block, (q31_t *)tx_buffer, I2S_BUFFER_SIZE);
             }
         }
+
+        const uint32_t rx_count = i2s_core_get_rx_block_count();
+        if (rx_count != last_rx_count) {
+            rx_blocks_missed += rx_count - last_rx_count - 1;
+            last_rx_count = rx_count;
+
+            if (current_mode != MODE_LOOPBACK) {
+                // fast vector conversion using optimized CMSIS assembly loops
+                arm_q31_to_float(
+                    (q31_t *)get_rx_buffer(),
+                    rx_sample_window_next_block(&rx_window),
+                    I2S_BUFFER_SIZE);
+                process_rx_block(rx_count);
+            }
+        }
+    }
+}
+
+// Core 0: redraw the terminal display. Always prints the same number of rows.
+static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *record, uint32_t records_received) {
+    fft_visualise_draw(&fft_visualise, spectrum);
+
+    printf("Mode %-9s  TX symbol %3lu of %lu  RX delay %4lu  peak %5.1f%%          \n",
+        mode_name(current_mode),
+        (unsigned long)tx_symbol,
+        (unsigned long)MAX_SYMBOLS,
+        (unsigned long)record->delay,
+        record->peak * 100.0f);
+    printf("RX symbol %3lu  centroid %8.4f  error %+.4f rad  strength %e          \n",
+        (unsigned long)record->symbol.symbol_index,
+        record->symbol.angle * symbol_rx_config.symbols_per_radian,
+        record->symbol.error_angle,
+        record->symbol.strength);
+
+    for (uint32_t i = 0; i < MAX_SYMBOLS; ++i) {
+        putchar(i == record->symbol.symbol_index ? '*' : '.');
+    }
+    putchar('\n');
+
+    printf("Tracking %-8s  timing error %+7.2f smp  drift %+.3f smp/frame  magnitude %.3f          \n",
+        tracking_name((enum tracking_mode)record->tracking),
+        record->timing_error,
+        record->timing_rate,
+        record->symbol.magnitude);
+    printf("Frames %lu  missed rx %lu tx %lu  dropped records %lu          \n",
+        (unsigned long)records_received,
+        (unsigned long)rx_blocks_missed,
+        (unsigned long)tx_blocks_missed,
+        (unsigned long)rx_records_dropped);
+    printf("Keys: 1-4 mode  o/p symbol  z/x delay  t tracking  c/v page  l log\n");
+}
+
+// ---------------------------------------------------------------------------
+// CSV logging (core 0). One line per received frame; lines starting with '#'
+// are comments, so the output can be loaded directly by most CSV readers.
+// ---------------------------------------------------------------------------
+static bool logging = false;
+
+static void print_log_header(void) {
+    printf("# chirp receiver log v2\n");
+    printf("# sample_rate=%.1f fft_size=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol=%u\n",
+        FS, (unsigned)FFT_SIZE, (unsigned)MAX_SYMBOLS, F0, BW, (unsigned)(FFT_SIZE / MAX_SYMBOLS));
+    printf("# track_alpha=%g track_beta=%g track_max_rate=%g track_rate_window=%g track_min_magnitude=%g\n",
+        TRACK_ALPHA, TRACK_BETA, TRACK_MAX_RATE, TRACK_RATE_WINDOW, TRACK_MIN_MAGNITUDE);
+    printf("# delay: window delay used for this frame (samples); timing_error: samples, positive = increase delay\n");
+    printf("# angle/error_angle: radians; b<k>: de-chirped FFT power |X|^2 of bin k (k mod fft_size)\n");
+    printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");
+    printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
+           "timing_error,timing_rate,rx_missed,tx_missed,dropped");
+    for (int32_t k = -(int32_t)MAX_SYMBOLS; k < (int32_t)MAX_SYMBOLS; k++) {
+        printf(",b%ld", (long)k);
+    }
+    for (uint32_t k = 0; k < MAX_SYMBOLS; k++) {
+        printf(",f%lu", (unsigned long)k);
+    }
+    printf("\n");
+}
+
+static void print_log_record(const RxFrameRecord_t *record) {
+    printf("%lu,%s,%lu,%lu,%s,%lu,%.5f,%+.5f,%.4f,%.4e,%.4f,%+.3f,%+.4f,%lu,%lu,%lu",
+        (unsigned long)record->frame,
+        mode_name((enum test_mode)record->mode),
+        (unsigned long)record->tx_symbol,
+        (unsigned long)record->delay,
+        tracking_name((enum tracking_mode)record->tracking),
+        (unsigned long)record->symbol.symbol_index,
+        record->symbol.angle,
+        record->symbol.error_angle,
+        record->symbol.magnitude,
+        record->symbol.strength,
+        record->peak,
+        record->timing_error,
+        record->timing_rate,
+        (unsigned long)rx_blocks_missed,
+        (unsigned long)tx_blocks_missed,
+        (unsigned long)rx_records_dropped);
+    for (uint32_t i = 0; i < LOG_BAND_BINS; i++) {
+        printf(",%.3e", record->band_power[i]);
+    }
+    for (uint32_t i = 0; i < MAX_SYMBOLS; i++) {
+        printf(",%.3e", record->folded_power[i]);
+    }
+    printf("\n");
+}
+
+static void handle_key(int ch) {
+    switch (ch) {
+        case '1':
+            set_mode(MODE_LOOPBACK);
+            break;
+        case '2':
+            set_mode(MODE_MIC_LEVEL);
+            break;
+        case '3':
+            set_mode(MODE_TONE_440);
+            break;
+        case '4':
+            set_mode(MODE_TONE_CHIRP);
+            break;
+        case 'p':
+            tx_symbol = (tx_symbol + 1) % MAX_SYMBOLS;
+            break;
+        case 'o':
+            tx_symbol = (tx_symbol == 0) ? (MAX_SYMBOLS - 1) : (tx_symbol - 1);
+            break;
+        case 'z': {
+            const uint32_t delay = rx_sample_window_get_delay(&rx_window);
+            rx_sample_window_set_delay(&rx_window, delay > 0 ? delay - 1 : (FFT_SIZE - 1));
+            break;
+        }
+        case 'x': {
+            const uint32_t delay = rx_sample_window_get_delay(&rx_window);
+            rx_sample_window_set_delay(&rx_window, delay < (FFT_SIZE - 1) ? delay + 1 : 0);
+            break;
+        }
+        case 't':
+            tracking_mode = (enum tracking_mode)((tracking_mode + 1) % 3);
+            break;
+        case 'c':
+            fft_visualise_page_prev(&fft_visualise);
+            break;
+        case 'v':
+            fft_visualise_page_next(&fft_visualise);
+            break;
+        case 'l':
+            logging = !logging;
+            if (logging) {
+                printf("\033[2J\033[H"); // Clear the display
+                print_log_header();
+            } else {
+                printf("# log end\n");
+            }
+            break;
+        default:
+            break;
     }
 }
 
@@ -371,98 +545,69 @@ int main() {
     printf("  3 = 440Hz sine tone\n");
     printf("  4 = chirp tone\n");
     printf("[CORE] Initializing DMA and PIO peripherals...\n");
-    printf("[CORE] Tone output uses a 440Hz sine wave with soft startup ramp.\n");
 
     i2s_core_init();
+
+    // Everything shared between the cores is initialized before core 1 starts
+    spsc_ring_init(&rx_record_queue, rx_record_storage, sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY);
+    frame_snapshot_init(&spectrum_snapshot, spectrum_snapshot_buffer, FFT_SIZE);
+    rx_sample_window_init(
+        &rx_window,
+        rx_window_storage,
+        FFT_SIZE,
+        // 961 is about best. but using 960 for now to see some errors.
+        960 // Initial delay in samples to phase align with the input signal
+    );
+
+    fft_visualise_init(
+        &fft_visualise,
+        FFT_SIZE,
+        FS,
+        50,      // Bins per page
+        1500.0f, // Magnitude to bar length; tune for microphone gain
+        120      // Max bar width in characters
+    );
 
     set_mode(MODE_TONE_440);
     printf("[CORE] Starting in tone validation mode to isolate the speaker output path.\n");
     i2s_core_start();
 
-    // Start core 1 
+    // Start core 1
     multicore_launch_core1(core1_main);
 
-    uint32_t last_print_ms = 0;
-    uint32_t last_status_ms = 0;
+    // Static: records are large (band_power) and the stack is small
+    static RxFrameRecord_t latest_record;
+    static RxFrameRecord_t record;
+    uint32_t records_received = 0;
+    uint32_t last_display_ms = 0;
+
     while (true) {
         int ch = getchar_timeout_us(500);
         if (ch != PICO_ERROR_TIMEOUT) {
-            switch (ch) {
-                case '1':
-                    set_mode(MODE_LOOPBACK);
-                    tone_step_index = 0;
-                    break;
-                case '2':
-                    set_mode(MODE_MIC_LEVEL);
-                    break;
-                case '3':
-                    set_mode(MODE_TONE_440);
-                    tone_step_index = 0;
-                    break;
-                case '4':
-                    set_mode(MODE_TONE_CHIRP);
-                    tone_step_index = 0;
-                    break;
-                case 'p':
-                    symbol_index = (symbol_index + 1) % MAX_SYMBOLS;
-                    break;
-                case 'o':
-                    symbol_index = (symbol_index == 0) ? (MAX_SYMBOLS - 1) : (symbol_index - 1);
-                    break;
-                case 'z':
-                    rx_sample_delay = rx_sample_delay > 0 ? rx_sample_delay - 1 : FFT_SIZE;
-                    break;
-                case 'x':
-                    rx_sample_delay = rx_sample_delay < (FFT_SIZE - 1) ? rx_sample_delay + 1 : 0;
-                    break;
-                case 'c':
-                    visualize_fft_start = visualize_fft_start > 0 ? visualize_fft_start - 1 : 0;
-                    break;
-                case 'v':
-                    visualize_fft_start = visualize_fft_start  + 1;
-                    break;
-                default:
-                    break;
+            handle_key(ch);
+        }
+
+        // Drain every record from the receiver, keeping the latest for display
+        // and logging each one when logging is on
+        while (spsc_ring_pop(&rx_record_queue, &record)) {
+            if (logging) {
+                print_log_record(&record);
             }
+            latest_record = record;
+            records_received++;
         }
 
         uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
-        if (now_ms - last_print_ms >= MIC_LEVEL_PRINT_PERIOD_MS) {
-            float percent = mic_peak_value  * 100.0f;
-            if (percent < 0.0) percent = 0.0;
-            if (percent > 100.0) {
-                printf("[MIC] Warning: Peak value exceeds 100%% (%3.2f) of full scale!\n", percent);
-                percent = 100.0f;
+        if (!logging && now_ms - last_display_ms >= DISPLAY_PERIOD_MS) {
+            const float32_t *spectrum = frame_snapshot_acquire(&spectrum_snapshot);
+            if (spectrum != NULL) {
+                draw_display(spectrum, &latest_record, records_received);
+                frame_snapshot_release(&spectrum_snapshot);
+                last_display_ms = now_ms;
             }
-            visualize_fft(fft_magnitude_buffer);
-            //print_bar(percent);
-            printf("Symbol %3lu of %lu RX delay %4ld RX symbol centroid: %3.4f Rx symbol strength: %ef     \n", 
-                symbol_index, 
-                MAX_SYMBOLS,
-                rx_sample_delay,
-                cwc_result.bin,
-                cwc_result.strength
-            );
-            uint32_t rsym = cwc_result.ubin;
-            if (rsym >= MAX_SYMBOLS) rsym = 0;
-            for (int i = 0; i < MAX_SYMBOLS; ++i) {
-                putchar(i == rsym  ? '*' : '.');
-            }
-            last_print_ms = now_ms;
         }
-/*
-        if (now_ms - last_status_ms >= 1000U) {
-            const char *mode_name = (current_mode == MODE_LOOPBACK) ? "loopback" :
-                                    (current_mode == MODE_MIC_LEVEL) ? "mic-level" : "tone-440";
-            printf("[STATUS] running=%s peak=%3.2f tx_dma=%lu rx_dma=%lu\n",
-                   mode_name,
-                   mic_peak_value * 100.0f,
-                   (unsigned long)g_i2s_tx_dma_count,
-                   (unsigned long)g_i2s_rx_dma_count);
-            last_status_ms = now_ms;
-        }
-*/
+
         tight_loop_contents();
     }
 
