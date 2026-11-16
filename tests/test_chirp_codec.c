@@ -73,7 +73,7 @@ static void test_spectrum_buffers(void) {
 
     const double full = pow(N * VOLUME / 2.0, 2.0); // Band-pass keeps half the real amplitude
     const double raw_a = rig_decoder.fft_magnitude_buffer[s];
-    const double raw_b = rig_decoder.fft_magnitude_buffer[N - M + s];
+    const double raw_b = rig_decoder.fft_magnitude_buffer[N - RIG_BINS + s];
     const double folded = rig_decoder.folded_power_buffer[s];
     printf("  raw %.4f, %.4f of full tone; folded %.4f\n", raw_a / full, raw_b / full, folded / full);
     CHECK_NEAR(raw_a / full, 0.25, 0.02);

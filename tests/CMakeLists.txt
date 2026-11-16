@@ -86,3 +86,8 @@ add_executable(test_filter test_filter.c)
 target_compile_options(test_filter PRIVATE -Wall -Wextra)
 target_link_libraries(test_filter PRIVATE test_support)
 add_test(NAME filter COMMAND test_filter)
+
+add_executable(test_spacing test_spacing.c)
+target_compile_options(test_spacing PRIVATE -Wall -Wextra)
+target_link_libraries(test_spacing PRIVATE test_support)
+add_test(NAME spacing COMMAND test_spacing)

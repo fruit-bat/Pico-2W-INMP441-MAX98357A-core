@@ -121,7 +121,7 @@ static void test_low_frequency_noise_floor(void) {
     static float32_t frame[N];
     const double white_rms = RIG_VOLUME;
     for (int filtered = 0; filtered <= 1; filtered++) {
-        double mean[M] = { 0 };
+        double mean[RIG_BINS] = { 0 };
         chirp_channel_seed(21);
         LowFrequencyNoise_t lf;
         lf_init(&lf, white_rms * pow(10.0, LF_OVER_WHITE_DB / 20.0));
@@ -133,16 +133,16 @@ static void test_low_frequency_noise_floor(void) {
             if (f < 4) continue; // Let the filter settle
             ChirpSymbolRx_t rx;
             rig_decode(frame, &rx);
-            for (uint32_t k = 0; k < M; k++) mean[k] += rig_decoder.folded_power_buffer[k];
+            for (uint32_t k = 0; k < RIG_BINS; k++) mean[k] += rig_decoder.folded_power_buffer[k];
         }
-        double sorted[M];
+        double sorted[RIG_BINS];
         memcpy(sorted, mean, sizeof sorted);
-        for (uint32_t i = 1; i < M; i++) {
+        for (uint32_t i = 1; i < RIG_BINS; i++) {
             for (uint32_t j = i; j > 0 && sorted[j - 1] > sorted[j]; j--) {
                 const double t = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = t;
             }
         }
-        const double median = 0.5 * (sorted[M / 2 - 1] + sorted[M / 2]);
+        const double median = 0.5 * (sorted[RIG_BINS / 2 - 1] + sorted[RIG_BINS / 2]);
         double bump = 0.0;
         for (uint32_t k = 3; k <= 8; k++) bump += mean[k];
         bump /= 6.0 * median;
