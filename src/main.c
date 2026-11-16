@@ -10,6 +10,7 @@
 #include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
 #include "arm_const_structs.h"
 
+#include "biquad_filter.h"
 #include "chirp_decoder.h"
 #include "chirp_encoder.h"
 #include "chirp_symbol_rx.h"
@@ -45,6 +46,12 @@ static const float32_t chirp_vol = 0.005f;
 #define TRACK_MAX_RATE       0.5f  // Max drift, samples per frame
 #define TRACK_RATE_WINDOW    4.0f  // Only learn drift when |error| <= this many samples
 #define TRACK_MIN_MAGNITUDE  0.8f  // Ignore frames whose centroid magnitude is below this (no clear tone)
+
+// Microphone high-pass (see biquad_filter.h): removes the mic's DC offset and
+// low-frequency noise, which would otherwise leak into the chirp band at the
+// frame edges. Second-order Butterworth, well below the 15 kHz band edge.
+#define RX_HIGHPASS_HZ       10000.0f
+#define RX_HIGHPASS_Q        0.70710678f
 
 enum test_mode {
     MODE_LOOPBACK = 0,
@@ -85,7 +92,7 @@ typedef struct {
     uint32_t mode;           // enum test_mode in effect for this frame
     uint32_t delay;          // Alignment delay in samples used for this frame
     uint32_t tx_symbol;      // Symbol being transmitted at the time (useful for loopback/testing)
-    float32_t peak;          // Peak absolute sample value in the frame, [0, 1]
+    float32_t peak;          // Peak absolute sample value in the frame after the RX high-pass, [0, 1]
     ChirpSymbolRx_t symbol;  // Decoded symbol
     uint32_t tracking;       // enum tracking_mode in effect for this frame
     float32_t timing_error;  // Timing error in samples (positive: delay should increase)
@@ -129,6 +136,7 @@ static ChirpDecoderState_t chirp_decoder;
 static ChirpEncoder_t chirp_encoder;
 static ChirpSymbolRxConfig_t symbol_rx_config;
 static SymbolTimingTracker_t timing_tracker;
+static BiquadFilter_t rx_highpass; // Applied to the microphone stream, block by block
 
 static float tone_phase = 0.0f;
 
@@ -185,6 +193,8 @@ static void init_audio_system(void) {
         TRACK_RATE_WINDOW,
         rx_sample_window_get_delay(&rx_window)
     );
+
+    biquad_filter_init_highpass(&rx_highpass, FS, RX_HIGHPASS_HZ, RX_HIGHPASS_Q);
 }
 
 static const char *tracking_name(enum tracking_mode mode) {
@@ -378,10 +388,11 @@ static void __not_in_flash_func(core1_main)(void) {
 
             if (current_mode != MODE_LOOPBACK) {
                 // fast vector conversion using optimized CMSIS assembly loops
-                arm_q31_to_float(
-                    (q31_t *)get_rx_buffer(),
-                    rx_sample_window_next_block(&rx_window),
-                    I2S_BUFFER_SIZE);
+                float32_t *block = rx_sample_window_next_block(&rx_window);
+                arm_q31_to_float((q31_t *)get_rx_buffer(), block, I2S_BUFFER_SIZE);
+
+                // High-pass the continuous stream, before it is cut into frames
+                biquad_filter_process(&rx_highpass, block, I2S_BUFFER_SIZE);
                 process_rx_block(rx_count);
             }
         }
@@ -434,6 +445,7 @@ static void print_log_header(void) {
         FS, (unsigned)FFT_SIZE, (unsigned)MAX_SYMBOLS, F0, BW, (unsigned)(FFT_SIZE / MAX_SYMBOLS));
     printf("# track_alpha=%g track_beta=%g track_max_rate=%g track_rate_window=%g track_min_magnitude=%g\n",
         TRACK_ALPHA, TRACK_BETA, TRACK_MAX_RATE, TRACK_RATE_WINDOW, TRACK_MIN_MAGNITUDE);
+    printf("# rx_highpass_hz=%g (2nd order, applied to the mic stream; peak is measured after it)\n", RX_HIGHPASS_HZ);
     printf("# delay: window delay used for this frame (samples); timing_error: samples, positive = increase delay\n");
     printf("# angle/error_angle: radians; b<k>: de-chirped FFT power |X|^2 of bin k (k mod fft_size)\n");
     printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");

@@ -53,6 +53,7 @@ add_library(chirp_dsp STATIC
     ${SRC_DIR}/cyclic_weighted_centroid.c
     ${SRC_DIR}/rx_sample_window.c
     ${SRC_DIR}/symbol_timing_tracker.c
+    ${SRC_DIR}/biquad_filter.c
 )
 target_include_directories(chirp_dsp PUBLIC
     ${SRC_DIR}
@@ -80,3 +81,8 @@ add_executable(test_timing test_timing.c)
 target_compile_options(test_timing PRIVATE -Wall -Wextra)
 target_link_libraries(test_timing PRIVATE test_support)
 add_test(NAME timing COMMAND test_timing)
+
+add_executable(test_filter test_filter.c)
+target_compile_options(test_filter PRIVATE -Wall -Wextra)
+target_link_libraries(test_filter PRIVATE test_support)
+add_test(NAME filter COMMAND test_filter)
