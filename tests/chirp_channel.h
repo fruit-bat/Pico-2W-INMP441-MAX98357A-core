@@ -40,6 +40,9 @@ typedef struct {
     double volume;               // Amplitude
 } ChirpChannelTx_t;
 
+// Symbol value meaning "send nothing this frame"
+#define CHIRP_CHANNEL_SILENT 0xFFFFFFFFu
+
 typedef struct {
     double delay;  // Extra delay in TX samples (positive: arrives later)
     double gain;   // Amplitude relative to the direct path

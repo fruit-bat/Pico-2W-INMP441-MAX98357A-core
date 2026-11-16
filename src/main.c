@@ -18,6 +18,9 @@
 #include "frame_snapshot.h"
 #include "rx_sample_window.h"
 #include "spsc_ring.h"
+#include "channel_template.h"
+#include "packet_rx.h"
+#include "packet_tx.h"
 #include "symbol_sequence.h"
 #include "symbol_timing_tracker.h"
 
@@ -49,6 +52,11 @@ static const float32_t chirp_vol = 0.04f; // About -28 dBFS. TODO: make this run
 #define LOG_BAND_BINS (2u * CHIRP_BINS) // FFT bins logged per frame: -CHIRP_BINS .. CHIRP_BINS-1
 #define TONE_STARTUP_STEPS 32
 #define RX_RECORD_QUEUE_CAPACITY 64u // Must be a power of two
+#define TX_PACKET_QUEUE_CAPACITY 2u  // Packets waiting to be sent; must be a power of two
+#define TEST_PACKET_LENGTH 16u       // Payload of the packet queued by the 's' key
+// The packet receiver also runs while this board is transmitting, so a single
+// board hears its own packets (useful for testing). Set to 0 for half duplex.
+#define PACKET_RX_WHILE_TRANSMITTING 1
 
 // Symbol timing tracking (see symbol_timing_tracker.h)
 #define TRACK_ALPHA          0.25f // Proportional gain
@@ -69,6 +77,7 @@ enum test_mode {
     MODE_TONE_440 = 2,
     MODE_TONE_CHIRP = 3,
     MODE_SEQUENCE = 4,  // A known pseudo-random symbol per frame (see symbol_sequence.h), for link tests
+    MODE_PACKET = 5,    // Silent until a packet is queued ('s' key), then sends it (see packet_format.h)
 };
 
 enum tracking_mode {
@@ -114,10 +123,21 @@ typedef struct {
     float32_t band_power[LOG_BAND_BINS]; // De-chirped FFT power |X|^2 of bins -CHIRP_BINS .. CHIRP_BINS-1
                                          // (bin = index mod FFT_SIZE)
     float32_t folded_power[CHIRP_BINS]; // Coherently folded power the decoder decides from, bins 0 .. CHIRP_BINS-1
+    PacketRxStatus_t packet;             // Packet receiver after this frame (see packet_rx.h)
+    float32_t packet_shape[CHIRP_BINS];  // Channel shape it last learned (from a packet's B)
 } RxFrameRecord_t;
+
+// A packet queued by core 0 for core 1 to send
+typedef struct {
+    uint32_t length;
+    uint8_t payload[PACKET_MAX_PAYLOAD];
+} TxPacketRequest_t;
 
 static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
 static SpscRing_t rx_record_queue;
+
+static uint8_t tx_packet_storage[SPSC_RING_STORAGE_LEN(sizeof(TxPacketRequest_t), TX_PACKET_QUEUE_CAPACITY)];
+static SpscRing_t tx_packet_queue;
 
 // Consistent copy of the latest FFT magnitude spectrum for display
 static float32_t spectrum_snapshot_buffer[FFT_SIZE];
@@ -152,6 +172,12 @@ static ChirpSymbolRxConfig_t symbol_rx_config;
 static SymbolTimingTracker_t timing_tracker;
 static SymbolSequence_t tx_sequence;   // MODE_SEQUENCE: the symbols being sent
 static uint32_t tx_sequence_symbol;    // MODE_SEQUENCE: the symbol most recently sent
+static PacketTx_t packet_tx;           // MODE_PACKET: the packet being sent
+static uint32_t packet_tx_symbol;      // MODE_PACKET: the symbol most recently sent
+static float32_t packet_rx_storage[PACKET_RX_STORAGE_LEN(CHIRP_BINS)];
+static float32_t channel_template_storage[CHANNEL_TEMPLATE_STORAGE_LEN(CHIRP_BINS)];
+static ChannelTemplate_t channel_template;
+static PacketRx_t packet_rx;
 static BiquadFilter_t rx_highpass; // Applied to the microphone stream, block by block
 
 static float tone_phase = 0.0f;
@@ -211,6 +237,10 @@ static void init_audio_system(void) {
     );
 
     biquad_filter_init_highpass(&rx_highpass, FS, RX_HIGHPASS_HZ, RX_HIGHPASS_Q);
+
+    packet_tx_init(&packet_tx, BITS_PER_SYMBOL);
+    channel_template_init(&channel_template, CHIRP_BINS, channel_template_storage);
+    packet_rx_init(&packet_rx, CHIRP_BINS, BITS_PER_SYMBOL, packet_rx_storage, &channel_template);
 }
 
 static const char *tracking_name(enum tracking_mode mode) {
@@ -229,8 +259,18 @@ static const char *mode_name(enum test_mode mode) {
         case MODE_TONE_440:   return "tone-440";
         case MODE_TONE_CHIRP: return "chirp";
         case MODE_SEQUENCE:   return "sequence";
+        case MODE_PACKET:     return "packet";
     }
     return "unknown";
+}
+
+static const char *packet_state_name(PacketRxState_t state) {
+    switch (state) {
+        case PACKET_RX_SEARCH: return "search";
+        case PACKET_RX_LOCK:   return "lock";
+        case PACKET_RX_TRAIN:  return "train";
+    }
+    return "?";
 }
 
 static void set_mode(enum test_mode mode) {
@@ -311,7 +351,8 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
         .frame = frame,
         .mode = current_mode,
         .delay = rx_sample_window_get_delay(&rx_window),
-        .tx_symbol = current_mode == MODE_SEQUENCE ? tx_sequence_symbol : tx_symbol,
+        .tx_symbol = current_mode == MODE_SEQUENCE ? tx_sequence_symbol
+                   : current_mode == MODE_PACKET ? packet_tx_symbol : tx_symbol,
         .peak = peak_abs(rx_frame, FFT_SIZE),
     };
 
@@ -344,6 +385,15 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
     }
     memcpy(record.folded_power, chirp_decoder.folded_power_buffer, sizeof(record.folded_power));
 
+    // Packet receiver (optionally not while this board is sending a packet)
+    if (PACKET_RX_WHILE_TRANSMITTING || !packet_tx_busy(&packet_tx)) {
+        record.packet = *packet_rx_frame(&packet_rx, chirp_decoder.folded_power_buffer);
+    } else {
+        packet_rx_reset(&packet_rx);
+        record.packet = packet_rx.status;
+    }
+    memcpy(record.packet_shape, channel_template.shape, sizeof(record.packet_shape));
+
     if (!spsc_ring_push(&rx_record_queue, &record)) {
         rx_records_dropped++;
     }
@@ -361,6 +411,20 @@ static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
     last_mode = mode;
 
     switch (mode) {
+        case MODE_PACKET: {
+            // Start the next queued packet when idle; silence between packets
+            static TxPacketRequest_t request;
+            if (!packet_tx_busy(&packet_tx) && spsc_ring_pop(&tx_packet_queue, &request)) {
+                packet_tx_start(&packet_tx, request.payload, request.length);
+            }
+            if (packet_tx_next_symbol(&packet_tx, &packet_tx_symbol)) {
+                chirp_encoder_symbol_to_samples(&chirp_encoder, packet_tx_symbol, buffer);
+            } else {
+                memset(buffer, 0, I2S_BUFFER_SIZE * sizeof(*buffer));
+            }
+            break;
+        }
+
         case MODE_SEQUENCE:
             tx_sequence_symbol = symbol_sequence_next(&tx_sequence);
             chirp_encoder_symbol_to_samples(&chirp_encoder, tx_sequence_symbol, buffer);
@@ -462,12 +526,23 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         record->timing_error,
         record->timing_rate,
         record->symbol.magnitude);
+    {
+        // Last packet preamble found (kept on core 0)
+        static PacketRxStatus_t last;
+        static uint32_t found = 0, failed = 0;
+        if (record->packet.event == PACKET_RX_EVENT_TRAINED) { last = record->packet; found++; }
+        if (record->packet.event == PACKET_RX_EVENT_TRAIN_FAILED) failed++;
+        printf("Packet RX %-6s corr %+.2f  found %lu failed %lu  last: B at frame %lu coherence %.2f paths strongest %+ld earliest %+ld          \n",
+            packet_state_name(record->packet.state), record->packet.correlation,
+            (unsigned long)found, (unsigned long)failed, (unsigned long)last.b_start_frame, last.coherence,
+            (long)last.strongest_offset, (long)last.earliest_offset);
+    }
     printf("Frames %lu  missed rx %lu tx %lu  dropped records %lu          \n",
         (unsigned long)records_received,
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-5 mode  o/p symbol  z/x delay  t tracking  c/v page  f folded view  l log\n");
+    printf("Keys: 1-6 mode  o/p symbol  z/x delay  t tracking  s send packet  c/v page  f folded view  l log\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +552,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
 static bool logging = false;
 
 static void print_log_header(void) {
-    printf("# chirp receiver log v3\n");
+    printf("# chirp receiver log v4\n");
     printf("# sample_rate=%.1f fft_size=%u bins=%u bins_per_symbol=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol_step=%u\n",
         FS, (unsigned)FFT_SIZE, (unsigned)CHIRP_BINS, (unsigned)BINS_PER_SYMBOL, (unsigned)NUM_SYMBOLS,
         F0, BW, (unsigned)(FFT_SIZE / NUM_SYMBOLS));
@@ -487,6 +562,8 @@ static void print_log_header(void) {
     printf("# delay: window delay used for this frame (samples); timing_error: samples, positive = increase delay\n");
     printf("# angle/error_angle: radians; b<k>: de-chirped FFT power |X|^2 of bin k (k mod fft_size)\n");
     printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");
+    printf("# packet_*: packet receiver (packet_rx.h) after this frame; packet_event 2 = preamble found (b_start, paths);\n");
+    printf("# s<k>: channel shape it last learned, by bin offset k from the window position\n");
     printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
            "timing_error,timing_rate,rx_missed,tx_missed,dropped");
     for (int32_t k = -(int32_t)CHIRP_BINS; k < (int32_t)CHIRP_BINS; k++) {
@@ -494,6 +571,10 @@ static void print_log_header(void) {
     }
     for (uint32_t k = 0; k < CHIRP_BINS; k++) {
         printf(",f%lu", (unsigned long)k);
+    }
+    printf(",packet_state,packet_event,packet_corr,packet_coherence,packet_b_start,packet_strongest,packet_earliest");
+    for (uint32_t k = 0; k < CHIRP_BINS; k++) {
+        printf(",s%lu", (unsigned long)k);
     }
     printf("\n");
 }
@@ -522,7 +603,30 @@ static void print_log_record(const RxFrameRecord_t *record) {
     for (uint32_t i = 0; i < CHIRP_BINS; i++) {
         printf(",%.3e", record->folded_power[i]);
     }
+    printf(",%s,%u,%+.3f,%.3f,%lu,%+ld,%+ld",
+        packet_state_name(record->packet.state), (unsigned)record->packet.event,
+        record->packet.correlation, record->packet.coherence, (unsigned long)record->packet.b_start_frame,
+        (long)record->packet.strongest_offset, (long)record->packet.earliest_offset);
+    for (uint32_t i = 0; i < CHIRP_BINS; i++) {
+        printf(",%.3e", record->packet_shape[i]);
+    }
     printf("\n");
+}
+
+// Core 0: queues a 16-byte test packet ("chirp packet NNN", NNN counting up)
+static void queue_test_packet(void) {
+    static uint32_t count = 0;
+    static TxPacketRequest_t request;
+    request.length = TEST_PACKET_LENGTH;
+    memset(request.payload, ' ', TEST_PACKET_LENGTH);
+    snprintf((char *)request.payload, TEST_PACKET_LENGTH + 1u, "chirp packet %03lu", (unsigned long)(count % 1000u));
+    if (spsc_ring_push(&tx_packet_queue, &request)) {
+        count++;
+        printf("[PACKET] Queued test packet %lu%s\n", (unsigned long)count,
+            current_mode == MODE_PACKET ? "" : " (sent in packet mode, key 6)");
+    } else {
+        printf("[PACKET] Queue full\n");
+    }
 }
 
 static void handle_key(int ch) {
@@ -541,6 +645,12 @@ static void handle_key(int ch) {
             break;
         case '5':
             set_mode(MODE_SEQUENCE);
+            break;
+        case '6':
+            set_mode(MODE_PACKET);
+            break;
+        case 's':
+            queue_test_packet();
             break;
         case 'p':
             tx_symbol = (tx_symbol + 1) % NUM_SYMBOLS;
@@ -599,12 +709,14 @@ int main() {
     printf("  3 = 440Hz sine tone\n");
     printf("  4 = chirp tone\n");
     printf("  5 = pseudo-random symbol sequence (link test; restarts each time it is selected)\n");
+    printf("  6 = packets (silent until 's' queues a test packet)\n");
     printf("[CORE] Initializing DMA and PIO peripherals...\n");
 
     i2s_core_init();
 
     // Everything shared between the cores is initialized before core 1 starts
     spsc_ring_init(&rx_record_queue, rx_record_storage, sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY);
+    spsc_ring_init(&tx_packet_queue, tx_packet_storage, sizeof(TxPacketRequest_t), TX_PACKET_QUEUE_CAPACITY);
     frame_snapshot_init(&spectrum_snapshot, spectrum_snapshot_buffer, FFT_SIZE);
     rx_sample_window_init(
         &rx_window,

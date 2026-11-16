@@ -36,6 +36,7 @@ double chirp_channel_tx_sample(
     const double k = floor(u / n);
     if (k >= (double)symbol_count) return 0.0;
 
+    if (symbols[(uint32_t)k] == CHIRP_CHANNEL_SILENT) return 0.0;
     const uint32_t symbol = symbols[(uint32_t)k] % tx->number_of_symbols;
     const double shift = (double)symbol * n / (double)tx->number_of_symbols;
     const double v = fmod((u - k * n) + shift, n);

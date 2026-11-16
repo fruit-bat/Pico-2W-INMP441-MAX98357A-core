@@ -56,6 +56,9 @@ add_library(chirp_dsp STATIC
     ${SRC_DIR}/biquad_filter.c
     ${SRC_DIR}/symbol_sequence.c
     ${SRC_DIR}/channel_template.c
+    ${SRC_DIR}/packet_format.c
+    ${SRC_DIR}/packet_tx.c
+    ${SRC_DIR}/packet_rx.c
 )
 target_include_directories(chirp_dsp PUBLIC
     ${SRC_DIR}
@@ -103,3 +106,13 @@ add_executable(test_channel_template test_channel_template.c)
 target_compile_options(test_channel_template PRIVATE -Wall -Wextra)
 target_link_libraries(test_channel_template PRIVATE test_support)
 add_test(NAME channel_template COMMAND test_channel_template)
+
+add_executable(test_packet test_packet.c)
+target_compile_options(test_packet PRIVATE -Wall -Wextra)
+target_link_libraries(test_packet PRIVATE test_support)
+add_test(NAME packet COMMAND test_packet)
+
+add_executable(test_packet_rx test_packet_rx.c)
+target_compile_options(test_packet_rx PRIVATE -Wall -Wextra)
+target_link_libraries(test_packet_rx PRIVATE test_support)
+add_test(NAME packet_rx COMMAND test_packet_rx)
