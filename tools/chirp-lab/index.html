@@ -99,7 +99,7 @@
       </section>
 
       <section class="section">
-        <div class="section-head"><h2><span class="stage-no">5</span>Decide</h2><p>symbol = strongest bin; position refined by mean shift; centroid gives magnitude and strength</p></div>
+        <div class="section-head"><h2><span class="stage-no">5</span>Decide</h2><p>symbol = strongest bin; timing = mean-shift position on the half-bin spectrum, relative to it; centroid gives magnitude and strength</p></div>
         <div class="grid2">
           <figure id="figPolar" class="polarfig">
             <figcaption><div><b>Centroid</b><span class="formula">spoke i: (folded/max)<sup>p</sup> at 2πi/B</span></div>
@@ -107,7 +107,7 @@
             <canvas aria-label="Polar plot of the folded power with the centroid vector"></canvas>
           </figure>
           <figure id="figRefine">
-            <figcaption><div><b>Peak refinement</b><span class="formula">mean shift, ±half-width window, 4 iterations</span></div>
+            <figcaption><div><b>Peak refinement</b><span class="formula">mean shift on the folded power every ½ bin, ±half-width, 4 iterations</span></div>
               <div class="legend"><span style="--sw:var(--band)">final window</span></div></figcaption>
             <canvas aria-label="Folded power near the peak with the mean-shift window"></canvas>
           </figure>

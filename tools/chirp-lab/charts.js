@@ -10,7 +10,8 @@
  * 'mark', 'accent'.
  *
  * xy cfg:
- *   series:  [{ x, y, name, color, mode: 'line' | 'linepoints' | 'bars', width }]
+ *   series:  [{ x, y, name, color, mode: 'line' | 'linepoints' | 'bars', width, barWidth }]
+ *            barWidth: bar spacing in x units (default 1)
  *            x must be increasing; the hover readout follows series[0].
  *   xDomain, yDomain: [lo, hi]
  *   xLabel:  axis label (also used in the hover readout)
@@ -153,7 +154,7 @@
       const col = C[s.color];
       ctx.strokeStyle = col; ctx.fillStyle = col;
       if (s.mode === 'bars') {
-        const bw = Math.max(1, Math.abs(X(1) - X(0)) - 2);
+        const bw = Math.max(1, Math.abs(X(s.barWidth || 1) - X(0)) - 2);
         const base = Y(Math.max(y0, 0));
         for (let i = 0; i < s.x.length; i++) {
           const top = Y(s.y[i]), r = Math.max(0, Math.min(3, bw / 2, (base - top) / 2));

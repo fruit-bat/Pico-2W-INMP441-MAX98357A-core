@@ -34,16 +34,19 @@ typedef struct {
     float32_t magnitude;  // Centroid magnitude of the received symbol
     float32_t strength;   // Centroid strength of the received symbol
     uint32_t symbol_index; // Index of the received symbol in the chirp modulation scheme
-    float32_t error_angle; // Angle minus the nearest symbol's angle, in radians
+    float32_t error_angle; // Angle minus the decided symbol's angle, wrapped to [-pi, pi), in radians
 } ChirpSymbolRx_t;
 
 //
-// Sets the properties of a received chirp symbol based on the provided angle, magnitude, and strength.
-// This function calculates the symbol index and error angle based on the configuration and the provided angle.
+// Sets the properties of a received chirp symbol. The symbol is decided
+// elsewhere (the decoder uses the strongest folded bin, which in noise is far
+// more reliable than rounding the refined angle); error_angle is the refined
+// angle relative to it, so a noisy refinement never changes the decision.
 //
 void chirp_symbol_rx_set(
     const ChirpSymbolRxConfig_t *config,
     ChirpSymbolRx_t *symbol_rx,
+    uint32_t symbol_index,
     float32_t angle,
     float32_t magnitude,
     float32_t strength);

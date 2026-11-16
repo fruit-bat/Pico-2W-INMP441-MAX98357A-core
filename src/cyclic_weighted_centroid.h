@@ -198,16 +198,21 @@ uint32_t cyclic_weighted_centroid_peak_bin(
  * where energy arrives over several bins; a 3-point peak fit is unstable there.
  * The window wraps around the circular spectrum.
  *
- * @param cwc             The centroid configuration.
+ * The spectrum need not be the one the centroid uses: for a clean tone the
+ * mean of whole-bin samples barely follows small shifts (nearly all the
+ * energy sits in one bin), so the chirp decoder passes a spectrum sampled
+ * every half bin (size = 2 * bins), which makes the estimate close to linear.
+ *
  * @param power_spectrum  Source power spectrum values (length = size).
- * @param start_bin       Bin index to start from, in [0, size).
- * @param half_width      Window half-width in bins (e.g. 3).
- * @return Refined angle in radians, in [0, 2*pi). With no power in the window
- *         the angle of start_bin is returned.
+ * @param size            Number of points in the circular spectrum.
+ * @param start_bin       Point to start from, in [0, size).
+ * @param half_width      Window half-width in points (e.g. 3 bins = 6 points at half-bin spacing).
+ * @return Refined angle in radians, in [0, 2*pi), with size points per turn.
+ *         With no power in the window the angle of start_bin is returned.
  */
 float32_t cyclic_weighted_centroid_refine_peak(
-    const CyclicWeightedCentroid_t *cwc,
     const float32_t *power_spectrum,
+    size_t size,
     uint32_t start_bin,
     uint32_t half_width
 );

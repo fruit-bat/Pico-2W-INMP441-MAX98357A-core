@@ -23,7 +23,8 @@
  *   u = (k*N + j) * clock_scale + offset
  *
  * so offset > 0 means the receive window starts late, and clock_scale > 1
- * means the receiver samples more slowly than the transmitter.
+ * means the receiver samples more slowly than the transmitter. Echoes add
+ * delayed, scaled copies of the signal (a simple multipath model).
  *
  * No memory is allocated; the caller provides all buffers.
  */
@@ -40,9 +41,16 @@ typedef struct {
 } ChirpChannelTx_t;
 
 typedef struct {
+    double delay;  // Extra delay in TX samples (positive: arrives later)
+    double gain;   // Amplitude relative to the direct path
+} ChirpEcho_t;
+
+typedef struct {
     double offset;       // Receive window start relative to the transmitter, in TX samples
     double clock_scale;  // TX samples per RX sample (1.0 = matched clocks)
     double noise_rms;    // Standard deviation of added white Gaussian noise
+    const ChirpEcho_t *echoes; // Optional echoes (NULL for none)
+    uint32_t echo_count;
 } ChirpChannel_t;
 
 /**
