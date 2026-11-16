@@ -21,7 +21,7 @@
 #define RIG_SAMPLES_PER_STEP (RIG_N / RIG_M) // Cyclic shift between adjacent symbols (default spacing)
 #define RIG_FS  44100.0
 #define RIG_F0  15000.0
-#define RIG_VOLUME 0.005
+#define RIG_VOLUME 0.04
 
 extern ChirpDecoderState_t rig_decoder;
 extern ChirpEncoder_t rig_encoder;

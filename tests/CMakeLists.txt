@@ -55,6 +55,7 @@ add_library(chirp_dsp STATIC
     ${SRC_DIR}/symbol_timing_tracker.c
     ${SRC_DIR}/biquad_filter.c
     ${SRC_DIR}/symbol_sequence.c
+    ${SRC_DIR}/channel_template.c
 )
 target_include_directories(chirp_dsp PUBLIC
     ${SRC_DIR}
@@ -97,3 +98,8 @@ add_executable(test_sequence test_sequence.c)
 target_compile_options(test_sequence PRIVATE -Wall -Wextra)
 target_link_libraries(test_sequence PRIVATE test_support)
 add_test(NAME sequence COMMAND test_sequence)
+
+add_executable(test_channel_template test_channel_template.c)
+target_compile_options(test_channel_template PRIVATE -Wall -Wextra)
+target_link_libraries(test_channel_template PRIVATE test_support)
+add_test(NAME channel_template COMMAND test_channel_template)

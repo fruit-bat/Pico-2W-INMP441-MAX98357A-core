@@ -43,7 +43,7 @@ static const float32_t BW = BPB * CHIRP_BINS; // Total bandwidth for the chirp s
 static const float32_t F0 = 15000.0f;
 static const float32_t T  = (float32_t)FFT_SIZE / FS;
 static const float32_t chirp_rate = BW / T;
-static const float32_t chirp_vol = 0.005f;
+static const float32_t chirp_vol = 0.04f; // About -28 dBFS. TODO: make this run-time configurable
 
 #define DISPLAY_PERIOD_MS 100
 #define LOG_BAND_BINS (2u * CHIRP_BINS) // FFT bins logged per frame: -CHIRP_BINS .. CHIRP_BINS-1
