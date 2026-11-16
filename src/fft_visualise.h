@@ -68,4 +68,23 @@ void fft_visualise_page_prev(FftVisualise_t *vis);
  */
 void fft_visualise_draw(const FftVisualise_t *vis, const float32_t *magnitude_buffer);
 
+/**
+ * Clears the terminal and draws a short power spectrum (e.g. the decoder's
+ * folded spectrum, one value per symbol) as a column chart: one column per
+ * bin, starting at the left edge, with height in dB below the strongest bin
+ * (one row per dB). Takes the same number of lines as fft_visualise_draw(),
+ * so text printed after either stays in the same place.
+ *
+ * @param vis   Visualiser state (only page_size, the height, is used).
+ * @param title Title line text.
+ * @param power Power spectrum (linear, e.g. |X|^2).
+ * @param bins  Number of values (columns).
+ */
+void fft_visualise_draw_columns_db(
+    const FftVisualise_t *vis,
+    const char *title,
+    const float32_t *power,
+    uint32_t bins
+);
+
 #endif // FFT_VISUALISE_H

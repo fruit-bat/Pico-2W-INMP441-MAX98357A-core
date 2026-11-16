@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include "fft_visualise.h"
 
@@ -70,4 +71,35 @@ void fft_visualise_draw(const FftVisualise_t *vis, const float32_t *magnitude_bu
     for (uint32_t i = last; i < first + vis->page_size; i++) {
         putchar('\n');
     }
+}
+
+void fft_visualise_draw_columns_db(
+    const FftVisualise_t *vis,
+    const char *title,
+    const float32_t *power,
+    uint32_t bins
+) {
+    printf("\033[2J\033[H");
+
+    float32_t max = 0.0f;
+    for (uint32_t k = 0; k < bins; k++) {
+        if (power[k] > max) max = power[k];
+    }
+    printf("=== %s: top = %.3e, 1 row per dB ===\n\n", title, (double)max);
+
+    // page_size rows in all: the chart, then an axis row with bin markers
+    const uint32_t rows = vis->page_size > 1 ? vis->page_size - 1 : 1;
+    for (uint32_t r = 0; r < rows; r++) {
+        // A column reaches row r when its power is within r + 1 dB of the top
+        const float32_t threshold = max * powf(10.0f, -(float32_t)(r + 1) / 10.0f);
+        for (uint32_t k = 0; k < bins; k++) {
+            putchar(max > 0.0f && power[k] >= threshold ? '#' : ' ');
+        }
+        if (r % 5 == 4) printf(" -%lu dB", (unsigned long)(r + 1));
+        putchar('\n');
+    }
+    for (uint32_t k = 0; k < bins; k++) {
+        putchar(k % 10 == 0 ? '|' : '-');
+    }
+    printf(" bin (marks every 10)\n");
 }

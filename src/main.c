@@ -77,6 +77,9 @@ static volatile uint32_t tx_symbol = 0;        // Symbol transmitted in chirp mo
 static volatile uint32_t tone_step_index = 0;  // Reset by core 0 to restart the tone ramp
 static volatile enum tracking_mode tracking_mode = TRACK_OFF;
 
+// Core 0 only: which spectrum the display shows
+static bool display_folded = false; // false: de-chirped FFT spectrum (paged); true: folded spectrum
+
 // Core 1 writes these counters; core 0 reads them.
 static volatile uint32_t rx_blocks_missed = 0;  // RX blocks not processed in time
 static volatile uint32_t tx_blocks_missed = 0;  // TX blocks not refilled in time
@@ -401,7 +404,12 @@ static void __not_in_flash_func(core1_main)(void) {
 
 // Core 0: redraw the terminal display. Always prints the same number of rows.
 static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *record, uint32_t records_received) {
-    fft_visualise_draw(&fft_visualise, spectrum);
+    if (display_folded) {
+        fft_visualise_draw_columns_db(&fft_visualise, "FOLDED SPECTRUM (decoder input, one column per symbol)",
+            record->folded_power, MAX_SYMBOLS);
+    } else {
+        fft_visualise_draw(&fft_visualise, spectrum);
+    }
 
     printf("Mode %-9s  TX symbol %3lu of %lu  RX delay %4lu  peak %5.1f%%          \n",
         mode_name(current_mode),
@@ -430,7 +438,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-4 mode  o/p symbol  z/x delay  t tracking  c/v page  l log\n");
+    printf("Keys: 1-4 mode  o/p symbol  z/x delay  t tracking  c/v page  f folded view  l log\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +533,9 @@ static void handle_key(int ch) {
             break;
         case 'v':
             fft_visualise_page_next(&fft_visualise);
+            break;
+        case 'f':
+            display_folded = !display_folded;
             break;
         case 'l':
             logging = !logging;
