@@ -54,6 +54,7 @@ add_library(chirp_dsp STATIC
     ${SRC_DIR}/rx_sample_window.c
     ${SRC_DIR}/symbol_timing_tracker.c
     ${SRC_DIR}/biquad_filter.c
+    ${SRC_DIR}/symbol_sequence.c
 )
 target_include_directories(chirp_dsp PUBLIC
     ${SRC_DIR}
@@ -91,3 +92,8 @@ add_executable(test_spacing test_spacing.c)
 target_compile_options(test_spacing PRIVATE -Wall -Wextra)
 target_link_libraries(test_spacing PRIVATE test_support)
 add_test(NAME spacing COMMAND test_spacing)
+
+add_executable(test_sequence test_sequence.c)
+target_compile_options(test_sequence PRIVATE -Wall -Wextra)
+target_link_libraries(test_sequence PRIVATE test_support)
+add_test(NAME sequence COMMAND test_sequence)

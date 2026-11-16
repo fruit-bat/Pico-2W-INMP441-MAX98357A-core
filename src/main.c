@@ -18,6 +18,7 @@
 #include "frame_snapshot.h"
 #include "rx_sample_window.h"
 #include "spsc_ring.h"
+#include "symbol_sequence.h"
 #include "symbol_timing_tracker.h"
 
 // The chirp sweeps CHIRP_BINS FFT bins (64 bins = 2.76 kHz from F0). Symbols
@@ -30,6 +31,8 @@
 #define BINS_PER_SYMBOL 1u // 1, 2 or 4 (must divide CHIRP_BINS)
 #define NUM_SYMBOLS (CHIRP_BINS / BINS_PER_SYMBOL)
 _Static_assert(CHIRP_BINS % BINS_PER_SYMBOL == 0, "BINS_PER_SYMBOL must divide CHIRP_BINS");
+_Static_assert((NUM_SYMBOLS & (NUM_SYMBOLS - 1)) == 0, "NUM_SYMBOLS must be a power of two");
+#define BITS_PER_SYMBOL ((uint32_t)__builtin_ctz(NUM_SYMBOLS))
 
 // Currently must be 1024
 #define FFT_SIZE I2S_BUFFER_SIZE
@@ -65,6 +68,7 @@ enum test_mode {
     MODE_MIC_LEVEL = 1,
     MODE_TONE_440 = 2,
     MODE_TONE_CHIRP = 3,
+    MODE_SEQUENCE = 4,  // A known pseudo-random symbol per frame (see symbol_sequence.h), for link tests
 };
 
 enum tracking_mode {
@@ -101,7 +105,7 @@ typedef struct {
     uint32_t frame;          // RX block count when this frame was decoded
     uint32_t mode;           // enum test_mode in effect for this frame
     uint32_t delay;          // Alignment delay in samples used for this frame
-    uint32_t tx_symbol;      // Symbol being transmitted at the time (useful for loopback/testing)
+    uint32_t tx_symbol;      // Symbol this board was transmitting at the time (in sequence mode, the latest sent)
     float32_t peak;          // Peak absolute sample value in the frame after the RX high-pass, [0, 1]
     ChirpSymbolRx_t symbol;  // Decoded symbol
     uint32_t tracking;       // enum tracking_mode in effect for this frame
@@ -146,6 +150,8 @@ static ChirpDecoderState_t chirp_decoder;
 static ChirpEncoder_t chirp_encoder;
 static ChirpSymbolRxConfig_t symbol_rx_config;
 static SymbolTimingTracker_t timing_tracker;
+static SymbolSequence_t tx_sequence;   // MODE_SEQUENCE: the symbols being sent
+static uint32_t tx_sequence_symbol;    // MODE_SEQUENCE: the symbol most recently sent
 static BiquadFilter_t rx_highpass; // Applied to the microphone stream, block by block
 
 static float tone_phase = 0.0f;
@@ -222,6 +228,7 @@ static const char *mode_name(enum test_mode mode) {
         case MODE_MIC_LEVEL:  return "mic-level";
         case MODE_TONE_440:   return "tone-440";
         case MODE_TONE_CHIRP: return "chirp";
+        case MODE_SEQUENCE:   return "sequence";
     }
     return "unknown";
 }
@@ -304,7 +311,7 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
         .frame = frame,
         .mode = current_mode,
         .delay = rx_sample_window_get_delay(&rx_window),
-        .tx_symbol = tx_symbol,
+        .tx_symbol = current_mode == MODE_SEQUENCE ? tx_sequence_symbol : tx_symbol,
         .peak = peak_abs(rx_frame, FFT_SIZE),
     };
 
@@ -346,7 +353,19 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
 
 // Core 1: produce the next block of audio to transmit.
 static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
-    switch (current_mode) {
+    static enum test_mode last_mode = MODE_TONE_440;
+    const enum test_mode mode = current_mode;
+    if (mode == MODE_SEQUENCE && last_mode != MODE_SEQUENCE) {
+        symbol_sequence_init(&tx_sequence, BITS_PER_SYMBOL); // Restart from the beginning
+    }
+    last_mode = mode;
+
+    switch (mode) {
+        case MODE_SEQUENCE:
+            tx_sequence_symbol = symbol_sequence_next(&tx_sequence);
+            chirp_encoder_symbol_to_samples(&chirp_encoder, tx_sequence_symbol, buffer);
+            break;
+
         case MODE_LOOPBACK:
         case MODE_TONE_CHIRP:
             chirp_encoder_symbol_to_samples(&chirp_encoder, tx_symbol, buffer);
@@ -448,7 +467,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-4 mode  o/p symbol  z/x delay  t tracking  c/v page  f folded view  l log\n");
+    printf("Keys: 1-5 mode  o/p symbol  z/x delay  t tracking  c/v page  f folded view  l log\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +539,9 @@ static void handle_key(int ch) {
         case '4':
             set_mode(MODE_TONE_CHIRP);
             break;
+        case '5':
+            set_mode(MODE_SEQUENCE);
+            break;
         case 'p':
             tx_symbol = (tx_symbol + 1) % NUM_SYMBOLS;
             break;
@@ -576,6 +598,7 @@ int main() {
     printf("  2 = mic level meter\n");
     printf("  3 = 440Hz sine tone\n");
     printf("  4 = chirp tone\n");
+    printf("  5 = pseudo-random symbol sequence (link test; restarts each time it is selected)\n");
     printf("[CORE] Initializing DMA and PIO peripherals...\n");
 
     i2s_core_init();
