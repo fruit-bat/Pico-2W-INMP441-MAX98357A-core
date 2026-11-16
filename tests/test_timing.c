@@ -332,11 +332,12 @@ static void test_loop_crystal_drift(void) {
     }
 }
 
-// Room echoes 1-10 bins (16-160 samples) after the direct path. The symbol is
-// decided from the strongest bin, so the timing must lock onto that same
-// peak; if the timing window also takes in a nearby echo, the loop pushes the
-// peak off its bin and hunts (this is what went wrong on hardware with a
-// +/-3 bin refine window).
+// Room echoes 1-10 bins (16-160 samples) after the direct path. Decision and
+// timing both come from the refined centre, so the loop locks consistently
+// (near the echoes' energy centre, which shows as a true offset of several
+// samples, and sometimes a rotation of one symbol) and decodes without
+// errors. When the decision came from the strongest bin, these channels made
+// the loop hunt (as did the two-lobe channel measured on the desk).
 static void test_loop_echoes(void) {
     static const ChirpEcho_t one[] = { { 40.0, 0.6 } };
     static const ChirpEcho_t three[] = { { 25.0, 0.5 }, { 60.0, 0.4 }, { 130.0, 0.3 } };
@@ -357,9 +358,11 @@ static void test_loop_echoes(void) {
             char label[40];
             snprintf(label, sizeof label, "%s, offset %+.0f", rooms[i].name, offsets[j]);
             print_result(label, &r);
-            CHECK(r.converged_block >= 0 && r.converged_block < 20);
+            // The energy centre wanders with the symbol pattern, so the true
+            // offset can take a while to stay inside the 1.5-sample band
+            CHECK(r.converged_block >= 0);
             CHECK_EQ_U(r.symbol_errors, 0);
-            CHECK(r.measured_rms < 1.0);
+            CHECK(r.measured_rms < 2.0);
         }
     }
 }

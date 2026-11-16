@@ -18,10 +18,12 @@ One section per stage of `chirp_decoder.c`:
    *kL − B*.
 4. **Fold**: add the two pieces as complex values after a fixed rotation *R*
    (the firmware), compared with the old power sum.
-5. **Decide**: the strongest bin gives the symbol. A mean shift on the folded
+5. **Decide**: starting from the strongest bin, a mean shift on the folded
    power sampled every half bin (a second, half-bin-shifted de-chirp and FFT)
-   refines its position, which is the timing error. The circular centroid
-   gives magnitude and strength.
+   finds the centre of the symbol's energy. The nearest symbol to that centre
+   is the decision and the offset from it is the timing error (deciding from
+   the strongest bin alone flips between lobes on a multipath channel). The
+   circular centroid gives magnitude and strength.
 
 The decoder switches (band-pass on/off, coherent or power-sum fold, refining on
 half or whole bins) let you compare the current decoder with earlier ones. The

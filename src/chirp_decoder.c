@@ -213,10 +213,13 @@ static ChirpSymbolRx_t* __not_in_flash_func(chirp_decoder_magnitudes_to_symbol)(
     const float32_t angle = cyclic_weighted_centroid_refine_peak(
         state->fine_power_buffer, 2u * state->cwc.size, 2u * peak_bin, 2u * state->peak_half_width);
 
-    // The symbol is the strongest bin (bins map onto symbols evenly; with one
-    // bin per symbol they are the same); the refined angle gives the timing
-    const uint32_t bins = (uint32_t)state->cwc.size;
-    const uint32_t symbol = (peak_bin * config->number_of_symbols + bins / 2u) / bins;
+    // The symbol is the one nearest the refined centre, not the strongest bin.
+    // Real channels can spread a symbol into several near-equal lobes (on the
+    // desk: two lobes a bin either side, with a dip between); the strongest
+    // bin then flips between lobes, and as the timing error is measured from
+    // the decided symbol, the tracker hunts. Deciding from the centre keeps
+    // the decision and the timing consistent (|error| <= half a symbol step).
+    const uint32_t symbol = (uint32_t)lroundf(angle * config->symbols_per_radian) % config->number_of_symbols;
     chirp_symbol_rx_set(config, symbol_rx, symbol, angle, cwc_result.magnitude, cwc_result.strength);
 
     return symbol_rx;
