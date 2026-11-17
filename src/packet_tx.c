@@ -29,7 +29,7 @@ bool packet_tx_start(PacketTx_t *tx, const uint8_t *payload, uint32_t length) {
 }
 
 // Data symbol j: bits j*b .. j*b + b - 1 of the byte stream, MSB first,
-// zero beyond the end
+// zero beyond the end, Gray coded
 static uint32_t __not_in_flash_func(data_symbol)(const PacketTx_t *tx, uint32_t j) {
     const uint32_t nbits = tx->bits_per_symbol;
     uint32_t symbol = 0;
@@ -39,7 +39,7 @@ static uint32_t __not_in_flash_func(data_symbol)(const PacketTx_t *tx, uint32_t 
         const uint32_t value = byte < tx->byte_count ? (tx->bytes[byte] >> (7u - bit % 8u)) & 1u : 0u;
         symbol = (symbol << 1) | value;
     }
-    return symbol;
+    return packet_gray_symbol(symbol);
 }
 
 bool __not_in_flash_func(packet_tx_next_symbol)(PacketTx_t *tx, uint32_t *symbol) {

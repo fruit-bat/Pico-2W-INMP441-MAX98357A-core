@@ -221,9 +221,10 @@ static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *fo
     }
     if (margin < PACKET_RX_WEAK_MARGIN) st->weak_symbols++;
     st->data_count++;
+    const uint32_t value = packet_gray_value(symbol);
     for (uint32_t k = b; k-- > 0;) {
         const uint32_t byte = rx->bit_count / 8u;
-        if (byte < PACKET_MAX_BYTES) rx->bytes[byte] |= (uint8_t)(((symbol >> k) & 1u) << (7u - rx->bit_count % 8u));
+        if (byte < PACKET_MAX_BYTES) rx->bytes[byte] |= (uint8_t)(((value >> k) & 1u) << (7u - rx->bit_count % 8u));
         rx->bit_count++;
     }
 

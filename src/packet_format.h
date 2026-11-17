@@ -57,6 +57,13 @@ uint16_t packet_crc16(const uint8_t *data, uint32_t length);
 // symbol_sequence LFSR from its seed); applying it twice restores the data
 void packet_scramble(uint8_t *data, uint32_t length);
 
+// Gray coding of data symbols: a data value v (bits_per_symbol bits) is sent
+// as the symbol whose Gray code is v, so neighbouring symbols (including the
+// wrap from the last to the first) carry values one bit apart, and a slip to
+// a neighbouring symbol, the commonest error, damages only one bit.
+static inline uint32_t packet_gray_value(uint32_t symbol) { return symbol ^ (symbol >> 1); } // Symbol -> value
+uint32_t packet_gray_symbol(uint32_t value);                                                   // Value -> symbol
+
 // Symbols in a whole packet (preamble included) with this payload length
 uint32_t packet_symbol_count(uint32_t payload_length, uint32_t bits_per_symbol);
 

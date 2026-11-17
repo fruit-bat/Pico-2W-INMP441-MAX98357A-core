@@ -132,15 +132,15 @@ static void print_events(const char *label, Events_t e) {
 // B is placed on the frame that holds most of B0, and the learned shape's
 // peak is where the window sits relative to the symbols (a window d samples
 // late sees every symbol d/16 bins high). Coherence falls as the window
-// moves off, as each frame mixes two B symbols; near half a frame B's start
-// is ambiguous by one frame (see packet_rx.h), so it is only checked within
-// +/-400 samples.
+// moves off, as each frame mixes two B symbols. Near half a frame out B is
+// unreliable without the window move (see packet_rx.h; whether it is found
+// depends on the data after it), so that case is left to test_alignment.
 //
-// Baseline coherence: 1.00 (0), 0.98 (+37), 0.78 (-200), 0.64 (+300), 0.47 (+500).
+// Baseline coherence: 1.00 (0), 0.98 (+37), 0.78 (-200), 0.64 (+300).
 static void test_offsets(void) {
     rig_setup_spacing(1);
-    const double offsets[] = { 0.0, 37.0, -200.0, 300.0, 500.0 };
-    for (unsigned i = 0; i < 5; i++) {
+    const double offsets[] = { 0.0, 37.0, -200.0, 300.0 };
+    for (unsigned i = 0; i < 4; i++) {
         const uint32_t b_frame = build_packet_stream(80);
         const Events_t e = run(80, offsets[i], 100.0, NULL, 0, false);
         char label[48];
@@ -149,7 +149,7 @@ static void test_offsets(void) {
         CHECK_EQ_U(e.trained, 1);
         CHECK_EQ_U(e.failed, 0);
         if (e.trained) {
-            if (fabs(offsets[i]) < 400.0) CHECK_EQ_U(e.last_trained.b_start_frame, b_frame);
+            CHECK_EQ_U(e.last_trained.b_start_frame, b_frame);
             if (fabs(offsets[i]) < 50.0) CHECK(e.last_trained.coherence > 0.9);
             else CHECK(e.last_trained.coherence > 0.4);
             const int32_t expect = wrap_offset((int32_t)lround(offsets[i] / (N / BINS)));

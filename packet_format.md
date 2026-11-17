@@ -92,9 +92,11 @@ Two optional, cheap steps on the bit stream (I'd include both):
 - **Scrambling**: XOR the payload bits with an LFSR sequence, so that
   repetitive data (e.g. all zeros) cannot look like preamble and symbols stay
   evenly spread. A single scrambler is a generic, old technique.
-- **Gray coding** of each symbol, so a slip to the neighbouring symbol flips
-  one bit. It changes nothing for error detection; it helps if forward error
-  correction is added later.
+- **Gray coding** of each data symbol (done): value v is sent as the symbol
+  whose Gray code is v (`packet_gray_symbol` / `packet_gray_value`), so a
+  slip to the neighbouring symbol, including the wrap round, flips one bit.
+  It changes nothing for error detection; it helps when forward error
+  correction is added. The preamble is not Gray coded.
 
 ### Airtime examples (6 bits/symbol)
 
@@ -201,10 +203,22 @@ buffer is needed beyond a few bytes of state.
 board, so its receiver ignores frames while it is transmitting (and *2
 frames* after, for the room to quieten).
 
-## Questions for you
+## Spacing: 2 bins per symbol by default
+
+Long (255-byte) packets at 1 bin per symbol, 2026-11-17: board 1 → 2 10/10
+intact, board 2 → 1 only 2/10. The errors were ±1 slips at the same symbols
+in most packets, set by the previous symbol (paths 16–48 samples late carry
+its tail into the next frame). At 2 bins per symbol: 2 → 1 8/8, 9/9 and 4/4,
+1 → 2 5/5; at 4: 3/3 each way. So the default is now 2 (5 bits per symbol,
+10.0 s for 255 bytes); key `b` cycles 1, 2, 4 while running (both boards
+must match; a packet in progress is abandoned), and the log records the
+spacing on every row.
+
+## Questions answered (kept for the record)
 
 1. **Default spacing**: 1 bin/symbol (most rate) or 2 (more tolerant of
    smearing)? With the matched decision, 1 got 99.9–100% between the boards.
+   *Now 2; see above.*
 2. **Maximum payload**: 255 bytes (8 s of airtime) or smaller?
 3. **Scrambling and Gray coding**: include now (cheap), or leave out until
    needed?

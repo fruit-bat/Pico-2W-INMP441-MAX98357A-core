@@ -25,17 +25,20 @@
 #include "symbol_timing_tracker.h"
 
 // The chirp sweeps CHIRP_BINS FFT bins (64 bins = 2.76 kHz from F0). Symbols
-// are spaced BINS_PER_SYMBOL bins apart: 1 gives 64 symbols (6 bits each),
+// are spaced bins_per_symbol bins apart (key 'b' cycles 1, 2, 4 while
+// running; both boards must match): 1 gives 64 symbols (6 bits each),
 // 2 gives 32 (5 bits), 4 gives 16 (4 bits). Wider spacing costs rate but
 // tolerates a channel that smears each symbol over neighbouring bins (the
 // desk channel spreads about +/-1 bin), and widens the tracker's pull-in to
-// +/- half a symbol step.
+// +/- half a symbol step. Between the two boards 1 bin per symbol lost long
+// packets to neighbouring-symbol slips (echoes from the previous symbol); 2
+// did not.
 #define CHIRP_BINS 64u
-#define BINS_PER_SYMBOL 1u // 1, 2 or 4 (must divide CHIRP_BINS)
-#define NUM_SYMBOLS (CHIRP_BINS / BINS_PER_SYMBOL)
-_Static_assert(CHIRP_BINS % BINS_PER_SYMBOL == 0, "BINS_PER_SYMBOL must divide CHIRP_BINS");
-_Static_assert((NUM_SYMBOLS & (NUM_SYMBOLS - 1)) == 0, "NUM_SYMBOLS must be a power of two");
-#define BITS_PER_SYMBOL ((uint32_t)__builtin_ctz(NUM_SYMBOLS))
+#define DEFAULT_BINS_PER_SYMBOL 2u // 1, 2 or 4
+static volatile uint32_t bins_per_symbol_request = DEFAULT_BINS_PER_SYMBOL; // Set by core 0 (key 'b')
+static volatile uint32_t bins_per_symbol = DEFAULT_BINS_PER_SYMBOL;         // In use; core 1 applies requests
+static inline uint32_t num_symbols(void) { return CHIRP_BINS / bins_per_symbol; }
+static inline uint32_t bits_per_symbol(void) { return (uint32_t)__builtin_ctz(num_symbols()); }
 
 // Currently must be 1024
 #define FFT_SIZE I2S_BUFFER_SIZE
@@ -93,7 +96,7 @@ enum tracking_mode {
 // Shared between cores.
 // Core 0 (UI) writes these single-word controls; core 1 (DSP) reads them.
 // ---------------------------------------------------------------------------
-static volatile enum test_mode current_mode = MODE_TONE_440;
+static volatile enum test_mode current_mode = MODE_PACKET; // Silent until a packet is queued
 static volatile uint32_t tx_symbol = 0;        // Symbol transmitted in chirp modes
 static volatile uint32_t tone_step_index = 0;  // Reset by core 0 to restart the tone ramp
 static volatile enum tracking_mode tracking_mode = TRACK_OFF;
@@ -115,6 +118,7 @@ static volatile uint32_t rx_records_dropped = 0; // Records lost because the que
 typedef struct {
     uint32_t frame;          // RX block count when this frame was decoded
     uint32_t mode;           // enum test_mode in effect for this frame
+    uint32_t bins_per_symbol; // Symbol spacing in effect for this frame
     uint32_t delay;          // Alignment delay in samples used for this frame
     uint32_t tx_symbol;      // Symbol this board was transmitting at the time (in sequence mode, the latest sent)
     float32_t peak;          // Peak absolute sample value in the frame after the RX high-pass, [0, 1]
@@ -234,11 +238,11 @@ static void init_audio_system(void) {
         &chirp_encoder,
         chirp_decoder.complex_dechirp_vector,
         FFT_SIZE,
-        NUM_SYMBOLS,
+        num_symbols(),
         chirp_vol
     );
 
-    chirp_symbol_rx_config_init(&symbol_rx_config, NUM_SYMBOLS);
+    chirp_symbol_rx_config_init(&symbol_rx_config, num_symbols());
 
     symbol_timing_tracker_init(
         &timing_tracker,
@@ -252,9 +256,9 @@ static void init_audio_system(void) {
 
     biquad_filter_init_highpass(&rx_highpass, FS, RX_HIGHPASS_HZ, RX_HIGHPASS_Q);
 
-    packet_tx_init(&packet_tx, BITS_PER_SYMBOL);
+    packet_tx_init(&packet_tx, bits_per_symbol());
     channel_template_init(&channel_template, CHIRP_BINS, channel_template_storage);
-    packet_rx_init(&packet_rx, CHIRP_BINS, BITS_PER_SYMBOL, packet_rx_storage, &channel_template);
+    packet_rx_init(&packet_rx, CHIRP_BINS, bits_per_symbol(), packet_rx_storage, &channel_template);
 }
 
 static const char *tracking_name(enum tracking_mode mode) {
@@ -338,14 +342,14 @@ static float32_t __not_in_flash_func(wrap_pi)(float32_t a) {
 //
 // Core 1: timing error in samples for a decoded frame (positive: increase the delay).
 //
-// A symbol is the base chirp cyclically shifted by FFT_SIZE / NUM_SYMBOLS
+// A symbol is the base chirp cyclically shifted by FFT_SIZE / num_symbols()
 // samples per symbol step, so an angle error converts directly into samples.
 // A late window (delay too large) reduces the effective shift and so the
 // decoded angle, giving a negative error.
 //
 static float32_t __not_in_flash_func(timing_error_samples)(const RxFrameRecord_t *record, enum tracking_mode mode) {
     const float32_t samples_per_radian =
-        (float32_t)(FFT_SIZE / NUM_SYMBOLS) * symbol_rx_config.symbols_per_radian;
+        (float32_t)(FFT_SIZE / num_symbols()) * symbol_rx_config.symbols_per_radian;
 
     float32_t error_angle = record->symbol.error_angle; // Relative to the decided symbol (the strongest bin)
     if (mode == TRACK_PILOT) {
@@ -366,6 +370,7 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
     record = (RxFrameRecord_t){
         .frame = frame,
         .mode = current_mode,
+        .bins_per_symbol = bins_per_symbol,
         .delay = rx_sample_window_get_delay(&rx_window),
         .tx_symbol = current_mode == MODE_SEQUENCE ? tx_sequence_symbol
                    : current_mode == MODE_PACKET ? packet_tx_symbol : tx_symbol,
@@ -437,10 +442,10 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
 
 // Core 1: produce the next block of audio to transmit.
 static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
-    static enum test_mode last_mode = MODE_TONE_440;
+    static enum test_mode last_mode = MODE_PACKET;
     const enum test_mode mode = current_mode;
     if (mode == MODE_SEQUENCE && last_mode != MODE_SEQUENCE) {
-        symbol_sequence_init(&tx_sequence, BITS_PER_SYMBOL); // Restart from the beginning
+        symbol_sequence_init(&tx_sequence, bits_per_symbol()); // Restart from the beginning
     }
     last_mode = mode;
 
@@ -479,6 +484,18 @@ static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
     }
 }
 
+// Core 1: changes the symbol spacing (between blocks, so the transmitter and
+// receiver change together). A packet being sent or received is abandoned.
+static void apply_spacing(uint32_t bps) {
+    bins_per_symbol = bps;
+    const uint32_t n = num_symbols();
+    chirp_encoder.number_of_symbols = n;
+    chirp_symbol_rx_config_init(&symbol_rx_config, n);
+    packet_tx_init(&packet_tx, bits_per_symbol());
+    packet_rx_init(&packet_rx, CHIRP_BINS, bits_per_symbol(), packet_rx_storage, &channel_template);
+    symbol_sequence_init(&tx_sequence, bits_per_symbol());
+}
+
 // Core 1: real-time audio loop. Services each DMA block as it completes.
 static void __not_in_flash_func(core1_main)(void) {
     static float32_t tx_block[I2S_BUFFER_SIZE];
@@ -489,6 +506,8 @@ static void __not_in_flash_func(core1_main)(void) {
     uint32_t last_rx_count = i2s_core_get_rx_block_count();
 
     while (1) {
+        if (bins_per_symbol_request != bins_per_symbol) apply_spacing(bins_per_symbol_request);
+
         const uint32_t tx_count = i2s_core_get_tx_block_count();
         if (tx_count != last_tx_count) {
             tx_blocks_missed += tx_count - last_tx_count - 1;
@@ -542,10 +561,12 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         fft_visualise_draw(&fft_visualise, spectrum);
     }
 
-    printf("Mode %-9s  TX symbol %3lu of %lu  RX delay %4lu  peak %5.1f%%          \n",
+    printf("Mode %-9s  %lu bins/symbol (%lu bits)  TX symbol %3lu of %lu  RX delay %4lu  peak %5.1f%%          \n",
         mode_name(current_mode),
+        (unsigned long)record->bins_per_symbol,
+        (unsigned long)__builtin_ctz(CHIRP_BINS / record->bins_per_symbol),
         (unsigned long)tx_symbol,
-        (unsigned long)NUM_SYMBOLS,
+        (unsigned long)(CHIRP_BINS / record->bins_per_symbol),
         (unsigned long)record->delay,
         record->peak * 100.0f);
     printf("RX symbol %3lu  centroid %8.4f  error %+.4f rad  strength %e          \n",
@@ -557,8 +578,8 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
     // One character per bin, lined up with the folded view: '.' on each
     // symbol's bin, '*' on the decided one, blank between symbols
     for (uint32_t i = 0; i < CHIRP_BINS; ++i) {
-        if (i % BINS_PER_SYMBOL != 0) putchar(' ');
-        else putchar(i / BINS_PER_SYMBOL == record->symbol.symbol_index ? '*' : '.');
+        if (i % record->bins_per_symbol != 0) putchar(' ');
+        else putchar(i / record->bins_per_symbol == record->symbol.symbol_index ? '*' : '.');
     }
     putchar('\n');
 
@@ -591,7 +612,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-6 mode  o/p symbol  z/x delay  t tracking  s send packet  a align  c/v page  f folded view  l log\n");
+    printf("Keys: 1-6 mode  b spacing  o/p symbol  z/x delay  t tracking  s/S send packet (16/255 bytes)  a align  c/v page  f folded view  l log\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -601,10 +622,10 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
 static bool logging = false;
 
 static void print_log_header(void) {
-    printf("# chirp receiver log v6\n");
+    printf("# chirp receiver log v7\n");
     printf("# sample_rate=%.1f fft_size=%u bins=%u bins_per_symbol=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol_step=%u\n",
-        FS, (unsigned)FFT_SIZE, (unsigned)CHIRP_BINS, (unsigned)BINS_PER_SYMBOL, (unsigned)NUM_SYMBOLS,
-        F0, BW, (unsigned)(FFT_SIZE / NUM_SYMBOLS));
+        FS, (unsigned)FFT_SIZE, (unsigned)CHIRP_BINS, (unsigned)bins_per_symbol, (unsigned)num_symbols(),
+        F0, BW, (unsigned)(FFT_SIZE / num_symbols()));
     printf("# track_alpha=%g track_beta=%g track_max_rate=%g track_rate_window=%g track_min_magnitude=%g\n",
         TRACK_ALPHA, TRACK_BETA, TRACK_MAX_RATE, TRACK_RATE_WINDOW, TRACK_MIN_MAGNITUDE);
     printf("# rx_highpass_hz=%g (2nd order, applied to the mic stream; peak is measured after it)\n", RX_HIGHPASS_HZ);
@@ -628,7 +649,7 @@ static void print_log_header(void) {
     for (uint32_t k = 0; k < CHIRP_BINS; k++) {
         printf(",s%lu", (unsigned long)k);
     }
-    printf(",packet_align,packet_align_on,packet_data_symbol,packet_data_margin,packet_align_fraction\n");
+    printf(",packet_align,packet_align_on,packet_data_symbol,packet_data_margin,packet_align_fraction,bins_per_symbol\n");
 }
 
 static void print_log_record(const RxFrameRecord_t *record) {
@@ -664,7 +685,7 @@ static void print_log_record(const RxFrameRecord_t *record) {
     }
     printf(",%+ld,%u,%lu,%.3f", (long)record->packet.align_bins, (unsigned)packet_align,
         (unsigned long)record->packet.data_symbol, record->packet.data_margin);
-    printf(",%+.3f\n", record->packet.align_fraction);
+    printf(",%+.3f,%lu\n", record->packet.align_fraction, (unsigned long)record->bins_per_symbol);
 }
 
 // Core 0: a received packet; logged as a comment line when logging
@@ -687,13 +708,24 @@ static void note_rx_packet(const RxFrameRecord_t *record, const RxPacket_t *pack
     }
 }
 
-// Core 0: queues a 16-byte test packet ("chirp packet NNN", NNN counting up)
-static void queue_test_packet(void) {
+// Core 0: queues a 16-byte test packet ("chirp packet NNN", NNN counting up),
+// or, with 'long', a PACKET_MAX_PAYLOAD-byte one ("chirp long NNN|" then a
+// repeating printable pattern, so a slip shows where it happened)
+static void queue_test_packet(bool long_packet) {
     static uint32_t count = 0;
     static TxPacketRequest_t request;
-    request.length = TEST_PACKET_LENGTH;
-    memset(request.payload, ' ', TEST_PACKET_LENGTH);
-    snprintf((char *)request.payload, TEST_PACKET_LENGTH + 1u, "chirp packet %03lu", (unsigned long)(count % 1000u));
+    char head[24];
+    if (long_packet) {
+        static const char pattern[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-";
+        request.length = PACKET_MAX_PAYLOAD;
+        for (uint32_t i = 0; i < PACKET_MAX_PAYLOAD; i++) request.payload[i] = (uint8_t)pattern[i % 64u];
+        const int n = snprintf(head, sizeof head, "chirp long %03lu|", (unsigned long)(count % 1000u));
+        memcpy(request.payload, head, (size_t)n);
+    } else {
+        request.length = TEST_PACKET_LENGTH;
+        snprintf(head, sizeof head, "chirp packet %03lu", (unsigned long)(count % 1000u));
+        memcpy(request.payload, head, TEST_PACKET_LENGTH);
+    }
     if (spsc_ring_push(&tx_packet_queue, &request)) {
         count++;
         printf("[PACKET] Queued test packet %lu%s\n", (unsigned long)count,
@@ -724,13 +756,16 @@ static void handle_key(int ch) {
             set_mode(MODE_PACKET);
             break;
         case 's':
-            queue_test_packet();
+            queue_test_packet(false);
+            break;
+        case 'S':
+            queue_test_packet(true);
             break;
         case 'p':
-            tx_symbol = (tx_symbol + 1) % NUM_SYMBOLS;
+            tx_symbol = (tx_symbol + 1) % num_symbols();
             break;
         case 'o':
-            tx_symbol = (tx_symbol == 0) ? (NUM_SYMBOLS - 1) : (tx_symbol - 1);
+            tx_symbol = (tx_symbol == 0) ? (num_symbols() - 1) : (tx_symbol - 1);
             break;
         case 'z': {
             const uint32_t delay = rx_sample_window_get_delay(&rx_window);
@@ -745,6 +780,14 @@ static void handle_key(int ch) {
         case 'a':
             packet_align = !packet_align;
             break;
+        case 'b': {
+            const uint32_t next = bins_per_symbol_request >= 4u ? 1u : bins_per_symbol_request * 2u;
+            tx_symbol %= CHIRP_BINS / next;
+            bins_per_symbol_request = next;
+            printf("[SPACING] %lu bins per symbol (%lu bits); set the other board to match\n",
+                (unsigned long)next, (unsigned long)__builtin_ctz(CHIRP_BINS / next));
+            break;
+        }
         case 't':
             tracking_mode = (enum tracking_mode)((tracking_mode + 1) % 3);
             break;
@@ -813,8 +856,8 @@ int main() {
         120      // Max bar width in characters
     );
 
-    set_mode(MODE_TONE_440);
-    printf("[CORE] Starting in tone validation mode to isolate the speaker output path.\n");
+    set_mode(MODE_PACKET);
+    printf("[CORE] Starting in packet mode (silent until a packet is queued: s or S; 3 for the 440 Hz test tone)\n");
     i2s_core_start();
 
     // Start core 1

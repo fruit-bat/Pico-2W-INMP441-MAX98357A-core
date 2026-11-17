@@ -37,6 +37,12 @@ void packet_scramble(uint8_t *data, uint32_t length) {
     }
 }
 
+uint32_t packet_gray_symbol(uint32_t value) {
+    uint32_t symbol = value;
+    for (uint32_t shift = value >> 1; shift != 0; shift >>= 1) symbol ^= shift;
+    return symbol;
+}
+
 uint32_t packet_symbol_count(uint32_t payload_length, uint32_t bits_per_symbol) {
     const uint32_t bits = 8u * (PACKET_HEADER_BYTES + payload_length + PACKET_CRC_BYTES);
     return PACKET_PREAMBLE_LEN + (bits + bits_per_symbol - 1u) / bits_per_symbol;

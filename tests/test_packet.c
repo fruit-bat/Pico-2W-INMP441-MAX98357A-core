@@ -50,11 +50,28 @@ static void test_b_sequence(void) {
     CHECK(packet_b_grid16[0] != 0);
 }
 
-// Independent unpacker: symbols (MSB first, b bits each) back to bytes
+// Gray coding: a round trip for every value, and neighbouring symbols
+// (including the wrap round) always carry values exactly one bit apart
+static void test_gray(void) {
+    for (uint32_t b = 4; b <= 6; b++) {
+        const uint32_t m = 1u << b;
+        uint32_t bad = 0;
+        for (uint32_t v = 0; v < m; v++) {
+            const uint32_t s = packet_gray_symbol(v);
+            bad += s >= m || packet_gray_value(s) != v;
+            const uint32_t diff = packet_gray_value(s) ^ packet_gray_value((s + 1) % m);
+            bad += __builtin_popcount(diff) != 1;
+        }
+        CHECK_EQ_U(bad, 0);
+    }
+}
+
+// Independent unpacker: symbols (Gray coded, MSB first, b bits each) back to bytes
 static void unpack(const uint32_t *symbols, uint32_t count, uint32_t b, uint8_t *bytes, uint32_t nbytes) {
     memset(bytes, 0, nbytes);
     for (uint32_t bit = 0; bit < count * b && bit / 8 < nbytes; bit++) {
-        const uint32_t v = (symbols[bit / b] >> (b - 1 - bit % b)) & 1u;
+        const uint32_t s = symbols[bit / b];
+        const uint32_t v = ((s ^ (s >> 1)) >> (b - 1 - bit % b)) & 1u;
         bytes[bit / 8] |= (uint8_t)(v << (7 - bit % 8));
     }
 }
@@ -108,6 +125,7 @@ int main(void) {
     RUN_TEST(test_crc_check_values);
     RUN_TEST(test_scramble);
     RUN_TEST(test_b_sequence);
+    RUN_TEST(test_gray);
     RUN_TEST(test_framing);
     RUN_TEST(test_airtime);
 
