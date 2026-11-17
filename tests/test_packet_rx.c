@@ -61,6 +61,9 @@ static uint32_t build_packet_stream(uint32_t length) {
 typedef struct {
     uint32_t locked, trained, failed, tone;
     uint32_t header_failed, packets, good;   // good: CRC-16 ok and the payload is what was sent
+    uint32_t lost;
+    PacketRxStatus_t last_lost;
+    float32_t min_quality;                  // Lowest data frame quality seen
     PacketRxStatus_t last_packet;
     int32_t last_align;           // align_bins at the last LOCKED
     double final_offset;          // Window offset at the end (after any moves)
@@ -79,12 +82,15 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
     packet_rx_init(&prx, BINS, (uint32_t)log2(rig_m), rx_storage, &tmpl);
     Events_t e;
     memset(&e, 0, sizeof e);
+    e.min_quality = 1.0f;
     for (uint32_t k = 0; k < length; k++) {
         chirp_channel_rx_frame(&rig_tx_model, &ch, stream, length, k, frame);
         ChirpSymbolRx_t rx;
         rig_decode(frame, &rx);
         const float32_t centre = rx.angle * (float32_t)BINS / (2.0f * (float32_t)M_PI);
         const PacketRxStatus_t *st = packet_rx_frame(&prx, rig_decoder.folded_power_buffer, centre);
+        if ((st->state == PACKET_RX_HEADER || st->state == PACKET_RX_PAYLOAD || st->event == PACKET_RX_EVENT_PACKET)
+                && st->data_count > 0 && st->data_quality < e.min_quality) e.min_quality = st->data_quality;
         switch (st->event) {
             case PACKET_RX_EVENT_LOCKED:
                 e.locked++;
@@ -98,6 +104,7 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
             case PACKET_RX_EVENT_TRAIN_FAILED: e.failed++; break;
             case PACKET_RX_EVENT_TONE: e.tone++; break;
             case PACKET_RX_EVENT_HEADER_FAILED: e.header_failed++; break;
+            case PACKET_RX_EVENT_LOST: e.lost++; e.last_lost = *st; break;
             case PACKET_RX_EVENT_PACKET:
                 e.packets++;
                 e.last_packet = *st;
@@ -279,10 +286,11 @@ static void test_alignment(void) {
 }
 
 static void print_packet(const char *label, Events_t e) {
-    printf("  %-38s trained %u header failed %u packets %u good %u", label, e.trained, e.header_failed, e.packets, e.good);
+    printf("  %-38s trained %u header failed %u lost %u packets %u good %u", label, e.trained, e.header_failed, e.lost, e.packets, e.good);
     if (e.packets) {
-        printf(" | %u data symbols, min margin %.2f (symbol %u), %u weak",
-            e.last_packet.data_count, e.last_packet.min_margin, e.last_packet.weakest_symbol, e.last_packet.weak_symbols);
+        printf(" | %u data symbols, min margin %.2f (symbol %u), %u weak, min quality %.2f",
+            e.last_packet.data_count, e.last_packet.min_margin, e.last_packet.weakest_symbol, e.last_packet.weak_symbols,
+            e.min_quality);
     }
     printf("\n");
 }
@@ -308,6 +316,7 @@ static void test_packets(void) {
         print_packet(label, e);
         CHECK_EQ_U(e.packets, 1);
         CHECK_EQ_U(e.good, 1);
+        CHECK_EQ_U(e.lost, 0);
     }
     rig_setup_spacing(1);
 }
@@ -326,7 +335,7 @@ static void test_long_packets(void) {
     for (int harsh = 0; harsh < 2; harsh++) {
         for (int i = 0; i < 3; i++) {
             const double snr = i == 0 ? 100.0 : (i == 1 ? 0.0 : -6.0);
-            uint32_t good = 0, weak = 0;
+            uint32_t good = 0, weak = 0, lost = 0;
             float32_t min_margin = 1e9f;
             for (uint32_t r = 0; r < 8; r++) {
                 chirp_channel_seed(200 + r);
@@ -334,12 +343,14 @@ static void test_long_packets(void) {
                 build_packet_stream_with(frames, payload, sizeof payload);
                 const Events_t e = run(frames, -400.0 + 100.0 * r, snr, harsh ? room_echoes : measured_echoes, 3, true);
                 good += e.good;
+                lost += e.lost;
                 weak += e.last_packet.weak_symbols;
                 if (e.packets && e.last_packet.min_margin < min_margin) min_margin = e.last_packet.min_margin;
             }
             printf("  %s room, 255 bytes, %-8s %u/8 intact, %u weak decisions, min margin %.2f\n",
                 harsh ? "harsh   " : "measured", i == 0 ? "no noise" : (i == 1 ? "0 dB" : "-6 dB"), good, weak, min_margin);
             CHECK_EQ_U(good, 8);
+            CHECK_EQ_U(lost, 0);
         }
     }
 }
@@ -380,6 +391,30 @@ static void test_two_packets(void) {
     CHECK_EQ_U(e.good, 2);
 }
 
+// The transmitter stops partway through the payload (noise goes on): the
+// packet is abandoned within a few frames, not decoded to the end, and a
+// packet straight after it is received
+static void test_lost_signal(void) {
+    rig_setup_spacing(1);
+    const uint32_t len = 43u, cut = 20u; // 16-byte packet: 43 symbols; stop after 20 (4 data symbols)
+    const uint32_t frames = LEAD + len + 6u + len + 10u;
+    build_packet_stream(frames);
+    for (uint32_t k = 0; k < len; k++) stream[LEAD + len + 6u + k] = stream[LEAD + k]; // A second, whole packet
+    for (uint32_t k = cut; k < len; k++) stream[LEAD + k] = CHIRP_CHANNEL_SILENT;
+    for (int i = 0; i < 2; i++) {
+        chirp_channel_seed(90 + i);
+        const Events_t e = run(frames, 150.0, i ? -6.0 : 0.0, measured_echoes, 3, true);
+        print_packet(i ? "cut off, then a packet, -6 dB" : "cut off, then a packet, 0 dB", e);
+        CHECK_EQ_U(e.lost, 1);
+        if (e.lost) {
+            printf("    lost after %u data symbols\n", e.last_lost.data_count);
+            CHECK(e.last_lost.data_count <= cut - PACKET_PREAMBLE_LEN + PACKET_RX_LOST_FRAMES + 1u);
+        }
+        CHECK_EQ_U(e.packets, 1);
+        CHECK_EQ_U(e.good, 1);
+    }
+}
+
 int main(void) {
     channel_template_init(&tmpl, BINS, template_storage);
 
@@ -395,6 +430,7 @@ int main(void) {
     RUN_TEST(test_bad_crc);
     RUN_TEST(test_bad_header);
     RUN_TEST(test_two_packets);
+    RUN_TEST(test_lost_signal);
 
     printf("\n%d checks, %d failures\n", test_checks, test_failures);
     return test_failures ? 1 : 0;

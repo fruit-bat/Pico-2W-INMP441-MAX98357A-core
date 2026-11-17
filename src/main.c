@@ -32,9 +32,9 @@
 // desk channel spreads about +/-1 bin), and widens the tracker's pull-in to
 // +/- half a symbol step. Between the two boards 1 bin per symbol lost long
 // packets to neighbouring-symbol slips (echoes from the previous symbol); 2
-// did not.
+// did not; 4 has the most margin (board 2's speaker is ~10 dB weaker in band).
 #define CHIRP_BINS 64u
-#define DEFAULT_BINS_PER_SYMBOL 2u // 1, 2 or 4
+#define DEFAULT_BINS_PER_SYMBOL 4u // 1, 2 or 4
 static volatile uint32_t bins_per_symbol_request = DEFAULT_BINS_PER_SYMBOL; // Set by core 0 (key 'b')
 static volatile uint32_t bins_per_symbol = DEFAULT_BINS_PER_SYMBOL;         // In use; core 1 applies requests
 static inline uint32_t num_symbols(void) { return CHIRP_BINS / bins_per_symbol; }
@@ -49,7 +49,17 @@ static const float32_t BW = BPB * CHIRP_BINS; // Total bandwidth for the chirp s
 static const float32_t F0 = 15000.0f;
 static const float32_t T  = (float32_t)FFT_SIZE / FS;
 static const float32_t chirp_rate = BW / T;
-static const float32_t chirp_vol = 0.04f; // About -28 dBFS. TODO: make this run-time configurable
+// Chirp transmit level, dB relative to full scale (keys '[' and ']'; core 1
+// applies changes between blocks). -28 dB is the x8 level used so far.
+#define TX_VOLUME_DEFAULT_DB (-28)
+#define TX_VOLUME_STEP_DB    3
+#define TX_VOLUME_MIN_DB     (-55)
+#define TX_VOLUME_MAX_DB     (-1)
+static volatile int32_t tx_volume_db = TX_VOLUME_DEFAULT_DB;
+
+static float32_t volume_from_db(int32_t db) {
+    return powf(10.0f, (float32_t)db / 20.0f);
+}
 
 #define DISPLAY_PERIOD_MS 100
 #define LOG_BAND_BINS (2u * CHIRP_BINS) // FFT bins logged per frame: -CHIRP_BINS .. CHIRP_BINS-1
@@ -119,6 +129,7 @@ typedef struct {
     uint32_t frame;          // RX block count when this frame was decoded
     uint32_t mode;           // enum test_mode in effect for this frame
     uint32_t bins_per_symbol; // Symbol spacing in effect for this frame
+    int32_t tx_volume_db;     // Transmit level in effect for this frame, dBFS
     uint32_t delay;          // Alignment delay in samples used for this frame
     uint32_t tx_symbol;      // Symbol this board was transmitting at the time (in sequence mode, the latest sent)
     float32_t peak;          // Peak absolute sample value in the frame after the RX high-pass, [0, 1]
@@ -239,7 +250,7 @@ static void init_audio_system(void) {
         chirp_decoder.complex_dechirp_vector,
         FFT_SIZE,
         num_symbols(),
-        chirp_vol
+        volume_from_db(tx_volume_db)
     );
 
     chirp_symbol_rx_config_init(&symbol_rx_config, num_symbols());
@@ -371,6 +382,7 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
         .frame = frame,
         .mode = current_mode,
         .bins_per_symbol = bins_per_symbol,
+        .tx_volume_db = tx_volume_db,
         .delay = rx_sample_window_get_delay(&rx_window),
         .tx_symbol = current_mode == MODE_SEQUENCE ? tx_sequence_symbol
                    : current_mode == MODE_PACKET ? packet_tx_symbol : tx_symbol,
@@ -507,6 +519,14 @@ static void __not_in_flash_func(core1_main)(void) {
 
     while (1) {
         if (bins_per_symbol_request != bins_per_symbol) apply_spacing(bins_per_symbol_request);
+        {
+            static int32_t applied_volume_db = TX_VOLUME_DEFAULT_DB;
+            const int32_t db = tx_volume_db;
+            if (db != applied_volume_db) {
+                applied_volume_db = db;
+                chirp_encoder.volume = volume_from_db(db);
+            }
+        }
 
         const uint32_t tx_count = i2s_core_get_tx_block_count();
         if (tx_count != last_tx_count) {
@@ -547,7 +567,7 @@ static void __not_in_flash_func(core1_main)(void) {
 
 // Core 0: received packets, for the display
 static struct {
-    uint32_t good, bad, header_failed;
+    uint32_t good, bad, header_failed, lost;
     char last_text[PACKET_MAX_PAYLOAD * 4 + 1]; // Last payload, printable (\xNN for other bytes)
     PacketRxStatus_t last;
 } rx_packet_stats;
@@ -561,10 +581,11 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         fft_visualise_draw(&fft_visualise, spectrum);
     }
 
-    printf("Mode %-9s  %lu bins/symbol (%lu bits)  TX symbol %3lu of %lu  RX delay %4lu  peak %5.1f%%          \n",
+    printf("Mode %-9s  %lu bins/symbol (%lu bits)  TX %+ld dBFS  TX symbol %3lu of %lu  RX delay %4lu  peak %5.1f%%          \n",
         mode_name(current_mode),
         (unsigned long)record->bins_per_symbol,
         (unsigned long)__builtin_ctz(CHIRP_BINS / record->bins_per_symbol),
+        (long)record->tx_volume_db,
         (unsigned long)tx_symbol,
         (unsigned long)(CHIRP_BINS / record->bins_per_symbol),
         (unsigned long)record->delay,
@@ -600,9 +621,10 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
             (long)last.strongest_offset, (long)last.earliest_offset);
         printf("Packet align %-3s  last lock: window %+.2f bins out          \n",
             packet_align ? "on" : "off", (double)((float32_t)record->packet.align_bins + record->packet.align_fraction));
-        printf("Packets good %lu bad %lu header failed %lu dropped %lu  last: %s margin %.2f weak %lu \"%.40s\"          \n",
+        printf("Packets good %lu bad %lu header failed %lu lost %lu dropped %lu  last: %s margin %.2f weak %lu \"%.40s\"          \n",
             (unsigned long)rx_packet_stats.good, (unsigned long)rx_packet_stats.bad,
-            (unsigned long)rx_packet_stats.header_failed, (unsigned long)rx_packets_dropped,
+            (unsigned long)rx_packet_stats.header_failed, (unsigned long)rx_packet_stats.lost,
+            (unsigned long)rx_packets_dropped,
             rx_packet_stats.good + rx_packet_stats.bad == 0 ? "-" : (rx_packet_stats.last.crc_ok ? "ok" : "BAD"),
             rx_packet_stats.last.min_margin, (unsigned long)rx_packet_stats.last.weak_symbols,
             rx_packet_stats.last_text);
@@ -612,7 +634,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-6 mode  b spacing  o/p symbol  z/x delay  t tracking  s/S send packet (16/255 bytes)  a align  c/v page  f folded view  l log\n");
+    printf("Keys: 1-6 mode  b spacing  [/] volume  o/p symbol  z/x delay  t tracking  s/S send packet (16/255 bytes)  a align  c/v page  f folded view  l log\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -622,7 +644,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
 static bool logging = false;
 
 static void print_log_header(void) {
-    printf("# chirp receiver log v7\n");
+    printf("# chirp receiver log v8\n");
     printf("# sample_rate=%.1f fft_size=%u bins=%u bins_per_symbol=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol_step=%u\n",
         FS, (unsigned)FFT_SIZE, (unsigned)CHIRP_BINS, (unsigned)bins_per_symbol, (unsigned)num_symbols(),
         F0, BW, (unsigned)(FFT_SIZE / num_symbols()));
@@ -634,7 +656,9 @@ static void print_log_header(void) {
     printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");
     printf("# packet_*: packet receiver (packet_rx.h) after this frame; packet_event 2 = preamble found (b_start, paths);\n");
     printf("# s<k>: channel shape it last learned, by bin offset k from the window position\n");
-    printf("# packet_data_symbol/margin: last data symbol decided and its margin (best/second score)\n");
+    printf("# packet_data_symbol/margin/quality: last data symbol decided, its margin (best/second score)\n");
+    printf("#   and quality (correlation with the learned shape; noise ~0.3, symbols ~0.85)\n");
+    printf("# '# packet lost' lines: header or payload abandoned when the signal went\n");
     printf("# '# packet' lines: a received packet (after its frame's row); '# packet header failed': bad CRC-8\n");
     printf("# packet_align (+ packet_align_fraction): at the last lock, bins the window was late (moved by that if packet_align_on)\n");
     printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
@@ -649,7 +673,7 @@ static void print_log_header(void) {
     for (uint32_t k = 0; k < CHIRP_BINS; k++) {
         printf(",s%lu", (unsigned long)k);
     }
-    printf(",packet_align,packet_align_on,packet_data_symbol,packet_data_margin,packet_align_fraction,bins_per_symbol\n");
+    printf(",packet_align,packet_align_on,packet_data_symbol,packet_data_margin,packet_align_fraction,bins_per_symbol,tx_volume_db,packet_data_quality\n");
 }
 
 static void print_log_record(const RxFrameRecord_t *record) {
@@ -685,7 +709,8 @@ static void print_log_record(const RxFrameRecord_t *record) {
     }
     printf(",%+ld,%u,%lu,%.3f", (long)record->packet.align_bins, (unsigned)packet_align,
         (unsigned long)record->packet.data_symbol, record->packet.data_margin);
-    printf(",%+.3f,%lu\n", record->packet.align_fraction, (unsigned long)record->bins_per_symbol);
+    printf(",%+.3f,%lu,%+ld,%.3f\n", record->packet.align_fraction, (unsigned long)record->bins_per_symbol,
+        (long)record->tx_volume_db, record->packet.data_quality);
 }
 
 // Core 0: a received packet; logged as a comment line when logging
@@ -788,6 +813,16 @@ static void handle_key(int ch) {
                 (unsigned long)next, (unsigned long)__builtin_ctz(CHIRP_BINS / next));
             break;
         }
+        case '[':
+        case ']': {
+            const int32_t step = ch == ']' ? TX_VOLUME_STEP_DB : -TX_VOLUME_STEP_DB;
+            int32_t db = tx_volume_db + step;
+            if (db < TX_VOLUME_MIN_DB) db = TX_VOLUME_MIN_DB;
+            if (db > TX_VOLUME_MAX_DB) db = TX_VOLUME_MAX_DB;
+            tx_volume_db = db;
+            printf("[VOLUME] TX %+ld dBFS\n", (long)db);
+            break;
+        }
         case 't':
             tracking_mode = (enum tracking_mode)((tracking_mode + 1) % 3);
             break;
@@ -887,6 +922,9 @@ int main() {
             } else if (record.packet.event == PACKET_RX_EVENT_HEADER_FAILED) {
                 rx_packet_stats.header_failed++;
                 if (logging) printf("# packet header failed: length byte %lu\n", (unsigned long)record.packet.length);
+            } else if (record.packet.event == PACKET_RX_EVENT_LOST) {
+                rx_packet_stats.lost++;
+                if (logging) printf("# packet lost: signal gone after %lu data symbols\n", (unsigned long)record.packet.data_count);
             }
             latest_record = record;
             records_received++;

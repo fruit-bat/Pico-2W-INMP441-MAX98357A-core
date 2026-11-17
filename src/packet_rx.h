@@ -19,6 +19,14 @@
  *           payload, checks the CRC-16 and reports the packet (good or bad)
  *           with PACKET_RX_EVENT_PACKET; back to SEARCH
  *
+ * In HEADER and PAYLOAD each frame's "quality" is checked: the correlation
+ * (mean removed, 0..1) of its square-root power with the learned shape at
+ * the best candidate symbol. A symbol scores about 0.85 between the boards,
+ * noise about 0.3, independent of level. PACKET_RX_LOST_FRAMES frames in a
+ * row below PACKET_RX_MIN_QUALITY abandon the packet (PACKET_RX_EVENT_LOST),
+ * so a header that passed its CRC-8 by chance, or a transmitter that
+ * stopped, doesn't hold the receiver for the rest of a long payload.
+ *
  * Data symbols are decided by channel_template_decide: each candidate
  * symbol's score is the correlation of the frame with the learned shape
  * moved to that symbol, so reflections count for the symbol rather than
@@ -71,7 +79,7 @@
 #include "packet_format.h"
 
 #define PACKET_RX_HISTORY 16u // Frames of folded power kept (B plus a margin either side)
-#define PACKET_RX_STORAGE_LEN(bins) ((PACKET_RX_HISTORY + 2u) * (bins))
+#define PACKET_RX_STORAGE_LEN(bins) ((PACKET_RX_HISTORY + 3u) * (bins))
 
 // Thresholds on the frame-to-frame correlation and on B's coherence
 #define PACKET_RX_LOCK_CORRELATION   0.5f  // SEARCH -> LOCK when this many consecutive frames agree...
@@ -83,6 +91,10 @@
 #define PACKET_RX_PATH_FRACTION      0.25f // Paths within 6 dB of the strongest count as "strong"
 #define PACKET_RX_EARLIEST_SPAN      20    // The earliest strong path is looked for this many bins above the strongest
 #define PACKET_RX_WEAK_MARGIN        1.2f  // Data decisions with a margin below this are counted as weak
+#define PACKET_RX_MIN_QUALITY        0.55f // Data frames below this don't look like a symbol...
+#define PACKET_RX_LOST_FRAMES        8u    // ...and this many in a row (~190 ms) abandon the packet. Not
+                                           // fewer: loud bursts of room noise drop the quality for 2-3
+                                           // frames while the signal is still there
 
 typedef enum {
     PACKET_RX_SEARCH = 0,
@@ -100,6 +112,7 @@ typedef enum {
     PACKET_RX_EVENT_TONE,         // A held symbol went on too long; ignored until it changes
     PACKET_RX_EVENT_HEADER_FAILED, // The header's CRC-8 was wrong
     PACKET_RX_EVENT_PACKET,       // A packet is complete; see the packet fields and packet_rx_payload()
+    PACKET_RX_EVENT_LOST,         // The signal went during the header or payload; abandoned
 } PacketRxEvent_t;
 
 typedef struct {
@@ -123,6 +136,7 @@ typedef struct {
     // just before), and its margin
     uint32_t data_symbol;
     float32_t data_margin;
+    float32_t data_quality;       // Its quality (see above)
     uint32_t data_count;          // Data symbols decided so far in this packet
     // Set with PACKET_RX_EVENT_HEADER_FAILED / PACKET (and kept until the next one):
     uint32_t length;              // Payload length from the header
@@ -139,6 +153,7 @@ typedef struct {
     float32_t *history;           // PACKET_RX_HISTORY frames of folded power (ring)
     float32_t *previous;          // Previous frame, as a correlation vector
     float32_t *reference;         // A's average, as a correlation vector
+    float32_t *shape_vector;      // The learned shape, as a correlation vector (for the quality)
     ChannelTemplate_t *tmpl;      // Learned shape (from B)
     uint32_t agree;               // SEARCH: consecutive agreeing frames
     uint32_t lock_frames;         // LOCK: frames so far
@@ -148,6 +163,7 @@ typedef struct {
     float32_t centre[PACKET_RX_HISTORY]; // The decoder's refined centre per frame (bins, ring)
     uint32_t data_total;          // PAYLOAD: data symbols in this packet
     uint32_t bit_count;           // Bits collected into bytes
+    uint32_t low_quality;         // Consecutive data frames below PACKET_RX_MIN_QUALITY
     uint8_t bytes[PACKET_MAX_BYTES]; // Header, payload (descrambled once complete), CRC-16
     PacketRxStatus_t status;
 } PacketRx_t;

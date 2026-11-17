@@ -17,6 +17,7 @@ void packet_rx_init(
     rx->history = storage;
     rx->previous = storage + PACKET_RX_HISTORY * bins;
     rx->reference = rx->previous + bins;
+    rx->shape_vector = rx->reference + bins;
     rx->tmpl = tmpl;
     memset(storage, 0, PACKET_RX_STORAGE_LEN(bins) * sizeof(*storage));
     memset(&rx->status, 0, sizeof(rx->status));
@@ -184,8 +185,14 @@ static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
     st->strongest_offset = strongest;
     st->earliest_offset = earliest;
 
+    // The shape as a correlation vector, for the data frames' quality
+    // (correlation_vector takes power and square-roots it; the shape is
+    // power too)
+    correlation_vector(rx, rx->tmpl->shape, rx->shape_vector);
+
     // The data symbols follow B
     st->state = PACKET_RX_HEADER;
+    rx->low_quality = 0;
     rx->next_data_frame = start + PACKET_B_LEN;
     rx->bit_count = 0;
     memset(rx->bytes, 0, sizeof(rx->bytes));
@@ -205,6 +212,21 @@ static void back_to_search(PacketRx_t *rx) {
     rx->tone = false;
 }
 
+// How much a frame looks like a symbol: the best correlation, over the
+// candidate symbols, of its correlation vector with the shape's
+static float32_t __not_in_flash_func(frame_quality)(const PacketRx_t *rx, const float32_t *folded_power) {
+    const uint32_t n = rx->bins;
+    float32_t v[64];
+    correlation_vector(rx, folded_power, v);
+    float32_t best = -1.0f;
+    for (uint32_t c = 0; c < n; c += rx->bins_per_symbol) {
+        float32_t q = 0.0f;
+        for (uint32_t o = 0; o < n; o++) q += v[(c + o) % n] * rx->shape_vector[o];
+        if (q > best) best = q;
+    }
+    return best;
+}
+
 // Decides the data symbol in one frame and adds its bits (MSB first); then
 // checks the header or finishes the packet when enough are in
 static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *folded_power) {
@@ -215,6 +237,13 @@ static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *fo
         rx->tmpl, folded_power, 0, rx->bins_per_symbol, 1u << b, &margin);
     st->data_symbol = symbol;
     st->data_margin = margin;
+    st->data_quality = frame_quality(rx, folded_power);
+    rx->low_quality = st->data_quality < PACKET_RX_MIN_QUALITY ? rx->low_quality + 1u : 0u;
+    if (rx->low_quality >= PACKET_RX_LOST_FRAMES) {
+        st->event = PACKET_RX_EVENT_LOST;
+        back_to_search(rx);
+        return;
+    }
     if (margin < st->min_margin) {
         st->min_margin = margin;
         st->weakest_symbol = st->data_count;
