@@ -87,6 +87,57 @@ static int32_t signed_offset(uint32_t o, uint32_t n) {
     return o >= n / 2u ? (int32_t)o - (int32_t)n : (int32_t)o;
 }
 
+// Paths in a shape (power by bin offset from the window): the strongest,
+// and the earliest within 6 dB of it. A later path lands at a lower bin, so
+// the earliest is the highest one above the strongest, looked for only
+// within PACKET_RX_EARLIEST_SPAN bins (the shape wraps, so further up it
+// would be a long echo instead). Signed offsets, -bins/2 .. bins/2-1.
+static void find_paths(const PacketRx_t *rx, const float32_t *shape, int32_t *strongest_out, int32_t *earliest_out) {
+    const uint32_t n = rx->bins;
+    uint32_t strongest = 0;
+    for (uint32_t o = 1; o < n; o++) if (shape[o] > shape[strongest]) strongest = o;
+    uint32_t earliest = strongest;
+    for (uint32_t up = 1; up <= (uint32_t)PACKET_RX_EARLIEST_SPAN && up < n; up++) {
+        const uint32_t o = (strongest + up) % n;
+        if (shape[o] >= PACKET_RX_PATH_FRACTION * shape[strongest]) earliest = o;
+    }
+    *strongest_out = signed_offset(strongest, n);
+    *earliest_out = signed_offset(earliest, n);
+}
+
+// Entering LOCK: the path shape of the agreeing A frames (this one and the
+// PACKET_RX_LOCK_FRAMES before it), each normalised as channel_template does,
+// and how far the window is out
+static void __not_in_flash_func(measure_alignment)(PacketRx_t *rx, uint32_t frame) {
+    const uint32_t n = rx->bins;
+    float32_t shape[64];
+    memset(shape, 0, n * sizeof(*shape));
+    for (uint32_t i = 0; i <= PACKET_RX_LOCK_FRAMES; i++) {
+        const float32_t *p = history_frame(rx, frame - i);
+        float32_t total = 0.0f;
+        for (uint32_t k = 0; k < n; k++) total += p[k];
+        if (total <= 0.0f) continue;
+        for (uint32_t k = 0; k < n; k++) shape[k] += p[k] / total;
+    }
+    int32_t strongest, earliest;
+    find_paths(rx, shape, &strongest, &earliest);
+    rx->status.align_bins = earliest;
+}
+
+// Moves a vector's contents 'bins' bins lower (what was at k goes to k - bins)
+static void rotate_down(float32_t *v, uint32_t n, int32_t bins) {
+    float32_t t[64];
+    const uint32_t s = (uint32_t)(((bins % (int32_t)n) + (int32_t)n) % (int32_t)n);
+    for (uint32_t k = 0; k < n; k++) t[k] = v[(k + s) % n];
+    memcpy(v, t, n * sizeof(*v));
+}
+
+void packet_rx_window_moved(PacketRx_t *rx, int32_t bins) {
+    if (rx->bins > 64) return;
+    rotate_down(rx->reference, rx->bins, bins);
+    rotate_down(rx->previous, rx->bins, bins);
+}
+
 // B is complete: find its start, learn the channel, report the paths
 static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
     PacketRxStatus_t *st = &rx->status;
@@ -111,26 +162,15 @@ static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
         channel_template_learn(rx->tmpl, history_frame(rx, start + i), b_bin(rx, i));
     }
 
-    // Paths: the strongest, and the earliest within 6 dB of it. A later
-    // path lands at a lower bin, so the earliest is the highest one above
-    // the strongest, looked for only within PACKET_RX_EARLIEST_SPAN bins
-    // (the shape wraps, so further up it would be a long echo instead)
-    const uint32_t n = rx->bins;
-    const float32_t *shape = rx->tmpl->shape;
-    uint32_t strongest = 0;
-    for (uint32_t o = 1; o < n; o++) if (shape[o] > shape[strongest]) strongest = o;
-    uint32_t earliest = strongest;
-    for (uint32_t up = 1; up <= (uint32_t)PACKET_RX_EARLIEST_SPAN && up < n; up++) {
-        const uint32_t o = (strongest + up) % n;
-        if (shape[o] >= PACKET_RX_PATH_FRACTION * shape[strongest]) earliest = o;
-    }
+    int32_t strongest, earliest;
+    find_paths(rx, rx->tmpl->shape, &strongest, &earliest);
 
     st->event = PACKET_RX_EVENT_TRAINED;
     st->coherence = best;
     st->start_adjust = best_adjust;
     st->b_start_frame = start;
-    st->strongest_offset = signed_offset(strongest, n);
-    st->earliest_offset = signed_offset(earliest, n);
+    st->strongest_offset = strongest;
+    st->earliest_offset = earliest;
 }
 
 const PacketRxStatus_t *__not_in_flash_func(packet_rx_frame)(PacketRx_t *rx, const float32_t *folded_power) {
@@ -157,6 +197,7 @@ const PacketRxStatus_t *__not_in_flash_func(packet_rx_frame)(PacketRx_t *rx, con
                 st->state = PACKET_RX_LOCK;
                 st->event = PACKET_RX_EVENT_LOCKED;
                 memcpy(rx->reference, v, n * sizeof(*v));
+                measure_alignment(rx, frame);
                 rx->lock_frames = 0;
             }
             break;

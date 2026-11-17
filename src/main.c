@@ -96,6 +96,7 @@ static volatile enum test_mode current_mode = MODE_TONE_440;
 static volatile uint32_t tx_symbol = 0;        // Symbol transmitted in chirp modes
 static volatile uint32_t tone_step_index = 0;  // Reset by core 0 to restart the tone ramp
 static volatile enum tracking_mode tracking_mode = TRACK_OFF;
+static volatile bool packet_align = true;      // Move the window when the packet receiver locks (key 'a')
 
 // Core 0 only: which spectrum the display shows
 static bool display_folded = false; // false: de-chirped FFT spectrum (paged); true: folded spectrum
@@ -388,6 +389,14 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
     // Packet receiver (optionally not while this board is sending a packet)
     if (PACKET_RX_WHILE_TRANSMITTING || !packet_tx_busy(&packet_tx)) {
         record.packet = *packet_rx_frame(&packet_rx, chirp_decoder.folded_power_buffer);
+        // Preamble A found: move the window onto the earliest path (from the next frame)
+        if (packet_align && record.packet.event == PACKET_RX_EVENT_LOCKED && record.packet.align_bins != 0) {
+            const int32_t move = record.packet.align_bins * (int32_t)(FFT_SIZE / CHIRP_BINS); // Samples earlier
+            const uint32_t delay = (uint32_t)(((int32_t)record.delay + move) % (int32_t)FFT_SIZE + (int32_t)FFT_SIZE) % FFT_SIZE;
+            rx_sample_window_set_delay(&rx_window, delay);
+            packet_rx_window_moved(&packet_rx, record.packet.align_bins);
+            symbol_timing_tracker_reset(&timing_tracker, delay);
+        }
     } else {
         packet_rx_reset(&packet_rx);
         record.packet = packet_rx.status;
@@ -536,13 +545,15 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
             packet_state_name(record->packet.state), record->packet.correlation,
             (unsigned long)found, (unsigned long)failed, (unsigned long)last.b_start_frame, last.coherence,
             (long)last.strongest_offset, (long)last.earliest_offset);
+        printf("Packet align %-3s  last lock: window %+ld bins out          \n",
+            packet_align ? "on" : "off", (long)record->packet.align_bins);
     }
     printf("Frames %lu  missed rx %lu tx %lu  dropped records %lu          \n",
         (unsigned long)records_received,
         (unsigned long)rx_blocks_missed,
         (unsigned long)tx_blocks_missed,
         (unsigned long)rx_records_dropped);
-    printf("Keys: 1-6 mode  o/p symbol  z/x delay  t tracking  s send packet  c/v page  f folded view  l log\n");
+    printf("Keys: 1-6 mode  o/p symbol  z/x delay  t tracking  s send packet  a align  c/v page  f folded view  l log\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +563,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
 static bool logging = false;
 
 static void print_log_header(void) {
-    printf("# chirp receiver log v4\n");
+    printf("# chirp receiver log v5\n");
     printf("# sample_rate=%.1f fft_size=%u bins=%u bins_per_symbol=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol_step=%u\n",
         FS, (unsigned)FFT_SIZE, (unsigned)CHIRP_BINS, (unsigned)BINS_PER_SYMBOL, (unsigned)NUM_SYMBOLS,
         F0, BW, (unsigned)(FFT_SIZE / NUM_SYMBOLS));
@@ -564,6 +575,7 @@ static void print_log_header(void) {
     printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");
     printf("# packet_*: packet receiver (packet_rx.h) after this frame; packet_event 2 = preamble found (b_start, paths);\n");
     printf("# s<k>: channel shape it last learned, by bin offset k from the window position\n");
+    printf("# packet_align: at the last lock, bins the window was late (moved by that if packet_align_on)\n");
     printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
            "timing_error,timing_rate,rx_missed,tx_missed,dropped");
     for (int32_t k = -(int32_t)CHIRP_BINS; k < (int32_t)CHIRP_BINS; k++) {
@@ -576,7 +588,7 @@ static void print_log_header(void) {
     for (uint32_t k = 0; k < CHIRP_BINS; k++) {
         printf(",s%lu", (unsigned long)k);
     }
-    printf("\n");
+    printf(",packet_align,packet_align_on\n");
 }
 
 static void print_log_record(const RxFrameRecord_t *record) {
@@ -610,7 +622,7 @@ static void print_log_record(const RxFrameRecord_t *record) {
     for (uint32_t i = 0; i < CHIRP_BINS; i++) {
         printf(",%.3e", record->packet_shape[i]);
     }
-    printf("\n");
+    printf(",%+ld,%u\n", (long)record->packet.align_bins, (unsigned)packet_align);
 }
 
 // Core 0: queues a 16-byte test packet ("chirp packet NNN", NNN counting up)
@@ -668,6 +680,9 @@ static void handle_key(int ch) {
             rx_sample_window_set_delay(&rx_window, delay < (FFT_SIZE - 1) ? delay + 1 : 0);
             break;
         }
+        case 'a':
+            packet_align = !packet_align;
+            break;
         case 't':
             tracking_mode = (enum tracking_mode)((tracking_mode + 1) % 3);
             break;

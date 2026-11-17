@@ -48,13 +48,16 @@ static uint32_t build_packet_stream(uint32_t length) {
 
 typedef struct {
     uint32_t locked, trained, failed, tone;
+    int32_t last_align;           // align_bins at the last LOCKED
+    double final_offset;          // Window offset at the end (after any moves)
     PacketRxStatus_t last_trained;
 } Events_t;
 
-// Runs 'length' frames of the stream through the channel and the receiver
-static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEcho_t *echoes, uint32_t echo_count) {
+// Runs 'length' frames of the stream through the channel and the receiver.
+// With 'align', the window is moved when the receiver locks, as main.c does.
+static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEcho_t *echoes, uint32_t echo_count, bool align) {
     static float32_t frame[N];
-    const ChirpChannel_t ch = {
+    ChirpChannel_t ch = {
         .offset = offset, .clock_scale = 1.0,
         .noise_rms = snr_db > 90.0 ? 0.0 : (RIG_VOLUME / sqrt(2.0)) / pow(10.0, snr_db / 20.0),
         .echoes = echoes, .echo_count = echo_count,
@@ -68,13 +71,21 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
         rig_decode(frame, &rx);
         const PacketRxStatus_t *st = packet_rx_frame(&prx, rig_decoder.folded_power_buffer);
         switch (st->event) {
-            case PACKET_RX_EVENT_LOCKED: e.locked++; break;
+            case PACKET_RX_EVENT_LOCKED:
+                e.locked++;
+                e.last_align = st->align_bins;
+                if (align && st->align_bins != 0) {
+                    ch.offset -= st->align_bins * (double)(N / BINS); // Earlier
+                    packet_rx_window_moved(&prx, st->align_bins);
+                }
+                break;
             case PACKET_RX_EVENT_TRAINED: e.trained++; e.last_trained = *st; break;
             case PACKET_RX_EVENT_TRAIN_FAILED: e.failed++; break;
             case PACKET_RX_EVENT_TONE: e.tone++; break;
             default: break;
         }
     }
+    e.final_offset = ch.offset;
     return e;
 }
 
@@ -109,7 +120,7 @@ static void test_offsets(void) {
     const double offsets[] = { 0.0, 37.0, -200.0, 300.0, 500.0 };
     for (unsigned i = 0; i < 5; i++) {
         const uint32_t b_frame = build_packet_stream(80);
-        const Events_t e = run(80, offsets[i], 100.0, NULL, 0);
+        const Events_t e = run(80, offsets[i], 100.0, NULL, 0, false);
         char label[48];
         snprintf(label, sizeof label, "clean, window %+.0f samples", offsets[i]);
         print_events(label, e);
@@ -132,7 +143,7 @@ static void test_noise(void) {
     for (unsigned i = 0; i < 4; i++) {
         chirp_channel_seed(30 + i);
         const uint32_t b_frame = build_packet_stream(80);
-        const Events_t e = run(80, 100.0, snrs[i], NULL, 0);
+        const Events_t e = run(80, 100.0, snrs[i], NULL, 0, false);
         char label[48];
         snprintf(label, sizeof label, "clean, %+.0f dB", snrs[i]);
         print_events(label, e);
@@ -151,7 +162,7 @@ static void test_room(void) {
     for (unsigned i = 0; i < 3; i++) {
         chirp_channel_seed(40 + i);
         const uint32_t b_frame = build_packet_stream(80);
-        const Events_t e = run(80, 0.0, snrs[i], room_echoes, 3);
+        const Events_t e = run(80, 0.0, snrs[i], room_echoes, 3, false);
         char label[48];
         snprintf(label, sizeof label, "room, %s", snrs[i] > 90.0 ? "no noise" : (snrs[i] == 0.0 ? "0 dB" : "-6 dB"));
         print_events(label, e);
@@ -167,7 +178,7 @@ static void test_room(void) {
 static void test_spacing(void) {
     rig_setup_spacing(2);
     const uint32_t b_frame = build_packet_stream(80);
-    const Events_t e = run(80, 100.0, -6.0, room_echoes, 3);
+    const Events_t e = run(80, 100.0, -6.0, room_echoes, 3, false);
     print_events("room, -6 dB, 2 bins/symbol", e);
     CHECK_EQ_U(e.trained, 1);
     if (e.trained) {
@@ -182,7 +193,7 @@ static void test_noise_only(void) {
     rig_setup_spacing(1);
     for (uint32_t k = 0; k < 2000; k++) stream[k] = CHIRP_CHANNEL_SILENT;
     chirp_channel_seed(50);
-    const Events_t e = run(2000, 0.0, 0.0, NULL, 0); // Noise at the level of a 0 dB signal
+    const Events_t e = run(2000, 0.0, 0.0, NULL, 0, false); // Noise at the level of a 0 dB signal
     print_events("noise only, 2000 frames", e);
     CHECK_EQ_U(e.locked, 0);
     CHECK_EQ_U(e.trained, 0);
@@ -195,11 +206,52 @@ static void test_steady_tone(void) {
     // Shift the packet back by 100 frames and put a held symbol 20 in front
     for (int32_t k = 199; k >= 100; k--) stream[k] = stream[k - 100];
     for (uint32_t k = 0; k < 100; k++) stream[k] = k < 90 ? 20 : CHIRP_CHANNEL_SILENT;
-    const Events_t e = run(200, 0.0, -3.0, NULL, 0);
+    const Events_t e = run(200, 0.0, -3.0, NULL, 0, false);
     print_events("90 frames of tone, then a packet", e);
     CHECK(e.tone >= 1);
     CHECK_EQ_U(e.trained, 1);
     if (e.trained) CHECK_EQ_U(e.last_trained.b_start_frame, b_frame);
+}
+
+// Window alignment from A: whatever the window's offset, after the move it
+// sits on the earliest path (within half a bin, 8 samples), B lands on the
+// right frame with one symbol per frame, and the learned paths sit at 0
+static void test_alignment(void) {
+    rig_setup_spacing(1);
+    const double offsets[] = { 37.0, -200.0, 300.0, 500.0, -500.0 };
+    for (unsigned i = 0; i < 5; i++) {
+        const uint32_t b_frame = build_packet_stream(80);
+        const Events_t e = run(80, offsets[i], 100.0, NULL, 0, true);
+        char label[48];
+        snprintf(label, sizeof label, "aligned, clean, window %+.0f", offsets[i]);
+        print_events(label, e);
+        printf("    moved %+d bins, window now %+.0f samples\n", e.last_align, e.final_offset);
+        CHECK(fabs(e.final_offset) <= 8.0);
+        CHECK_EQ_U(e.trained, 1);
+        CHECK_EQ_U(e.failed, 0);
+        if (e.trained) {
+            CHECK_EQ_U(e.last_trained.b_start_frame, b_frame);
+            CHECK(e.last_trained.coherence > 0.9);
+            CHECK(abs(e.last_trained.strongest_offset) <= 1);
+        }
+    }
+    // The room, noisy: aligns on the direct path, not the strongest echo
+    const double snrs[] = { 0.0, -6.0 };
+    for (unsigned i = 0; i < 2; i++) {
+        chirp_channel_seed(60 + i);
+        const uint32_t b_frame = build_packet_stream(80);
+        const Events_t e = run(80, 300.0, snrs[i], room_echoes, 3, true);
+        char label[48];
+        snprintf(label, sizeof label, "aligned, room, window +300, %+.0f dB", snrs[i]);
+        print_events(label, e);
+        printf("    moved %+d bins, window now %+.0f samples\n", e.last_align, e.final_offset);
+        CHECK(fabs(e.final_offset) <= 24.0);
+        CHECK_EQ_U(e.trained, 1);
+        if (e.trained) {
+            CHECK_EQ_U(e.last_trained.b_start_frame, b_frame);
+            CHECK(abs(e.last_trained.earliest_offset) <= 1);
+        }
+    }
 }
 
 int main(void) {
@@ -211,6 +263,7 @@ int main(void) {
     RUN_TEST(test_spacing);
     RUN_TEST(test_noise_only);
     RUN_TEST(test_steady_tone);
+    RUN_TEST(test_alignment);
 
     printf("\n%d checks, %d failures\n", test_checks, test_failures);
     return test_failures ? 1 : 0;

@@ -3,7 +3,8 @@
 Status: the transmitter (`packet_tx`, all of the layout below) and the
 receiver's first stage (`packet_rx`: SEARCH, LOCK, TRAIN) are implemented
 and tested in the host model and between two boards (10/10 packets found in
-each direction). HEADER, PAYLOAD and CHECK, and window alignment, are next.
+each direction), including window alignment from A. HEADER, PAYLOAD and
+CHECK are next.
 Numbers in *italics* are still guesses.
 
 ## Background: what the measurements say
@@ -117,7 +118,7 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PA
 
 | State | Each frame | Leaves when |
 |---|---|---|
-| SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 3 frames in a row → LOCK |
+| SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 3 frames in a row → LOCK, measuring how far the window is out from the agreeing A frames (main.c then moves it; key `a` turns that off) |
 | LOCK | correlate with A's average spectrum | below 0.4 → TRAIN (B has started); over 16 frames → a steady tone, ignored until it changes |
 | TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths → (for now) SEARCH; else → SEARCH |
 | HEADER | matched decisions; collect 16 bits; check CRC-8 | CRC-8 good → PAYLOAD; bad → SEARCH |
@@ -132,14 +133,25 @@ Measured so far: in the model, preambles are found down to −12 dB, and
 0.5–0.63 with the windows 224–352 samples out of line (0.99 for one board
 hearing itself), and the learned shapes repeated packet after packet.
 
-**Known limitation:** near half a frame out of line, B's start is ambiguous
-by one frame. Aligning the window before B (option (a) below) cures it.
+**Window alignment (done):** A's frames all hold the same symbol, so
+however far the window is out they don't mix two symbols, and A's path
+shape is clean. On entering LOCK the receiver takes the earliest strong path
+from the agreeing A frames and main.c moves the window that many bins
+(16 samples each) so it sits on it, from the next frame, before B starts.
+Without the move, near half a frame out B's start was ambiguous by one
+frame. In the model every offset (±500 samples) now ends within 8 samples
+of the direct path, with B's coherence 1.00 on a clean channel (0.47 at
++500 unaligned).
 
-**Order problem to solve:** the window should be frame-aligned *before* B is
-learned, but the full offset is only certain after B. Options: (a) align
-on A's estimate of *r* when entering TRAIN, then correct any residual from
-B (moving the learned shape round by the same amount); (b) learn B at
-whatever alignment and move the window after B. I'd start with (a).
+Between the boards (2026-11-17), 10 packets each way:
+
+| | First lock moved the window | Later locks | B coherence | Learned paths |
+|---|---|---|---|---|
+| Board 1 → 2 | −19 bins (304 samples) | all 0 | 0.81–0.84 (was 0.60–0.63) | 0 strongest, −1/−2 at a third, +21 at a tenth |
+| Board 2 → 1 | +28 bins (448 samples) | 0, one −1 trim | 0.81–0.86 (was 0.49–0.54) | −1/−2 strongest, earliest 0 |
+
+The one-bin trim came from a path near the 6 dB threshold flipping in and
+out; hysteresis could stop that if it matters.
 
 **Which path to align to:** aligning to the earliest strong copy (direct
 path) means late copies carry a little of the previous symbol; the other

@@ -34,9 +34,16 @@
  * "earliest" path is therefore only looked for within
  * PACKET_RX_EARLIEST_SPAN bins above the strongest.
  *
- * Known limitation: with the window near half a frame out, B's start is
- * ambiguous by one frame (B is then read with every frame mixing two
- * symbols). Aligning the window from A's estimate before B is the cure.
+ * Window alignment: A's frames all hold the same symbol, so however far the
+ * window is out they don't mix two symbols. On entering LOCK the receiver
+ * learns the path shape from the agreeing A frames and reports, with
+ * PACKET_RX_EVENT_LOCKED, how far the window is out (align_bins: the
+ * earliest strong path's offset). The caller may move its window by that
+ * many bins (later paths keep their place relative to it) and must then
+ * call packet_rx_window_moved() so the receiver's reference follows. B is
+ * then read with the window in line, so each B frame holds one symbol.
+ * Without the move, near half a frame out B's start is ambiguous by one
+ * frame (every B frame mixes two symbols).
  *
  * No memory is allocated; the caller provides PACKET_RX_STORAGE_LEN(bins)
  * floats and a channel template.
@@ -68,7 +75,7 @@ typedef enum {
 
 typedef enum {
     PACKET_RX_EVENT_NONE = 0,
-    PACKET_RX_EVENT_LOCKED,       // Entered LOCK (a held symbol)
+    PACKET_RX_EVENT_LOCKED,       // Entered LOCK (a held symbol); see align_bins
     PACKET_RX_EVENT_TRAINED,      // B found and learned; see the status fields
     PACKET_RX_EVENT_TRAIN_FAILED, // The change after A was not B
     PACKET_RX_EVENT_TONE,         // A held symbol went on too long; ignored until it changes
@@ -79,6 +86,9 @@ typedef struct {
     PacketRxEvent_t event;        // What happened on this frame
     uint32_t frame;               // Frames processed so far
     float32_t correlation;        // This frame against the previous one (SEARCH) or A (LOCK)
+    // Set with PACKET_RX_EVENT_LOCKED (and kept until the next one):
+    int32_t align_bins;           // Earliest strong path in A, bins from the window's position: the
+                                  // window is this many bins late (move it earlier to correct)
     // Set with PACKET_RX_EVENT_TRAINED (and kept until the next one):
     float32_t coherence;          // How well the B frames agreed at the chosen start (0..1)
     int32_t start_adjust;         // Chosen B start relative to the frame where the change was seen
@@ -116,5 +126,9 @@ void packet_rx_reset(PacketRx_t *rx);
 
 // Processes one frame's folded power spectrum (bins values)
 const PacketRxStatus_t *packet_rx_frame(PacketRx_t *rx, const float32_t *folded_power);
+
+// The caller has moved its window 'bins' bins earlier (bins * frame / bins
+// samples) from the next frame on: what was at bin k is now at bin k - bins
+void packet_rx_window_moved(PacketRx_t *rx, int32_t bins);
 
 #endif // PACKET_RX_H
