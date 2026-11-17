@@ -54,6 +54,7 @@ static const float32_t chirp_vol = 0.04f; // About -28 dBFS. TODO: make this run
 #define RX_RECORD_QUEUE_CAPACITY 64u // Must be a power of two
 #define TX_PACKET_QUEUE_CAPACITY 2u  // Packets waiting to be sent; must be a power of two
 #define TEST_PACKET_LENGTH 16u       // Payload of the packet queued by the 's' key
+#define RX_PACKET_QUEUE_CAPACITY 4u  // Received packets waiting for core 0; must be a power of two
 // The packet receiver also runs while this board is transmitting, so a single
 // board hears its own packets (useful for testing). Set to 0 for half duplex.
 #define PACKET_RX_WHILE_TRANSMITTING 1
@@ -136,6 +137,18 @@ typedef struct {
 
 static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
 static SpscRing_t rx_record_queue;
+
+// A packet received by core 1 (good or bad), for core 0. Pushed just before
+// the record whose packet.event is PACKET_RX_EVENT_PACKET; that record's
+// packet fields hold the details (CRC, margins).
+typedef struct {
+    uint32_t length;
+    uint8_t payload[PACKET_MAX_PAYLOAD];
+} RxPacket_t;
+
+static uint8_t rx_packet_storage[SPSC_RING_STORAGE_LEN(sizeof(RxPacket_t), RX_PACKET_QUEUE_CAPACITY)];
+static SpscRing_t rx_packet_queue;
+static volatile uint32_t rx_packets_dropped = 0; // Received packets lost because the queue was full
 
 static uint8_t tx_packet_storage[SPSC_RING_STORAGE_LEN(sizeof(TxPacketRequest_t), TX_PACKET_QUEUE_CAPACITY)];
 static SpscRing_t tx_packet_queue;
@@ -270,6 +283,8 @@ static const char *packet_state_name(PacketRxState_t state) {
         case PACKET_RX_SEARCH: return "search";
         case PACKET_RX_LOCK:   return "lock";
         case PACKET_RX_TRAIN:  return "train";
+        case PACKET_RX_HEADER:  return "header";
+        case PACKET_RX_PAYLOAD: return "payload";
     }
     return "?";
 }
@@ -388,14 +403,24 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
 
     // Packet receiver (optionally not while this board is sending a packet)
     if (PACKET_RX_WHILE_TRANSMITTING || !packet_tx_busy(&packet_tx)) {
-        record.packet = *packet_rx_frame(&packet_rx, chirp_decoder.folded_power_buffer);
-        // Preamble A found: move the window onto the earliest path (from the next frame)
-        if (packet_align && record.packet.event == PACKET_RX_EVENT_LOCKED && record.packet.align_bins != 0) {
-            const int32_t move = record.packet.align_bins * (int32_t)(FFT_SIZE / CHIRP_BINS); // Samples earlier
+        const float32_t centre_bins = record.symbol.angle * (float32_t)CHIRP_BINS / (2.0f * (float32_t)M_PI);
+        record.packet = *packet_rx_frame(&packet_rx, chirp_decoder.folded_power_buffer, centre_bins);
+        // Preamble A found: move the window onto the earliest path, with its
+        // energy on a bin centre (from the next frame)
+        const int32_t move = (int32_t)lroundf(
+            ((float32_t)record.packet.align_bins + record.packet.align_fraction) * (float32_t)(FFT_SIZE / CHIRP_BINS)); // Samples earlier
+        if (packet_align && record.packet.event == PACKET_RX_EVENT_LOCKED && move != 0) {
             const uint32_t delay = (uint32_t)(((int32_t)record.delay + move) % (int32_t)FFT_SIZE + (int32_t)FFT_SIZE) % FFT_SIZE;
             rx_sample_window_set_delay(&rx_window, delay);
             packet_rx_window_moved(&packet_rx, record.packet.align_bins);
             symbol_timing_tracker_reset(&timing_tracker, delay);
+        }
+        // A complete packet: to core 0 ahead of this frame's record
+        if (record.packet.event == PACKET_RX_EVENT_PACKET) {
+            static RxPacket_t rx_packet; // Static: core 1's stack is small
+            rx_packet.length = record.packet.length;
+            memcpy(rx_packet.payload, packet_rx_payload(&packet_rx), rx_packet.length);
+            if (!spsc_ring_push(&rx_packet_queue, &rx_packet)) rx_packets_dropped++;
         }
     } else {
         packet_rx_reset(&packet_rx);
@@ -501,6 +526,13 @@ static void __not_in_flash_func(core1_main)(void) {
     }
 }
 
+// Core 0: received packets, for the display
+static struct {
+    uint32_t good, bad, header_failed;
+    char last_text[PACKET_MAX_PAYLOAD * 4 + 1]; // Last payload, printable (\xNN for other bytes)
+    PacketRxStatus_t last;
+} rx_packet_stats;
+
 // Core 0: redraw the terminal display. Always prints the same number of rows.
 static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *record, uint32_t records_received) {
     if (display_folded) {
@@ -545,8 +577,14 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
             packet_state_name(record->packet.state), record->packet.correlation,
             (unsigned long)found, (unsigned long)failed, (unsigned long)last.b_start_frame, last.coherence,
             (long)last.strongest_offset, (long)last.earliest_offset);
-        printf("Packet align %-3s  last lock: window %+ld bins out          \n",
-            packet_align ? "on" : "off", (long)record->packet.align_bins);
+        printf("Packet align %-3s  last lock: window %+.2f bins out          \n",
+            packet_align ? "on" : "off", (double)((float32_t)record->packet.align_bins + record->packet.align_fraction));
+        printf("Packets good %lu bad %lu header failed %lu dropped %lu  last: %s margin %.2f weak %lu \"%.40s\"          \n",
+            (unsigned long)rx_packet_stats.good, (unsigned long)rx_packet_stats.bad,
+            (unsigned long)rx_packet_stats.header_failed, (unsigned long)rx_packets_dropped,
+            rx_packet_stats.good + rx_packet_stats.bad == 0 ? "-" : (rx_packet_stats.last.crc_ok ? "ok" : "BAD"),
+            rx_packet_stats.last.min_margin, (unsigned long)rx_packet_stats.last.weak_symbols,
+            rx_packet_stats.last_text);
     }
     printf("Frames %lu  missed rx %lu tx %lu  dropped records %lu          \n",
         (unsigned long)records_received,
@@ -563,7 +601,7 @@ static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *recor
 static bool logging = false;
 
 static void print_log_header(void) {
-    printf("# chirp receiver log v5\n");
+    printf("# chirp receiver log v6\n");
     printf("# sample_rate=%.1f fft_size=%u bins=%u bins_per_symbol=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol_step=%u\n",
         FS, (unsigned)FFT_SIZE, (unsigned)CHIRP_BINS, (unsigned)BINS_PER_SYMBOL, (unsigned)NUM_SYMBOLS,
         F0, BW, (unsigned)(FFT_SIZE / NUM_SYMBOLS));
@@ -575,7 +613,9 @@ static void print_log_header(void) {
     printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");
     printf("# packet_*: packet receiver (packet_rx.h) after this frame; packet_event 2 = preamble found (b_start, paths);\n");
     printf("# s<k>: channel shape it last learned, by bin offset k from the window position\n");
-    printf("# packet_align: at the last lock, bins the window was late (moved by that if packet_align_on)\n");
+    printf("# packet_data_symbol/margin: last data symbol decided and its margin (best/second score)\n");
+    printf("# '# packet' lines: a received packet (after its frame's row); '# packet header failed': bad CRC-8\n");
+    printf("# packet_align (+ packet_align_fraction): at the last lock, bins the window was late (moved by that if packet_align_on)\n");
     printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
            "timing_error,timing_rate,rx_missed,tx_missed,dropped");
     for (int32_t k = -(int32_t)CHIRP_BINS; k < (int32_t)CHIRP_BINS; k++) {
@@ -588,7 +628,7 @@ static void print_log_header(void) {
     for (uint32_t k = 0; k < CHIRP_BINS; k++) {
         printf(",s%lu", (unsigned long)k);
     }
-    printf(",packet_align,packet_align_on\n");
+    printf(",packet_align,packet_align_on,packet_data_symbol,packet_data_margin,packet_align_fraction\n");
 }
 
 static void print_log_record(const RxFrameRecord_t *record) {
@@ -622,7 +662,29 @@ static void print_log_record(const RxFrameRecord_t *record) {
     for (uint32_t i = 0; i < CHIRP_BINS; i++) {
         printf(",%.3e", record->packet_shape[i]);
     }
-    printf(",%+ld,%u\n", (long)record->packet.align_bins, (unsigned)packet_align);
+    printf(",%+ld,%u,%lu,%.3f", (long)record->packet.align_bins, (unsigned)packet_align,
+        (unsigned long)record->packet.data_symbol, record->packet.data_margin);
+    printf(",%+.3f\n", record->packet.align_fraction);
+}
+
+// Core 0: a received packet; logged as a comment line when logging
+static void note_rx_packet(const RxFrameRecord_t *record, const RxPacket_t *packet) {
+    const PacketRxStatus_t *st = &record->packet;
+    if (st->crc_ok) rx_packet_stats.good++; else rx_packet_stats.bad++;
+    rx_packet_stats.last = *st;
+    char *t = rx_packet_stats.last_text;
+    for (uint32_t i = 0; i < packet->length; i++) {
+        const uint8_t c = packet->payload[i];
+        if (c >= 0x20 && c < 0x7F && c != '\\') *t++ = (char)c;
+        else t += sprintf(t, "\\x%02X", c);
+    }
+    *t = 0;
+    if (logging) {
+        printf("# packet frame=%lu crc_ok=%u length=%lu data_symbols=%lu min_margin=%.3f weakest=%lu weak=%lu payload=%s\n",
+            (unsigned long)record->frame, (unsigned)st->crc_ok, (unsigned long)st->length,
+            (unsigned long)st->data_count, st->min_margin, (unsigned long)st->weakest_symbol,
+            (unsigned long)st->weak_symbols, rx_packet_stats.last_text);
+    }
 }
 
 // Core 0: queues a 16-byte test packet ("chirp packet NNN", NNN counting up)
@@ -731,6 +793,7 @@ int main() {
 
     // Everything shared between the cores is initialized before core 1 starts
     spsc_ring_init(&rx_record_queue, rx_record_storage, sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY);
+    spsc_ring_init(&rx_packet_queue, rx_packet_storage, sizeof(RxPacket_t), RX_PACKET_QUEUE_CAPACITY);
     spsc_ring_init(&tx_packet_queue, tx_packet_storage, sizeof(TxPacketRequest_t), TX_PACKET_QUEUE_CAPACITY);
     frame_snapshot_init(&spectrum_snapshot, spectrum_snapshot_buffer, FFT_SIZE);
     rx_sample_window_init(
@@ -774,6 +837,13 @@ int main() {
         while (spsc_ring_pop(&rx_record_queue, &record)) {
             if (logging) {
                 print_log_record(&record);
+            }
+            if (record.packet.event == PACKET_RX_EVENT_PACKET) {
+                static RxPacket_t rx_packet;
+                if (spsc_ring_pop(&rx_packet_queue, &rx_packet)) note_rx_packet(&record, &rx_packet);
+            } else if (record.packet.event == PACKET_RX_EVENT_HEADER_FAILED) {
+                rx_packet_stats.header_failed++;
+                if (logging) printf("# packet header failed: length byte %lu\n", (unsigned long)record.packet.length);
             }
             latest_record = record;
             records_received++;

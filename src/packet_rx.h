@@ -6,13 +6,24 @@
  *
  * Packet receiver, first stage: finds a packet's preamble (packet_format.h)
  * and learns the channel from it. Runs once per received frame on the
- * decoder's folded power spectrum. States so far:
+ * decoder's folded power spectrum. States:
  *
  *   SEARCH  waiting for a held symbol (preamble A): consecutive spectra
  *           that look alike
  *   LOCK    in A; waiting for the spectrum to change (the start of B)
  *   TRAIN   collecting B; then finds exactly which frame B started on, and
  *           learns the channel's shape from the B frames (channel_template)
+ *   HEADER  decides data symbols with the learned shape, until the header's
+ *           16 bits are in; checks its CRC-8 (bad: back to SEARCH)
+ *   PAYLOAD decides the rest; when the last symbol is in, descrambles the
+ *           payload, checks the CRC-16 and reports the packet (good or bad)
+ *           with PACKET_RX_EVENT_PACKET; back to SEARCH
+ *
+ * Data symbols are decided by channel_template_decide: each candidate
+ * symbol's score is the correlation of the frame with the learned shape
+ * moved to that symbol, so reflections count for the symbol rather than
+ * against it. The margin is best / second-best score; low margins mark the
+ * decisions most likely to be wrong.
  *
  * It works from spectra, not decoded symbols, because in a room the
  * strongest bin is often a reflection: "looks alike" is the correlation of
@@ -37,10 +48,14 @@
  * Window alignment: A's frames all hold the same symbol, so however far the
  * window is out they don't mix two symbols. On entering LOCK the receiver
  * learns the path shape from the agreeing A frames and reports, with
- * PACKET_RX_EVENT_LOCKED, how far the window is out (align_bins: the
- * earliest strong path's offset). The caller may move its window by that
- * many bins (later paths keep their place relative to it) and must then
- * call packet_rx_window_moved() so the receiver's reference follows. B is
+ * PACKET_RX_EVENT_LOCKED, how far the window is out: align_bins, the
+ * earliest strong path's offset in whole bins, plus align_fraction, where
+ * the energy sits within a bin (the decoder's refined centre, averaged over
+ * the same frames). The caller may move its window by the sum and must then
+ * call packet_rx_window_moved() with the whole bins so the receiver's
+ * reference follows. The fraction matters: with the energy half a bin off a
+ * bin centre it splits between neighbouring bins, and between the boards
+ * nearly every data decision then came down to two adjacent symbols. B is
  * then read with the window in line, so each B frame holds one symbol.
  * Without the move, near half a frame out B's start is ambiguous by one
  * frame (every B frame mixes two symbols).
@@ -53,6 +68,7 @@
 #include <stdint.h>
 #include "arm_math.h"
 #include "channel_template.h"
+#include "packet_format.h"
 
 #define PACKET_RX_HISTORY 16u // Frames of folded power kept (B plus a margin either side)
 #define PACKET_RX_STORAGE_LEN(bins) ((PACKET_RX_HISTORY + 2u) * (bins))
@@ -66,11 +82,14 @@
 #define PACKET_RX_MIN_COHERENCE      0.3f  // Below this B is not accepted
 #define PACKET_RX_PATH_FRACTION      0.25f // Paths within 6 dB of the strongest count as "strong"
 #define PACKET_RX_EARLIEST_SPAN      20    // The earliest strong path is looked for this many bins above the strongest
+#define PACKET_RX_WEAK_MARGIN        1.2f  // Data decisions with a margin below this are counted as weak
 
 typedef enum {
     PACKET_RX_SEARCH = 0,
     PACKET_RX_LOCK = 1,
     PACKET_RX_TRAIN = 2,
+    PACKET_RX_HEADER = 3,
+    PACKET_RX_PAYLOAD = 4,
 } PacketRxState_t;
 
 typedef enum {
@@ -79,6 +98,8 @@ typedef enum {
     PACKET_RX_EVENT_TRAINED,      // B found and learned; see the status fields
     PACKET_RX_EVENT_TRAIN_FAILED, // The change after A was not B
     PACKET_RX_EVENT_TONE,         // A held symbol went on too long; ignored until it changes
+    PACKET_RX_EVENT_HEADER_FAILED, // The header's CRC-8 was wrong
+    PACKET_RX_EVENT_PACKET,       // A packet is complete; see the packet fields and packet_rx_payload()
 } PacketRxEvent_t;
 
 typedef struct {
@@ -89,6 +110,8 @@ typedef struct {
     // Set with PACKET_RX_EVENT_LOCKED (and kept until the next one):
     int32_t align_bins;           // Earliest strong path in A, bins from the window's position: the
                                   // window is this many bins late (move it earlier to correct)
+    float32_t align_fraction;     // Plus this much of a bin (-0.5 .. 0.5): where A's energy sits
+                                  // relative to the nearest bin centre
     // Set with PACKET_RX_EVENT_TRAINED (and kept until the next one):
     float32_t coherence;          // How well the B frames agreed at the chosen start (0..1)
     int32_t start_adjust;         // Chosen B start relative to the frame where the change was seen
@@ -96,6 +119,17 @@ typedef struct {
     int32_t strongest_offset;     // Strongest path, bins from the window's position (-bins/2 .. bins/2-1)
     int32_t earliest_offset;      // Earliest path within 6 dB of the strongest (and within
                                   // PACKET_RX_EARLIEST_SPAN bins above it), same units
+    // In HEADER and PAYLOAD: the last data symbol decided (on this frame or
+    // just before), and its margin
+    uint32_t data_symbol;
+    float32_t data_margin;
+    uint32_t data_count;          // Data symbols decided so far in this packet
+    // Set with PACKET_RX_EVENT_HEADER_FAILED / PACKET (and kept until the next one):
+    uint32_t length;              // Payload length from the header
+    bool crc_ok;                  // CRC-16 good (PACKET only)
+    float32_t min_margin;         // Lowest data decision margin in the packet
+    uint32_t weakest_symbol;      // Which data symbol it was (0 = first after B)
+    uint32_t weak_symbols;        // Data decisions with a margin below PACKET_RX_WEAK_MARGIN
 } PacketRxStatus_t;
 
 typedef struct {
@@ -110,6 +144,11 @@ typedef struct {
     uint32_t lock_frames;         // LOCK: frames so far
     bool tone;                    // Ignoring a steady tone until it changes
     uint32_t change_frame;        // Frame where LOCK saw the change
+    uint32_t next_data_frame;     // HEADER, PAYLOAD: next frame to decide
+    float32_t centre[PACKET_RX_HISTORY]; // The decoder's refined centre per frame (bins, ring)
+    uint32_t data_total;          // PAYLOAD: data symbols in this packet
+    uint32_t bit_count;           // Bits collected into bytes
+    uint8_t bytes[PACKET_MAX_BYTES]; // Header, payload (descrambled once complete), CRC-16
     PacketRxStatus_t status;
 } PacketRx_t;
 
@@ -124,8 +163,14 @@ void packet_rx_init(
 // Back to SEARCH (keeps the frame count)
 void packet_rx_reset(PacketRx_t *rx);
 
-// Processes one frame's folded power spectrum (bins values)
-const PacketRxStatus_t *packet_rx_frame(PacketRx_t *rx, const float32_t *folded_power);
+// Processes one frame's folded power spectrum (bins values). centre_bins:
+// the decoder's refined centre for the frame (its angle), in bins; only its
+// fraction of a bin is used
+const PacketRxStatus_t *packet_rx_frame(PacketRx_t *rx, const float32_t *folded_power, float32_t centre_bins);
+
+// After PACKET_RX_EVENT_PACKET: the payload (status.length bytes), valid
+// until the next frame is processed
+const uint8_t *packet_rx_payload(const PacketRx_t *rx);
 
 // The caller has moved its window 'bins' bins earlier (bins * frame / bins
 // samples) from the next frame on: what was at bin k is now at bin k - bins

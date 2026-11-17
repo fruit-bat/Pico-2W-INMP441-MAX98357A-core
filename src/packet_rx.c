@@ -1,3 +1,4 @@
+#include <math.h>
 #include <string.h>
 #include "packet_rx.h"
 #include "packet_format.h"
@@ -122,6 +123,17 @@ static void __not_in_flash_func(measure_alignment)(PacketRx_t *rx, uint32_t fram
     int32_t strongest, earliest;
     find_paths(rx, shape, &strongest, &earliest);
     rx->status.align_bins = earliest;
+
+    // Fraction of a bin: mean of the centres on a one-bin circle, so
+    // values either side of a bin edge (+0.49, -0.49) average correctly
+    const float32_t two_pi = 6.28318531f;
+    float32_t c = 0.0f, s = 0.0f;
+    for (uint32_t i = 0; i <= PACKET_RX_LOCK_FRAMES; i++) {
+        const float32_t x = rx->centre[(frame - i) % PACKET_RX_HISTORY];
+        c += cosf(two_pi * x);
+        s += sinf(two_pi * x);
+    }
+    rx->status.align_fraction = atan2f(s, c) / two_pi;
 }
 
 // Moves a vector's contents 'bins' bins lower (what was at k goes to k - bins)
@@ -171,15 +183,79 @@ static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
     st->b_start_frame = start;
     st->strongest_offset = strongest;
     st->earliest_offset = earliest;
+
+    // The data symbols follow B
+    st->state = PACKET_RX_HEADER;
+    rx->next_data_frame = start + PACKET_B_LEN;
+    rx->bit_count = 0;
+    memset(rx->bytes, 0, sizeof(rx->bytes));
+    st->data_count = 0;
+    st->min_margin = 1e9f;
+    st->weakest_symbol = 0;
+    st->weak_symbols = 0;
 }
 
-const PacketRxStatus_t *__not_in_flash_func(packet_rx_frame)(PacketRx_t *rx, const float32_t *folded_power) {
+const uint8_t *packet_rx_payload(const PacketRx_t *rx) {
+    return &rx->bytes[PACKET_HEADER_BYTES];
+}
+
+static void back_to_search(PacketRx_t *rx) {
+    rx->status.state = PACKET_RX_SEARCH;
+    rx->agree = 0;
+    rx->tone = false;
+}
+
+// Decides the data symbol in one frame and adds its bits (MSB first); then
+// checks the header or finishes the packet when enough are in
+static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *folded_power) {
+    PacketRxStatus_t *st = &rx->status;
+    const uint32_t b = rx->bits_per_symbol;
+    float32_t margin;
+    const uint32_t symbol = channel_template_decide(
+        rx->tmpl, folded_power, 0, rx->bins_per_symbol, 1u << b, &margin);
+    st->data_symbol = symbol;
+    st->data_margin = margin;
+    if (margin < st->min_margin) {
+        st->min_margin = margin;
+        st->weakest_symbol = st->data_count;
+    }
+    if (margin < PACKET_RX_WEAK_MARGIN) st->weak_symbols++;
+    st->data_count++;
+    for (uint32_t k = b; k-- > 0;) {
+        const uint32_t byte = rx->bit_count / 8u;
+        if (byte < PACKET_MAX_BYTES) rx->bytes[byte] |= (uint8_t)(((symbol >> k) & 1u) << (7u - rx->bit_count % 8u));
+        rx->bit_count++;
+    }
+
+    if (st->state == PACKET_RX_HEADER && rx->bit_count >= 8u * PACKET_HEADER_BYTES) {
+        st->length = rx->bytes[0];
+        if (packet_crc8(rx->bytes, 1) != rx->bytes[1]) {
+            st->event = PACKET_RX_EVENT_HEADER_FAILED;
+            back_to_search(rx);
+            return;
+        }
+        st->state = PACKET_RX_PAYLOAD;
+        rx->data_total = packet_symbol_count(st->length, b) - PACKET_PREAMBLE_LEN;
+    }
+    if (st->state == PACKET_RX_PAYLOAD && st->data_count >= rx->data_total) {
+        const uint32_t len = st->length;
+        packet_scramble(&rx->bytes[PACKET_HEADER_BYTES], len);
+        const uint16_t crc = packet_crc16(rx->bytes, PACKET_HEADER_BYTES + len);
+        const uint16_t sent = (uint16_t)((rx->bytes[PACKET_HEADER_BYTES + len] << 8) | rx->bytes[PACKET_HEADER_BYTES + len + 1u]);
+        st->crc_ok = crc == sent;
+        st->event = PACKET_RX_EVENT_PACKET;
+        back_to_search(rx);
+    }
+}
+
+const PacketRxStatus_t *__not_in_flash_func(packet_rx_frame)(PacketRx_t *rx, const float32_t *folded_power, float32_t centre_bins) {
     PacketRxStatus_t *st = &rx->status;
     const uint32_t n = rx->bins;
     const uint32_t frame = st->frame;
     st->event = PACKET_RX_EVENT_NONE;
 
     memcpy(history_frame(rx, frame), folded_power, n * sizeof(*folded_power));
+    rx->centre[frame % PACKET_RX_HISTORY] = centre_bins;
     float32_t v[64];
     if (n > 64) return st;
     correlation_vector(rx, folded_power, v);
@@ -230,11 +306,20 @@ const PacketRxStatus_t *__not_in_flash_func(packet_rx_frame)(PacketRx_t *rx, con
             st->correlation = dot(v, rx->previous, n);
             if (frame >= rx->change_frame + PACKET_B_LEN - 1u + (uint32_t)PACKET_RX_START_SEARCH) {
                 finish_training(rx);
-                st->state = PACKET_RX_SEARCH; // For now; the header comes next
-                rx->agree = 0;
-                rx->tone = false;
+                if (st->state == PACKET_RX_TRAIN) back_to_search(rx); // B not found
             }
             break;
+
+        case PACKET_RX_HEADER:
+        case PACKET_RX_PAYLOAD:
+            st->correlation = dot(v, rx->previous, n);
+            break;
+    }
+
+    // Data frames, including any that arrived while B was being placed
+    while ((st->state == PACKET_RX_HEADER || st->state == PACKET_RX_PAYLOAD) && rx->next_data_frame <= frame) {
+        decide_data(rx, history_frame(rx, rx->next_data_frame));
+        rx->next_data_frame++;
     }
 
     memcpy(rx->previous, v, n * sizeof(*v));

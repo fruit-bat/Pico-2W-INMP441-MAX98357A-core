@@ -1,10 +1,9 @@
 # Packet format and receiver states — DRAFT for review
 
-Status: the transmitter (`packet_tx`, all of the layout below) and the
-receiver's first stage (`packet_rx`: SEARCH, LOCK, TRAIN) are implemented
-and tested in the host model and between two boards (10/10 packets found in
-each direction), including window alignment from A. HEADER, PAYLOAD and
-CHECK are next.
+Status: the transmitter (`packet_tx`) and receiver (`packet_rx`: all the
+states below) are implemented and tested in the host model and between two
+boards: 30/30 16-byte packets intact in each direction (2026-11-17), with
+the window aligned from A to within about a sample.
 Numbers in *italics* are still guesses.
 
 ## Background: what the measurements say
@@ -120,13 +119,15 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PA
 |---|---|---|
 | SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 3 frames in a row → LOCK, measuring how far the window is out from the agreeing A frames (main.c then moves it; key `a` turns that off) |
 | LOCK | correlate with A's average spectrum | below 0.4 → TRAIN (B has started); over 16 frames → a steady tone, ignored until it changes |
-| TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths → (for now) SEARCH; else → SEARCH |
-| HEADER | matched decisions; collect 16 bits; check CRC-8 | CRC-8 good → PAYLOAD; bad → SEARCH |
+| TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths → HEADER (deciding any data frames already in); else → SEARCH |
+| HEADER | matched decisions (`channel_template_decide`); collect 16 bits; check CRC-8 | CRC-8 good → PAYLOAD; bad → SEARCH |
 | PAYLOAD | matched decisions; collect the payload and CRC bits | all symbols received → CHECK |
-| CHECK | CRC-16 | publish the packet (good or bad, with per-symbol margins) on the record queue to core 0; → SEARCH |
+| CHECK | descramble, CRC-16 (done in the same frame as the last symbol) | report the packet (good or bad) with its lowest margin, which symbol that was, and how many were below 1.2; main.c puts the payload on its own queue to core 0 → SEARCH |
 
-Timing tracking continues through HEADER and PAYLOAD (decision directed, on
-the matched decisions).
+No timing tracking during the data yet: the crystals agree to 0.6 ppm, about
+0.2 samples over the longest packet, and each packet re-aligns from its A.
+Core 0 shows good/bad counts and the last payload on the display, and
+writes a `# packet ...` comment line into the log for each packet.
 
 Measured so far: in the model, preambles are found down to −12 dB, and
 2000 frames of noise never lock. Between the boards the coherence was
@@ -152,6 +153,32 @@ Between the boards (2026-11-17), 10 packets each way:
 
 The one-bin trim came from a path near the 6 dB threshold flipping in and
 out; hysteresis could stop that if it matters.
+
+**Within a bin too.** Whole-bin alignment wasn't enough: between the
+boards, board 2 → 1 lost 10 of 20 packets, every error a ±1 symbol slip.
+Nudging the window showed margins collapsing every 16 samples: with the
+energy about half a bin off a bin centre it splits between two bins and
+neighbouring symbols look alike. The receiver now also averages the
+decoder's refined centre over the A frames (on a one-bin circle) and the
+window is moved by that fraction too. In the model the window then lands
+within 1 sample (clean), long packets in the harsh room went from 6/8 to
+8/8 intact, and the clean-channel margin rose from about 2.2 to 5.9.
+
+| Window nudge, board 2 → 1 | Intact | Lowest margin | Decoder error in A (samples) |
+|---|---|---|---|
+| +8 | 8/8 | 1.18 | +0.6 |
+| −8 | 8/8 | 1.33 | −1.2 |
+| −24 | 8/8 | 1.44 | −3.6 |
+| −40 | 8/8 | 1.52 | −5.9 |
+| 0 | 8/8 | 1.13 | +6.7 |
+| −16 | 6/8 | 1.01 | +5.9 |
+| −32 | 4/8 | 1.00 | +3.4 |
+
+(The pattern drifts slowly between runs: 0.6 ppm is about 1.6 samples a
+minute.) With sub-bin alignment, 30 packets each way: all intact; lowest
+margin 1.005 (2 → 1) and 1.17 (1 → 2). For 2 → 1 the margins were best with
+the residual slightly negative, so its best target is a few samples off the
+bin centre; the target could be tuned per channel later.
 
 **Which path to align to:** aligning to the earliest strong copy (direct
 path) means late copies carry a little of the previous symbol; the other
