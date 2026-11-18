@@ -112,6 +112,14 @@ typedef struct {
 // ---------------------------------------------------------------------------
 // Events the board reports
 // ---------------------------------------------------------------------------
+// Why a packet being received was given up (rx.lost reason=)
+typedef enum {
+    PROTO_LOST_SIGNAL = 0,   // The signal went (packet_rx: too many frames that don't look like a symbol)
+    PROTO_LOST_SPACING,      // link.spacing changed
+    PROTO_LOST_RESET,        // "reset rx"
+    PROTO_LOST_TRANSMIT,     // This board started sending, with rx.during_tx off
+} ProtocolLostReason_t;
+
 typedef enum {
     PROTO_EV_RX_LOCKED,
     PROTO_EV_RX_TRAINED,
@@ -131,7 +139,7 @@ typedef struct {
         struct { int32_t align; float fraction; int32_t moved; } locked;
         struct { uint32_t b_start; float coherence; int32_t strongest, earliest; } trained;
         struct { uint32_t length; } header_failed;
-        struct { uint32_t symbols; } lost;
+        struct { uint32_t symbols; ProtocolLostReason_t reason; } lost;
         struct {
             bool crc_ok;
             uint32_t length;

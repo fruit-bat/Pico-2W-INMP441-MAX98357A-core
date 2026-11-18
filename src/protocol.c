@@ -101,7 +101,7 @@ static const StatusDef_t STATUS[] = {
     S_U("count.good", good, "Packets received with a good CRC"),
     S_U("count.bad", bad, "Packets received with a bad CRC"),
     S_U("count.header_failed", header_failed, "Headers with a bad CRC-8"),
-    S_U("count.lost", lost, "Packets abandoned when the signal went"),
+    S_U("count.lost", lost, "Packets abandoned part-way (signal gone, spacing change, reset rx, transmitting)"),
     S_U("count.rx_dropped", rx_dropped, "Received packets lost between the cores"),
     S_U("count.events_dropped", events_dropped, "Events dropped because the host was not reading"),
     S_U("count.link_errors", link_errors, "Lines from the host that failed their check (or were too long to check)"),
@@ -993,7 +993,12 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
                 (unsigned long)e->u.header_failed.length);
             break;
         case PROTO_EV_RX_LOST:
-            n = snprintf(line, size, "* rx.lost seq=%lu frame=%lu symbols=%lu\n", seq, frame, (unsigned long)e->u.lost.symbols);
+        {
+            static const char *const REASONS[] = { "signal", "spacing", "reset", "transmit" };
+            const uint32_t r = (uint32_t)e->u.lost.reason;
+            n = snprintf(line, size, "* rx.lost seq=%lu frame=%lu symbols=%lu reason=%s\n", seq, frame,
+                (unsigned long)e->u.lost.symbols, r < 4u ? REASONS[r] : "?");
+        }
             break;
         case PROTO_EV_RX_PACKET: {
             uint32_t len = e->u.packet.length;

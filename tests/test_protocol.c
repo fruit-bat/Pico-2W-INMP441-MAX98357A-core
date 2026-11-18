@@ -398,6 +398,7 @@ static void test_save_load(void) {
     fb.status.good = 5;
     fb.status.rx_state = PROTO_RX_PAYLOAD;
     CHECK_STR(talk("w3 reset counters\nw4 reset rx\n"), "w3 ok\nw4 ok\n");
+    fake_board_advance_frames(&fb, 1); // Core 1 resets the receiver on its next pass
     CHECK_STR(talk("w5 get count.good rx.state\n"), "w5 count.good=0\nw5 rx.state=search\nw5 ok\n");
     CHECK_STR(talk("w6 reset everything\n"), "w6 err 503 reset takes counters, rx or settings\n");
 }
@@ -568,7 +569,10 @@ static void test_stream_lines(void) {
     CHECK(shape && strstr(shape, ",-5.2\n") != NULL); // The early path, 0.3 = -5.2 dB
 }
 
-// A spacing change cuts a packet short; the host still hears how it ended
+// A spacing change cuts a packet short; the host still hears how it ended,
+// for the packet being sent and the one being received (here the same one:
+// the board hears itself). So does "reset rx". Every rx.locked ends in one
+// conclusion
 static void test_abandoned(void) {
     setup();
     CHECK_STR(talk("x1 set rx.during_tx=off\nx2 send hex=0102030405\n"), "x1 ok\nx2 ok id=1\n");
@@ -577,6 +581,32 @@ static void test_abandoned(void) {
     CHECK_STR(talk("x3 set link.spacing=2\n"), "x3 ok\n"); // The reply comes first...
     fake_board_advance_frames(&fb, 1);
     CHECK_STR(drain(), "* tx.done seq=2 frame=11 id=1 result=abandoned\n"); // ...then what it caused
+
+    // Heard, mid-payload
+    CHECK_STR(talk("x4 set rx.during_tx=on\nx5 send hex=0102030405\n"), "x4 ok\nx5 ok id=2\n");
+    fake_board_advance_frames(&fb, 24);
+    CHECK_STR(talk("x6 set link.spacing=4\n"), "* tx.start seq=3 frame=12 id=2\n"
+        "* rx.locked seq=4 frame=15 align=+0 fraction=+0.120 moved=+2\n"
+        "* rx.trained seq=5 frame=30 b_start=20 coherence=0.830 strongest=-1 earliest=+0\nx6 ok\n");
+    fake_board_advance_frames(&fb, 1);
+    CHECK_STR(drain(), "* tx.done seq=6 frame=36 id=2 result=abandoned\n"
+        "* rx.lost seq=7 frame=36 symbols=7 reason=spacing\n");
+
+    // reset rx while hearing: rx.lost, and nothing more from that packet
+    CHECK_STR(talk("x7 send hex=0102030405\n"), "x7 ok id=3\n");
+    fake_board_advance_frames(&fb, 20);
+    drain();
+    CHECK_STR(talk("x8 reset rx\n"), "x8 ok\n");
+    fake_board_advance_frames(&fb, 40);
+    const char *s = drain();
+    CHECK(starts(s, "* rx.lost seq=") && strstr(s, " reason=reset\n") != NULL);
+    CHECK(strstr(s, "* tx.done") != NULL && strstr(s, "result=sent") != NULL);
+    CHECK(strstr(s, "* rx.packet") == NULL);
+    CHECK_STR(talk("x9 get count.lost rx.state\n"), "x9 count.lost=2\nx9 rx.state=search\nx9 ok\n");
+    // Nothing being received: no rx.lost
+    CHECK_STR(talk("y1 reset rx\n"), "y1 ok\n");
+    fake_board_advance_frames(&fb, 2);
+    CHECK_STR(drain(), "");
 }
 
 // A slow host: streams are dropped long before replies or events suffer,

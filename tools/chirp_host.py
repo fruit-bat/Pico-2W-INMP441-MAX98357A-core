@@ -642,7 +642,9 @@ class CsvLog:
             elif e.name == "rx.header_failed":
                 notes.append("# packet header failed: length byte %s" % e.raw("length"))
             elif e.name == "rx.lost":
-                notes.append("# packet lost: signal gone after %s data symbols" % e.raw("symbols"))
+                why = {"signal": "signal gone", "spacing": "spacing changed", "reset": "reset rx",
+                       "transmit": "this board transmitting"}.get(e.raw("reason"), e.raw("reason") or "signal gone")
+                notes.append("# packet lost: %s after %s data symbols" % (why, e.raw("symbols")))
         if "shape" in p:
             self._shape = p["shape"].raw("values").split(",")
         f, band, folded = p.get("frame"), p.get("band"), p.get("folded")

@@ -192,12 +192,16 @@ come after `seq`.
 | `* rx.train_failed` | `frame` | display "failed" count |
 | `* rx.tone` | `frame` | (not shown today) |
 | `* rx.header_failed` | `frame length` | `# packet header failed` |
-| `* rx.lost` | `frame symbols` | `# packet lost` |
+| `* rx.lost` | `frame symbols reason=signal\|spacing\|reset\|transmit` | `# packet lost`. A packet given up part-way: the signal went, `link.spacing` changed, `reset rx`, or this board started sending with `rx.during_tx=off` |
 | `* rx.packet` | `frame crc=ok\|bad len min_margin weakest weak hex` | `# packet ...` |
 | `* tx.start` | `frame id` | (new) |
 | `* tx.done` | `frame id result=sent\|abandoned` | (new). `abandoned`: cut short, e.g. by a `link.spacing` change, so a host waiting on that id always hears how it ended |
 | `* overflow` | `dropped=<n>` | (new) see Flow |
 | `* err` | `500 <text>` | (new) a line from the host that failed its check, was too long, or had no valid tag (see Link errors) |
+
+Every `rx.locked` ends in exactly one of `rx.tone`, `rx.train_failed`,
+`rx.header_failed`, `rx.lost` or `rx.packet`, so a host following a packet
+always hears how it ended.
 
 `rx.packet` is sent for bad packets too. The payload is often still
 useful for diagnosis, and the host can decide what to do with it.

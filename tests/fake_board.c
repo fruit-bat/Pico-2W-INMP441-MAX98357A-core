@@ -98,18 +98,32 @@ static void one_frame(FakeBoard_t *fb) {
     fb->status.frames = fb->frame;
     const bool hear = fb->settings.value[SETTING_RX_DURING_TX] != 0;
 
-    if (fb->sending && fb->abandon) {
-        // As main.c: a spacing change cuts the packet short (reported on core 1's next pass)
+    // As main.c: a spacing change cuts the packet being sent short, and gives
+    // up the one being received; so does "reset rx" (both on the next pass)
+    const bool spacing = fb->abandon && fb->sending;
+    if (spacing) {
         fb->sending = false;
         ProtocolEvent_t done = { .type = PROTO_EV_TX_DONE };
         done.u.tx.id = fb->current.id;
         done.u.tx.abandoned = true;
         event(fb, done);
     }
+    if ((spacing || fb->reset_rx) && fb->listening) {
+        fb->listening = false;
+        fb->status.rx_state = PROTO_RX_SEARCH;
+        fb->status.lost++;
+        ProtocolEvent_t lost = { .type = PROTO_EV_RX_LOST };
+        lost.u.lost.symbols = fb->sent_frames > 16u ? fb->sent_frames - 16u : 0u;
+        lost.u.lost.reason = spacing ? PROTO_LOST_SPACING : PROTO_LOST_RESET;
+        event(fb, lost);
+    }
+    if (fb->reset_rx) fb->status.rx_state = PROTO_RX_SEARCH;
     fb->abandon = false;
+    fb->reset_rx = false;
     if (fb->sending) {
         fb->sent_frames++;
         if (hear && fb->sent_frames == LOCK_FRAME) {
+            fb->listening = true;
             fb->status.rx_state = PROTO_RX_LOCK;
             ProtocolEvent_t e = { .type = PROTO_EV_RX_LOCKED };
             e.u.locked.align = 0;
@@ -121,7 +135,7 @@ static void one_frame(FakeBoard_t *fb) {
             fb->status.rx_delay = (fb->status.rx_delay + (uint32_t)e.u.locked.moved) % FFT_SIZE;
             event(fb, e);
         }
-        if (hear && fb->sent_frames == TRAIN_FRAME) {
+        if (fb->listening && fb->sent_frames == TRAIN_FRAME) {
             fb->status.rx_state = PROTO_RX_HEADER;
             ProtocolEvent_t e = { .type = PROTO_EV_RX_TRAINED };
             e.u.trained.b_start = fb->frame - 10u;
@@ -140,7 +154,8 @@ static void one_frame(FakeBoard_t *fb) {
             ProtocolEvent_t done = { .type = PROTO_EV_TX_DONE };
             done.u.tx.id = fb->current.id;
             event(fb, done);
-            if (hear) {
+            if (fb->listening) {
+                fb->listening = false;
                 fb->status.rx_state = PROTO_RX_SEARCH;
                 fb->status.good++;
                 ProtocolEvent_t e = { .type = PROTO_EV_RX_PACKET };
@@ -232,7 +247,7 @@ static void fb_reset_counters(void *ctx) {
 
 static void fb_reset_rx(void *ctx) {
     FakeBoard_t *fb = ctx;
-    fb->status.rx_state = PROTO_RX_SEARCH;
+    fb->reset_rx = true; // As main.c: core 1 does it on its next pass
 }
 
 static bool fb_save(void *ctx, const ProtocolSettings_t *s) {

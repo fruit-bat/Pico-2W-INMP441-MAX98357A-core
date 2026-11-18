@@ -142,6 +142,9 @@ typedef struct {
     float32_t folded_power[CHIRP_BINS]; // Coherently folded power the decoder decides from, bins 0 .. CHIRP_BINS-1
     PacketRxStatus_t packet;             // Packet receiver after this frame (see packet_rx.h)
     int32_t align_moved;                 // Samples the window was moved on this frame (when it locked)
+    uint32_t abandoned;                  // A packet being received was given up just before this frame:
+                                         // 0 none, else 1 + ProtocolLostReason_t
+    uint32_t abandoned_symbols;          // Data symbols it had decided
     float32_t packet_shape[CHIRP_BINS];  // Channel shape it last learned (from a packet's B)
 } RxFrameRecord_t;
 
@@ -217,11 +220,24 @@ static uint32_t tx_sequence_symbol;    // MODE_SEQUENCE: the symbol most recentl
 static PacketTx_t packet_tx;           // MODE_PACKET: the packet being sent
 static uint32_t packet_tx_symbol;      // MODE_PACKET: the symbol most recently sent
 static uint32_t packet_tx_id;          // MODE_PACKET: the protocol's id for it
+static uint32_t rx_abandoned;          // A packet being received was given up (1 + ProtocolLostReason_t), for the next record
+static uint32_t rx_abandoned_symbols;
+
 static float32_t packet_rx_storage[PACKET_RX_STORAGE_LEN(CHIRP_BINS)];
 static float32_t channel_template_storage[CHANNEL_TEMPLATE_STORAGE_LEN(CHIRP_BINS)];
 static ChannelTemplate_t channel_template;
 static PacketRx_t packet_rx;
 static BiquadFilter_t rx_highpass; // Applied to the microphone stream, block by block
+
+// Core 1: the packet receiver is about to be reset; if it was part-way
+// through a packet, say so in the next record (the host hears rx.lost, so
+// every rx.locked ends in exactly one conclusion)
+static void note_rx_abandoned(ProtocolLostReason_t reason) {
+    if (packet_rx.status.state != PACKET_RX_SEARCH && rx_abandoned == 0) {
+        rx_abandoned = 1u + (uint32_t)reason;
+        rx_abandoned_symbols = packet_rx.status.data_count;
+    }
+}
 
 static float tone_phase = 0.0f;
 
@@ -391,6 +407,7 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
 
     // Packet receiver (optionally not while this board is sending a packet)
     if (packet_rx_reset_request) {
+        note_rx_abandoned(PROTO_LOST_RESET);
         packet_rx_reset(&packet_rx);
         packet_rx_reset_request = false;
     }
@@ -416,9 +433,13 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
             if (!spsc_ring_push(&rx_packet_queue, &rx_packet)) rx_packets_dropped++;
         }
     } else {
+        note_rx_abandoned(PROTO_LOST_TRANSMIT);
         packet_rx_reset(&packet_rx);
         record.packet = packet_rx.status;
     }
+    record.abandoned = rx_abandoned;
+    record.abandoned_symbols = rx_abandoned_symbols;
+    rx_abandoned = 0;
     memcpy(record.packet_shape, channel_template.shape, sizeof(record.packet_shape));
 
     // The spectrum first, so it is ready when core 0 sees this frame's record
@@ -487,6 +508,7 @@ static void apply_spacing(uint32_t bps) {
         const TxEvent_t e = { .id = packet_tx_id, .frame = i2s_core_get_rx_block_count(), .abandoned = true };
         spsc_ring_push(&tx_event_queue, &e);
     }
+    note_rx_abandoned(PROTO_LOST_SPACING);
     bins_per_symbol = bps;
     const uint32_t n = num_symbols();
     chirp_encoder.number_of_symbols = n;
@@ -667,6 +689,15 @@ static void handle_record(const RxFrameRecord_t *r) {
     rx_view.frame = r->frame;
     rx_view.state = st->state;
 
+    // A packet given up before this frame (spacing change, reset, transmitting)
+    if (r->abandoned) {
+        rx_view.lost++;
+        ProtocolEvent_t lost = { .type = PROTO_EV_RX_LOST, .frame = r->frame };
+        lost.u.lost.symbols = r->abandoned_symbols;
+        lost.u.lost.reason = (ProtocolLostReason_t)(r->abandoned - 1u);
+        protocol_event(&protocol, &lost);
+    }
+
     ProtocolEvent_t e = { .frame = r->frame };
     bool have_event = true;
     switch (st->event) {
@@ -701,6 +732,7 @@ static void handle_record(const RxFrameRecord_t *r) {
             rx_view.lost++;
             e.type = PROTO_EV_RX_LOST;
             e.u.lost.symbols = st->data_count;
+            e.u.lost.reason = PROTO_LOST_SIGNAL;
             break;
         case PACKET_RX_EVENT_PACKET: {
             // Its payload was queued just before this record

@@ -46,6 +46,8 @@ typedef struct {
     FakePacket_t current;
     uint32_t sent_frames, total_frames;
     bool abandon;               // Spacing changed mid-packet: report it on the next frame
+    bool listening;             // Hearing its own packet (since rx.locked, until it concludes)
+    bool reset_rx;              // "reset rx" asked for: done on the next frame
 
     // Saved settings (RAM only); save fails unless save_enabled
     bool save_enabled, have_saved;
