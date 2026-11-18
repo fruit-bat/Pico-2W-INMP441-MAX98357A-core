@@ -1,0 +1,407 @@
+/**
+ * @file test_protocol.c
+ *
+ * Scenario tests for the host protocol engine (src/protocol.c) against a
+ * pretend board (fake_board.c) on a simulated clock. Each test feeds the
+ * engine host lines and checks the exact text that comes back.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include "fake_board.h"
+#include "protocol.h"
+#include "test_util.h"
+
+int test_failures = 0;
+int test_checks = 0;
+
+static Protocol_t proto;
+static FakeBoard_t fb;
+static char out[65536];
+
+#define CHECK_STR(actual, expected) do { \
+    test_checks++; \
+    const char *a_ = (actual), *e_ = (expected); \
+    if (strcmp(a_, e_) != 0) { \
+        test_failures++; \
+        printf("  FAIL %s:%d: got\n----\n%s----\n  expected\n----\n%s----\n", __FILE__, __LINE__, a_, e_); \
+    } \
+} while (0)
+
+// A fresh board and engine, with the start-up "* hello" read and checked
+static void setup(void) {
+    fake_board_init(&fb, &proto);
+    protocol_init(&proto, &fb.board);
+    protocol_start(&proto);
+    const size_t n = protocol_output(&proto, out, sizeof out - 1);
+    out[n] = 0;
+    CHECK_STR(out, "* hello proto=1 version=test id=0011223344556677\n");
+}
+
+// Everything waiting for the host
+static const char *drain(void) {
+    const size_t n = protocol_output(&proto, out, sizeof out - 1);
+    out[n] = 0;
+    return out;
+}
+
+// Host sends text (one or more lines); returns what the board sent
+static const char *talk(const char *text) {
+    const size_t n = protocol_input(&proto, text, strlen(text));
+    CHECK_EQ_U(n, strlen(text));
+    return drain();
+}
+
+static uint32_t count_lines(const char *s) {
+    uint32_t n = 0;
+    for (; *s; s++) n += *s == '\n';
+    return n;
+}
+
+// Every line of s starting with prefix comes in one unbroken run
+static bool lines_together(const char *s, const char *prefix) {
+    int runs = 0;
+    bool in_run = false;
+    for (const char *line = s; *line;) {
+        const bool match = strncmp(line, prefix, strlen(prefix)) == 0;
+        if (match && !in_run) runs++;
+        in_run = match;
+        const char *nl = strchr(line, '\n');
+        if (!nl) break;
+        line = nl + 1;
+    }
+    return runs == 1;
+}
+
+static void inject_packet(uint32_t length) {
+    static uint8_t payload[PROTOCOL_PAYLOAD_MAX];
+    for (uint32_t i = 0; i < length; i++) payload[i] = (uint8_t)i;
+    ProtocolEvent_t e = { .type = PROTO_EV_RX_PACKET, .frame = 7 };
+    e.u.packet.crc_ok = true;
+    e.u.packet.length = length;
+    e.u.packet.min_margin = 1.5f;
+    e.u.packet.payload = payload;
+    protocol_event(&proto, &e);
+}
+
+// ---------------------------------------------------------------------------
+
+static void test_start(void) {
+    setup();
+    CHECK_EQ_U(fb.apply_calls, 1);                        // All settings pushed at start-up
+    CHECK_EQ_U(fb.last_changed, (1u << SETTING_COUNT) - 1u);
+    CHECK_EQ_U(fb.settings.value[SETTING_TX_VOLUME], -28);
+    CHECK_STR(talk("a1 hello\n"), "a1 proto=1 version=test id=0011223344556677\na1 ok\n");
+}
+
+static void test_get(void) {
+    setup();
+    CHECK_STR(talk("a2 get tx.volume\n"), "a2 tx.volume=-28\na2 ok\n");
+    CHECK_STR(talk("a3 get rx.state rx.delay test.mode\n"),
+        "a3 rx.state=search\na3 rx.delay=960\na3 test.mode=packet\na3 ok\n");
+    CHECK_STR(talk("a4 get nothing.here\n"), "a4 err 502 unknown name nothing.here\n");
+    CHECK_STR(talk("a5 get tx.volume nothing.here\n"), "a5 err 502 unknown name nothing.here\n");
+    CHECK_STR(talk("a6 get link.*\n"), "a6 link.spacing=4\na6 link.symbols=16\na6 link.bits=4\na6 ok\n");
+
+    const char *all = talk("a7 get\n");
+    printf("  get (all): %lu lines, %lu bytes\n", (unsigned long)count_lines(all), (unsigned long)strlen(all));
+    CHECK_EQ_U(count_lines(all), SETTING_COUNT + 33u + 1u);
+    CHECK(strstr(all, "a7 info.f0=15000.0\n") != NULL);
+    CHECK(strstr(all, "a7 count.events_dropped=0\n") != NULL);
+    CHECK(strcmp(all + strlen(all) - 6, "a7 ok\n") == 0);
+
+    const char *rx = talk("a8 get rx.*\n");
+    CHECK_EQ_U(count_lines(rx), 3u + 2u + 3u + 4u + 1u);
+}
+
+static void test_list(void) {
+    setup();
+    CHECK_STR(talk("l1 list tx.volume\n"),
+        "l1 name=tx.volume kind=setting type=int range=-55..-1 default=-28 units=dBFS help=Transmit level\nl1 ok\n");
+    CHECK_STR(talk("l2 list rx.tracking link.spacing\n"),
+        "l2 name=rx.tracking kind=setting type=choice values=off,decision,pilot default=off help=Symbol timing tracking\n"
+        "l2 name=link.spacing kind=setting type=int values=1,2,4 default=4 units=bins "
+        "help=Bins between symbols (4 bits/symbol at 4, 5 at 2, 6 at 1); both boards must match\nl2 ok\n");
+    CHECK_STR(talk("l3 list count.good\n"),
+        "l3 name=count.good kind=status type=int help=Packets received with a good CRC\nl3 ok\n");
+    const char *all = talk("l4 list\n");
+    printf("  list (all): %lu bytes (reply limit %u)\n", (unsigned long)strlen(all), PROTOCOL_REPLY_MAX);
+    CHECK(strcmp(all + strlen(all) - 6, "l4 ok\n") == 0);
+    const char *help = talk("l6 help\n");
+    CHECK(strstr(help, "l6 command=send help=send hex=<bytes>") != NULL);
+    CHECK(strcmp(help + strlen(help) - 6, "l6 ok\n") == 0);
+}
+
+static void test_set(void) {
+    setup();
+    CHECK_STR(talk("s1 set tx.volume=-31\n"), "s1 ok\n");
+    CHECK_EQ_U(fb.settings.value[SETTING_TX_VOLUME], -31);
+    CHECK_EQ_U(fb.last_changed, 1u << SETTING_TX_VOLUME);
+
+    // Rejected, not clamped; and nothing changes
+    const uint32_t calls = fb.apply_calls;
+    CHECK_STR(talk("s2 set tx.volume=-60\n"), "s2 err 503 tx.volume out of range -55..-1\n");
+    CHECK_STR(talk("s3 set tx.volume=-40 link.spacing=3\n"), "s3 err 503 link.spacing must be one of 1,2,4\n");
+    CHECK_EQ_U(fb.settings.value[SETTING_TX_VOLUME], -31);
+    CHECK_EQ_U(fb.apply_calls, calls);
+
+    // test.symbol's range follows the spacing; a spacing change wraps it
+    CHECK_STR(talk("s4 set link.spacing=1 test.symbol=40\n"), "s4 ok\n");
+    CHECK_STR(talk("s5 set link.spacing=4\n"), "s5 ok test.symbol=8\n");
+    CHECK_STR(talk("s6 set test.symbol=16\n"), "s6 err 503 test.symbol out of range 0..15\n");
+    CHECK_STR(talk("s7 set test.symbol=15\n"), "s7 ok\n");
+
+    // Choices
+    CHECK_STR(talk("s8 set rx.tracking=pilot rx.align=off\n"), "s8 ok\n");
+    CHECK_EQ_U(fb.settings.value[SETTING_RX_TRACKING], 2);
+    CHECK_EQ_U(fb.settings.value[SETTING_RX_ALIGN], 0);
+    CHECK_STR(talk("s9 set rx.align=maybe\n"), "s9 err 503 rx.align must be one of off,on\n");
+
+    // Other mistakes
+    CHECK_STR(talk("t1 set rx.delay=5\n"), "t1 err 504 rx.delay is read only\n");
+    CHECK_STR(talk("t2 set tx.loudness=5\n"), "t2 err 502 unknown setting tx.loudness\n");
+    CHECK_STR(talk("t3 set tx.volume=-3 tx.volume=-4\n"), "t3 err 505 tx.volume given twice\n");
+    CHECK_STR(talk("t4 set\n"), "t4 err 505 set needs name=value\n");
+    CHECK_STR(talk("t5 set tx.volume\n"), "t5 err 505 expected name=value, not tx.volume\n");
+    CHECK_STR(talk("t6 set tx.volume=loud\n"), "t6 err 503 tx.volume needs an integer, not 'loud'\n");
+    CHECK_STR(talk("t7 set tx.volume=-3x\n"), "t7 err 503 tx.volume needs an integer, not '-3x'\n");
+
+    // Setting the same value again doesn't disturb the board
+    const uint32_t before = fb.apply_calls;
+    CHECK_STR(talk("t8 set tx.volume=-31\n"), "t8 ok\n");
+    CHECK_EQ_U(fb.apply_calls, before);
+    CHECK_STR(talk("t9 get tx.volume link.spacing test.symbol\n"),
+        "t9 tx.volume=-31\nt9 link.spacing=4\nt9 test.symbol=15\nt9 ok\n");
+}
+
+static void test_send(void) {
+    setup();
+    CHECK_STR(talk("p1 send hex=4869\n"), "p1 ok id=1\n");
+    CHECK_STR(talk("p2 get tx.queued\n"), "p2 tx.queued=1\np2 ok\n");
+    fake_board_advance_frames(&fb, 1);
+    CHECK_STR(drain(), "* tx.start frame=1 id=1\n");
+
+    // 2 bytes at 4 bits/symbol: 16 preamble + (16 + 16 + 16) / 4 = 28 frames
+    const uint32_t frames = fake_board_packet_frames(&fb, 2);
+    CHECK_EQ_U(frames, 28);
+    fake_board_advance_frames(&fb, frames);
+    CHECK_STR(drain(),
+        "* rx.locked frame=4 align=+0 fraction=+0.120 moved=+2\n"
+        "* rx.trained frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0\n"
+        "* tx.done frame=29 id=1\n"
+        "* rx.packet frame=29 crc=ok len=2 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
+    CHECK_STR(talk("p3 get count.good rx.delay rx.last_train.coherence\n"),
+        "p3 count.good=1\np3 rx.delay=962\np3 rx.last_train.coherence=0.830\np3 ok\n");
+
+    // The queue holds 2: a third is refused, and doesn't use up an id
+    CHECK_STR(talk("p4 send hex=01\np5 send hex=02\np6 send hex=03\n"),
+        "p4 ok id=2\np5 ok id=3\np6 err 450 transmit queue full\n");
+    fake_board_advance_frames(&fb, 1);
+    CHECK_STR(talk("p7 send hex=04\n"), "* tx.start frame=30 id=2\np7 ok id=4\n");
+
+    // Real time: 255 bytes at 4 bits/symbol take 16 + 518 frames, 12.4 s
+    setup();
+    CHECK_STR(talk("p8 set rx.during_tx=off\n"), "p8 ok\n");
+    char line[600] = "p9 send hex=";
+    for (int i = 0; i < 255; i++) strcat(line, "ab");
+    strcat(line, "\n");
+    CHECK_STR(talk(line), "p9 ok id=1\n");
+    fake_board_advance_us(&fb, 12000000u);
+    CHECK_STR(drain(), "* tx.start frame=1 id=1\n");
+    fake_board_advance_us(&fb, 500000u);
+    CHECK_STR(drain(), "* tx.done frame=535 id=1\n");
+
+    // Bad hex
+    CHECK_STR(talk("q1 send hex=486\n"), "q1 err 506 odd number of hex digits\n");
+    CHECK_STR(talk("q2 send hex=zz\n"), "q2 err 506 not hex\n");
+    strcpy(line, "q3 send hex=");
+    for (int i = 0; i < 256; i++) strcat(line, "00");
+    strcat(line, "\n");
+    CHECK_STR(talk(line), "q3 err 506 more than 255 bytes\n");
+    CHECK_STR(talk("q4 send\n"), "q4 err 505 send takes hex=<bytes>\n");
+    CHECK_STR(talk("q5 send text=hi\n"), "q5 err 505 send takes hex=<bytes>\n");
+    CHECK_STR(talk("q6 send hex=\n"), "q6 ok id=2\n"); // An empty packet is allowed
+    CHECK_STR(talk("q7 send hex=4A4b\n"), "q7 ok id=3\n"); // Either case
+}
+
+// Events can come before or after a reply, but lines are whole, a reply's
+// lines stay together, and a reply comes before what it causes
+static void test_ordering(void) {
+    setup();
+
+    // An event half-sent when the command arrives is finished first
+    inject_packet(4);
+    char first[11];
+    CHECK_EQ_U(protocol_output(&proto, first, 10), 10);
+    first[10] = 0;
+    char all[512];
+    snprintf(all, sizeof all, "%s%s", first, talk("e1 get tx.volume\n"));
+    CHECK_STR(all,
+        "* rx.packet frame=7 crc=ok len=4 min_margin=1.500 weakest=0 weak=0 hex=00010203\n"
+        "e1 tx.volume=-28\ne1 ok\n");
+
+    // Events around a long reply never land inside it
+    inject_packet(1);
+    protocol_input(&proto, "e2 get rx.*\n", 12);
+    inject_packet(2);
+    const char *s = drain();
+    CHECK(lines_together(s, "e2 "));
+    CHECK(strncmp(s, "* rx.packet", 11) == 0);
+    CHECK(strstr(s, "e2 ok\n* rx.packet") != NULL);
+
+    // The reply to send comes before tx.start and tx.done, even with
+    // the clock running between input bytes
+    const char *cmd = "e3 send hex=00\n";
+    for (const char *c = cmd; *c; c++) {
+        protocol_input(&proto, c, 1);
+        fake_board_advance_frames(&fb, 1);
+    }
+    fake_board_advance_frames(&fb, 40);
+    s = drain();
+    const char *ok = strstr(s, "e3 ok id=1"), *start = strstr(s, "* tx.start"), *done = strstr(s, "* tx.done");
+    CHECK(ok && start && done && ok < start && start < done);
+}
+
+static void test_input(void) {
+    setup();
+    CHECK_STR(talk("c1 hello\r\n"), "c1 proto=1 version=test id=0011223344556677\nc1 ok\n");
+    CHECK_STR(talk("\n\r\n   \n"), "");
+    CHECK_STR(talk("c2   get    tx.volume  \n"), "c2 tx.volume=-28\nc2 ok\n"); // Extra spaces are forgiven
+
+    // Too long: rejected with its tag, and the next line is fine
+    static char line[1600];
+    strcpy(line, "c3 send hex=");
+    for (int i = 0; i < 1500; i++) strcat(line, "0");
+    strcat(line, "\n");
+    CHECK_STR(talk(line), "c3 err 500 line longer than 1024 characters\n");
+    CHECK_STR(talk("c4 get tx.volume\n"), "c4 tx.volume=-28\nc4 ok\n");
+
+    // No usable tag
+    CHECK_STR(talk("*bad thing\n"), "* err 500 line has no valid tag\n");
+    CHECK_STR(talk("abcdefghi hello\n"), "* err 500 line has no valid tag\n");
+    CHECK_STR(talk("a-1 hello\n"), "* err 500 line has no valid tag\n");
+
+    CHECK_STR(talk("c5\n"), "c5 err 501 no command\n");
+    CHECK_STR(talk("c6 dance\n"), "c6 err 501 unknown command dance\n");
+    CHECK_STR(talk("c7 HELLO\n"), "c7 err 501 unknown command HELLO\n");
+    CHECK_STR(talk("c8 get tx.volume\x80\n"), "c8 err 500 characters other than printable ASCII\n");
+    CHECK_STR(talk("c9 get\ttx.volume\n"), "c9 err 500 characters other than printable ASCII\n");
+    CHECK_STR(talk("d1 hello there\n"), "d1 err 505 hello takes no arguments\n");
+
+    // A tag may be reused; lines may arrive a byte at a time
+    CHECK_STR(talk("x hello\nx hello\n"),
+        "x proto=1 version=test id=0011223344556677\nx ok\nx proto=1 version=test id=0011223344556677\nx ok\n");
+    const char *cmd = "d2 get tx.volume\n";
+    for (const char *c = cmd; *c; c++) protocol_input(&proto, c, 1);
+    CHECK_STR(drain(), "d2 tx.volume=-28\nd2 ok\n");
+}
+
+static void test_nudge(void) {
+    setup();
+    CHECK_STR(talk("n1 nudge samples=-8\n"), "n1 ok delay=952\n");
+    CHECK_STR(talk("n2 nudge samples=100\n"), "n2 ok delay=28\n"); // Wraps round the frame
+    CHECK_STR(talk("n3 nudge samples=2000\n"), "n3 err 503 samples out of range -1023..1023\n");
+    CHECK_STR(talk("n4 nudge\n"), "n4 err 505 nudge takes samples=<n>\n");
+    CHECK_STR(talk("n5 get rx.delay\n"), "n5 rx.delay=28\nn5 ok\n");
+}
+
+static void test_save_load(void) {
+    setup();
+    CHECK_STR(talk("v1 save\n"), "v1 err 452 saving settings is not available yet\n");
+    CHECK_STR(talk("v2 load\n"), "v2 ok\n"); // Nothing saved: the defaults
+
+    fb.save_enabled = true;
+    CHECK_STR(talk("v3 set tx.volume=-40 link.spacing=2\n"), "v3 ok\n");
+    CHECK_STR(talk("v4 save\n"), "v4 ok\n");
+    CHECK_STR(talk("v5 set tx.volume=-10\n"), "v5 ok\n");
+    CHECK_STR(talk("v6 load\n"), "v6 ok\n");
+    CHECK_EQ_U(fb.settings.value[SETTING_TX_VOLUME], -40);
+    CHECK_STR(talk("v7 reset settings\n"), "v7 ok\n");
+    CHECK_STR(talk("v8 get tx.volume link.spacing\n"), "v8 tx.volume=-28\nv8 link.spacing=4\nv8 ok\n");
+    CHECK_STR(talk("v9 load\n"), "v9 ok\n"); // The saved ones were kept
+    CHECK_EQ_U(fb.settings.value[SETTING_TX_VOLUME], -40);
+    CHECK_EQ_U(fb.settings.value[SETTING_LINK_SPACING], 2);
+
+    // A restart starts from the saved settings
+    protocol_init(&proto, &fb.board);
+    protocol_start(&proto);
+    drain();
+    CHECK_STR(talk("w1 get tx.volume\n"), "w1 tx.volume=-40\nw1 ok\n");
+
+    // Saved settings that don't make sense are ignored
+    fb.saved.value[SETTING_TX_VOLUME] = 7;
+    protocol_init(&proto, &fb.board);
+    protocol_start(&proto);
+    drain();
+    CHECK_STR(talk("w2 get tx.volume\n"), "w2 tx.volume=-28\nw2 ok\n");
+
+    // reset counters, reset rx
+    fb.status.good = 5;
+    fb.status.rx_state = PROTO_RX_PAYLOAD;
+    CHECK_STR(talk("w3 reset counters\nw4 reset rx\n"), "w3 ok\nw4 ok\n");
+    CHECK_STR(talk("w5 get count.good rx.state\n"), "w5 count.good=0\nw5 rx.state=search\nw5 ok\n");
+    CHECK_STR(talk("w6 reset everything\n"), "w6 err 503 reset takes counters, rx or settings\n");
+}
+
+// The host stops reading: events are dropped and counted, commands wait,
+// and replies are never lost
+static void test_flow(void) {
+    setup();
+    for (int i = 0; i < 100; i++) inject_packet(255);
+    const uint32_t queued = protocol_output_pending(&proto);
+    printf("  100 long packet events: %lu bytes queued, %lu dropped\n",
+        (unsigned long)queued, (unsigned long)proto.events_dropped);
+    CHECK(proto.events_dropped > 0);
+    CHECK(queued <= PROTOCOL_OUT_SIZE);
+
+    // The first command is taken in but waits; the next isn't taken in yet
+    const char *cmds = "f1 get count.events_dropped\nf2 hello\n";
+    const size_t first = strlen("f1 get count.events_dropped\n");
+    size_t used = protocol_input(&proto, cmds, strlen(cmds));
+    CHECK_EQ_U(used, first);
+    CHECK_EQ_U(protocol_input(&proto, cmds + used, strlen(cmds) - used), 0);
+
+    // The host reads again, a little at a time, as a slow link would
+    static char seen[65536];
+    size_t total = 0;
+    while (used < strlen(cmds) || protocol_output_pending(&proto) > 0) {
+        total += protocol_output(&proto, seen + total, 700);
+        protocol_poll(&proto);
+        used += protocol_input(&proto, cmds + used, strlen(cmds) - used);
+    }
+    seen[total] = 0;
+    char expect[64];
+    snprintf(expect, sizeof expect, "f1 count.events_dropped=%lu\nf1 ok\n", (unsigned long)proto.events_dropped);
+    CHECK(strstr(seen, expect) != NULL);
+    CHECK(strstr(seen, "f2 ok\n") != NULL);
+    snprintf(expect, sizeof expect, "* overflow dropped=%lu\n", (unsigned long)proto.events_dropped);
+    CHECK(strstr(seen, expect) != NULL);
+    // Every event line that got through is whole
+    uint32_t packets = 0;
+    for (const char *s = seen; (s = strstr(s, "* rx.packet")) != NULL; s++) {
+        const char *nl = strchr(s, '\n');
+        CHECK(nl && nl - s == (long)strlen("* rx.packet frame=7 crc=ok len=255 min_margin=1.500 weakest=0 weak=0 hex=") + 510);
+        packets++;
+    }
+    CHECK_EQ_U(packets + proto.events_dropped, 100);
+
+    // Afterwards events flow again, and reset counters clears the count
+    inject_packet(1);
+    CHECK(strncmp(drain(), "* rx.packet", 11) == 0);
+    CHECK_STR(talk("f3 reset counters\nf4 get count.events_dropped\n"), "f3 ok\nf4 count.events_dropped=0\nf4 ok\n");
+}
+
+int main(void) {
+    RUN_TEST(test_start);
+    RUN_TEST(test_get);
+    RUN_TEST(test_list);
+    RUN_TEST(test_set);
+    RUN_TEST(test_send);
+    RUN_TEST(test_ordering);
+    RUN_TEST(test_input);
+    RUN_TEST(test_nudge);
+    RUN_TEST(test_save_load);
+    RUN_TEST(test_flow);
+    printf("%d checks, %d failures\n", test_checks, test_failures);
+    return test_failures != 0;
+}
