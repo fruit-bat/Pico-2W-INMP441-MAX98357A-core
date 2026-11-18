@@ -20,6 +20,10 @@
  *     protocol_poll(p)                    // retry a held command / overflow notice
  *     m = protocol_output(p, buf, max)    // bytes for the host
  *
+ * Every line both ways starts with a check: "XXXX " (CRC-16 of the rest of
+ * the line, in hex, then a space). A line from the host that fails it is
+ * answered with an event, "* err seq=<n> 500 line failed its check".
+ *
  * protocol_input() may consume fewer bytes than offered: it holds a command
  * until its whole reply fits in the output queue (replies are never
  * dropped), and the caller offers the rest again later.
@@ -30,9 +34,10 @@
 #include <stdint.h>
 
 #define PROTOCOL_VERSION 1
-#define PROTOCOL_LINE_MAX 1024u    // Longest line either way, without the LF
-#define PROTOCOL_OUT_SIZE 12288u   // Output queue, bytes
-#define PROTOCOL_REPLY_MAX 4096u   // Longest reply to one command, bytes
+#define PROTOCOL_LINE_MAX 1024u    // Longest line either way, with its check, without the LF
+#define PROTOCOL_CHECK_LEN 5u      // "XXXX ": CRC-16 in hex and a space, at the start of every line
+#define PROTOCOL_OUT_SIZE 16384u   // Output queue, bytes
+#define PROTOCOL_REPLY_MAX 6144u   // Longest reply to one command, bytes, with its checks ("list" of everything is about 4 KB)
 #define PROTOCOL_TAG_MAX 8u
 #define PROTOCOL_PAYLOAD_MAX 255u  // Bytes in a packet (as packet_format.h)
 #define PROTOCOL_CHIRP_BINS 64u    // FFT bins the chirp spans (CHIRP_BINS in main.c)
@@ -85,7 +90,7 @@ typedef struct {
     uint32_t link_symbols, link_bits;
     // Counters (count.*)
     uint32_t frames, rx_missed, tx_missed, records_dropped;
-    uint32_t good, bad, header_failed, lost, rx_dropped, events_dropped;
+    uint32_t good, bad, header_failed, lost, rx_dropped, events_dropped, link_errors;
     // Now
     uint32_t tx_queued;
     uint32_t rx_state;  // PROTO_RX_*
@@ -172,9 +177,12 @@ typedef struct {
     uint32_t out_head, out_tail; // Free-running
     char reply[PROTOCOL_REPLY_MAX];
     uint32_t reply_len;
+    uint32_t reply_lines;  // Each will get a check in front
     bool reply_overflow;
     char event_line[PROTOCOL_LINE_MAX + 2]; // An event being formatted (not on core 0's small stack)
 
+    uint32_t next_seq;               // Every event gets the next one (0 = "* hello" at start-up)
+    uint32_t link_errors;            // Lines that failed their check
     uint32_t events_dropped;         // Total
     uint32_t events_dropped_pending; // Not yet reported with "* overflow"
 } Protocol_t;
@@ -198,6 +206,10 @@ size_t protocol_output(Protocol_t *p, char *buf, size_t max);
 
 // Bytes waiting in the output queue
 uint32_t protocol_output_pending(const Protocol_t *p);
+
+// CRC-16/CCITT (poly 0x1021, init 0xFFFF) of a line's text: every line,
+// both ways, is "XXXX text" with this in upper-case hex
+uint16_t protocol_crc16(const char *data, size_t length);
 
 // The built-in defaults
 void protocol_default_settings(ProtocolSettings_t *settings);

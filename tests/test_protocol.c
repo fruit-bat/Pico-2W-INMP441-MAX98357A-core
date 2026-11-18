@@ -4,6 +4,11 @@
  * Scenario tests for the host protocol engine (src/protocol.c) against a
  * pretend board (fake_board.c) on a simulated clock. Each test feeds the
  * engine host lines and checks the exact text that comes back.
+ *
+ * Every line both ways carries a check ("XXXX " in front). The helpers add
+ * it to what the host sends and verify and remove it from what the board
+ * sends, so most tests read as plain text; test_checks covers the check
+ * itself.
  */
 
 #include <stdio.h>
@@ -17,7 +22,9 @@ int test_checks = 0;
 
 static Protocol_t proto;
 static FakeBoard_t fb;
-static char out[65536];
+static char out[65536];  // Decoded output
+static char raw[65536];  // As sent
+static char enc[65536];  // Encoded input
 
 #define CHECK_STR(actual, expected) do { \
     test_checks++; \
@@ -28,28 +35,78 @@ static char out[65536];
     } \
 } while (0)
 
+// Adds a check to each line of plain text, as a host would. Blank lines
+// (or only spaces) stay as they are; a CR before the LF is sent but not checked
+static const char *encode(const char *plain) {
+    char *o = enc;
+    for (const char *line = plain; *line;) {
+        const char *nl = strchr(line, '\n');
+        const size_t n = nl ? (size_t)(nl - line) : strlen(line);
+        size_t text = n;
+        if (text > 0 && line[text - 1] == '\r') text--;
+        bool blank = true;
+        for (size_t i = 0; i < text; i++) blank = blank && line[i] == ' ';
+        if (!blank) o += sprintf(o, "%04X ", protocol_crc16(line, text));
+        memcpy(o, line, n);
+        o += n;
+        if (!nl) break;
+        *o++ = '\n';
+        line = nl + 1;
+    }
+    *o = 0;
+    return enc;
+}
+
+// Checks and removes each line's check, as a host would
+static const char *decode(const char *in) {
+    char *o = out;
+    for (const char *line = in; *line;) {
+        const char *nl = strchr(line, '\n');
+        CHECK(nl != NULL); // Whole lines only
+        if (!nl) break;
+        const size_t n = (size_t)(nl - line);
+        unsigned crc = 0;
+        const bool ok = n >= 5 && line[4] == ' ' && sscanf(line, "%4X", &crc) == 1
+            && crc == protocol_crc16(line + 5, n - 5);
+        test_checks++;
+        if (!ok) { test_failures++; printf("  FAIL bad check on line: %.*s\n", (int)n, line); }
+        if (n >= 5) { memcpy(o, line + 5, n - 5); o += n - 5; }
+        *o++ = '\n';
+        line = nl + 1;
+    }
+    *o = 0;
+    return out;
+}
+
+static const char *drain_raw(void) {
+    const size_t n = protocol_output(&proto, raw, sizeof raw - 1);
+    raw[n] = 0;
+    return raw;
+}
+
+// Everything waiting for the host, checked and without the checks
+static const char *drain(void) {
+    return decode(drain_raw());
+}
+
+// Host sends exactly these bytes; returns what the board sent (decoded)
+static const char *talk_raw(const char *bytes) {
+    const size_t n = protocol_input(&proto, bytes, strlen(bytes));
+    CHECK_EQ_U(n, strlen(bytes));
+    return drain();
+}
+
+// Host sends plain lines, each with its check added
+static const char *talk(const char *text) {
+    return talk_raw(encode(text));
+}
+
 // A fresh board and engine, with the start-up "* hello" read and checked
 static void setup(void) {
     fake_board_init(&fb, &proto);
     protocol_init(&proto, &fb.board);
     protocol_start(&proto);
-    const size_t n = protocol_output(&proto, out, sizeof out - 1);
-    out[n] = 0;
-    CHECK_STR(out, "* hello proto=1 version=test id=0011223344556677\n");
-}
-
-// Everything waiting for the host
-static const char *drain(void) {
-    const size_t n = protocol_output(&proto, out, sizeof out - 1);
-    out[n] = 0;
-    return out;
-}
-
-// Host sends text (one or more lines); returns what the board sent
-static const char *talk(const char *text) {
-    const size_t n = protocol_input(&proto, text, strlen(text));
-    CHECK_EQ_U(n, strlen(text));
-    return drain();
+    CHECK_STR(drain(), "* hello seq=0 proto=1 version=test id=0011223344556677\n");
 }
 
 static uint32_t count_lines(const char *s) {
@@ -105,7 +162,7 @@ static void test_get(void) {
 
     const char *all = talk("a7 get\n");
     printf("  get (all): %lu lines, %lu bytes\n", (unsigned long)count_lines(all), (unsigned long)strlen(all));
-    CHECK_EQ_U(count_lines(all), SETTING_COUNT + 33u + 1u);
+    CHECK_EQ_U(count_lines(all), SETTING_COUNT + 34u + 1u);
     CHECK(strstr(all, "a7 info.f0=15000.0\n") != NULL);
     CHECK(strstr(all, "a7 count.events_dropped=0\n") != NULL);
     CHECK(strcmp(all + strlen(all) - 6, "a7 ok\n") == 0);
@@ -125,7 +182,7 @@ static void test_list(void) {
     CHECK_STR(talk("l3 list count.good\n"),
         "l3 name=count.good kind=status type=int help=Packets received with a good CRC\nl3 ok\n");
     const char *all = talk("l4 list\n");
-    printf("  list (all): %lu bytes (reply limit %u)\n", (unsigned long)strlen(all), PROTOCOL_REPLY_MAX);
+    printf("  list (all): %lu bytes with checks (reply limit %u)\n", (unsigned long)strlen(raw), PROTOCOL_REPLY_MAX);
     CHECK(strcmp(all + strlen(all) - 6, "l4 ok\n") == 0);
     const char *help = talk("l6 help\n");
     CHECK(strstr(help, "l6 command=send help=send hex=<bytes>") != NULL);
@@ -179,17 +236,17 @@ static void test_send(void) {
     CHECK_STR(talk("p1 send hex=4869\n"), "p1 ok id=1\n");
     CHECK_STR(talk("p2 get tx.queued\n"), "p2 tx.queued=1\np2 ok\n");
     fake_board_advance_frames(&fb, 1);
-    CHECK_STR(drain(), "* tx.start frame=1 id=1\n");
+    CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
 
     // 2 bytes at 4 bits/symbol: 16 preamble + (16 + 16 + 16) / 4 = 28 frames
     const uint32_t frames = fake_board_packet_frames(&fb, 2);
     CHECK_EQ_U(frames, 28);
     fake_board_advance_frames(&fb, frames);
     CHECK_STR(drain(),
-        "* rx.locked frame=4 align=+0 fraction=+0.120 moved=+2\n"
-        "* rx.trained frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0\n"
-        "* tx.done frame=29 id=1\n"
-        "* rx.packet frame=29 crc=ok len=2 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
+        "* rx.locked seq=2 frame=4 align=+0 fraction=+0.120 moved=+2\n"
+        "* rx.trained seq=3 frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0\n"
+        "* tx.done seq=4 frame=29 id=1\n"
+        "* rx.packet seq=5 frame=29 crc=ok len=2 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
     CHECK_STR(talk("p3 get count.good rx.delay rx.last_train.coherence\n"),
         "p3 count.good=1\np3 rx.delay=962\np3 rx.last_train.coherence=0.830\np3 ok\n");
 
@@ -197,7 +254,7 @@ static void test_send(void) {
     CHECK_STR(talk("p4 send hex=01\np5 send hex=02\np6 send hex=03\n"),
         "p4 ok id=2\np5 ok id=3\np6 err 450 transmit queue full\n");
     fake_board_advance_frames(&fb, 1);
-    CHECK_STR(talk("p7 send hex=04\n"), "* tx.start frame=30 id=2\np7 ok id=4\n");
+    CHECK_STR(talk("p7 send hex=04\n"), "* tx.start seq=6 frame=30 id=2\np7 ok id=4\n");
 
     // Real time: 255 bytes at 4 bits/symbol take 16 + 518 frames, 12.4 s
     setup();
@@ -207,9 +264,9 @@ static void test_send(void) {
     strcat(line, "\n");
     CHECK_STR(talk(line), "p9 ok id=1\n");
     fake_board_advance_us(&fb, 12000000u);
-    CHECK_STR(drain(), "* tx.start frame=1 id=1\n");
+    CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
     fake_board_advance_us(&fb, 500000u);
-    CHECK_STR(drain(), "* tx.done frame=535 id=1\n");
+    CHECK_STR(drain(), "* tx.done seq=2 frame=535 id=1\n");
 
     // Bad hex
     CHECK_STR(talk("q1 send hex=486\n"), "q1 err 506 odd number of hex digits\n");
@@ -231,18 +288,19 @@ static void test_ordering(void) {
 
     // An event half-sent when the command arrives is finished first
     inject_packet(4);
-    char first[11];
-    CHECK_EQ_U(protocol_output(&proto, first, 10), 10);
-    first[10] = 0;
     char all[512];
-    snprintf(all, sizeof all, "%s%s", first, talk("e1 get tx.volume\n"));
-    CHECK_STR(all,
-        "* rx.packet frame=7 crc=ok len=4 min_margin=1.500 weakest=0 weak=0 hex=00010203\n"
+    CHECK_EQ_U(protocol_output(&proto, all, 10), 10);
+    const char *cmd1 = encode("e1 get tx.volume\n");
+    CHECK_EQ_U(protocol_input(&proto, cmd1, strlen(cmd1)), strlen(cmd1));
+    strcpy(all + 10, drain_raw());
+    CHECK_STR(decode(all),
+        "* rx.packet seq=1 frame=7 crc=ok len=4 min_margin=1.500 weakest=0 weak=0 hex=00010203\n"
         "e1 tx.volume=-28\ne1 ok\n");
 
     // Events around a long reply never land inside it
     inject_packet(1);
-    protocol_input(&proto, "e2 get rx.*\n", 12);
+    const char *cmd2 = encode("e2 get rx.*\n");
+    protocol_input(&proto, cmd2, strlen(cmd2));
     inject_packet(2);
     const char *s = drain();
     CHECK(lines_together(s, "e2 "));
@@ -251,7 +309,7 @@ static void test_ordering(void) {
 
     // The reply to send comes before tx.start and tx.done, even with
     // the clock running between input bytes
-    const char *cmd = "e3 send hex=00\n";
+    const char *cmd = encode("e3 send hex=00\n");
     for (const char *c = cmd; *c; c++) {
         protocol_input(&proto, c, 1);
         fake_board_advance_frames(&fb, 1);
@@ -268,18 +326,19 @@ static void test_input(void) {
     CHECK_STR(talk("\n\r\n   \n"), "");
     CHECK_STR(talk("c2   get    tx.volume  \n"), "c2 tx.volume=-28\nc2 ok\n"); // Extra spaces are forgiven
 
-    // Too long: rejected with its tag, and the next line is fine
+    // Too long: it can't be checked, so not even its tag is trusted; the
+    // answer is an event (with a sequence number), and the next line is fine
     static char line[1600];
     strcpy(line, "c3 send hex=");
     for (int i = 0; i < 1500; i++) strcat(line, "0");
     strcat(line, "\n");
-    CHECK_STR(talk(line), "c3 err 500 line longer than 1024 characters\n");
+    CHECK_STR(talk(line), "* err seq=1 500 line too long\n");
     CHECK_STR(talk("c4 get tx.volume\n"), "c4 tx.volume=-28\nc4 ok\n");
 
-    // No usable tag
-    CHECK_STR(talk("*bad thing\n"), "* err 500 line has no valid tag\n");
-    CHECK_STR(talk("abcdefghi hello\n"), "* err 500 line has no valid tag\n");
-    CHECK_STR(talk("a-1 hello\n"), "* err 500 line has no valid tag\n");
+    // No usable tag (checked lines, so the tag is genuinely missing or bad)
+    CHECK_STR(talk("*bad thing\n"), "* err seq=2 500 line has no valid tag\n");
+    CHECK_STR(talk("abcdefghi hello\n"), "* err seq=3 500 line has no valid tag\n");
+    CHECK_STR(talk("a-1 hello\n"), "* err seq=4 500 line has no valid tag\n");
 
     CHECK_STR(talk("c5\n"), "c5 err 501 no command\n");
     CHECK_STR(talk("c6 dance\n"), "c6 err 501 unknown command dance\n");
@@ -291,7 +350,7 @@ static void test_input(void) {
     // A tag may be reused; lines may arrive a byte at a time
     CHECK_STR(talk("x hello\nx hello\n"),
         "x proto=1 version=test id=0011223344556677\nx ok\nx proto=1 version=test id=0011223344556677\nx ok\n");
-    const char *cmd = "d2 get tx.volume\n";
+    const char *cmd = encode("d2 get tx.volume\n");
     for (const char *c = cmd; *c; c++) protocol_input(&proto, c, 1);
     CHECK_STR(drain(), "d2 tx.volume=-28\nd2 ok\n");
 }
@@ -343,6 +402,44 @@ static void test_save_load(void) {
     CHECK_STR(talk("w6 reset everything\n"), "w6 err 503 reset takes counters, rx or settings\n");
 }
 
+// Every line both ways starts with "XXXX ": CRC-16/CCITT of the rest
+static void test_checks_on_lines(void) {
+    CHECK_EQ_U(protocol_crc16("123456789", 9), 0x29B1); // The standard check value
+    setup();
+
+    // What the board sends: upper-case hex, a space, the line
+    char expect[64];
+    const char *k1 = encode("k1 get tx.volume\n");
+    protocol_input(&proto, k1, strlen(k1));
+    drain_raw();
+    snprintf(expect, sizeof expect, "%04X k1 tx.volume=-28\n%04X k1 ok\n",
+        protocol_crc16("k1 tx.volume=-28", 16), protocol_crc16("k1 ok", 5));
+    CHECK_STR(raw, expect);
+
+    // Lines that fail: no check, a damaged one, one character changed,
+    // no space after the check, and a 4-letter tag mistaken for a check
+    CHECK_STR(talk_raw("k2 hello\n"), "* err seq=1 500 line failed its check\n");
+    snprintf(expect, sizeof expect, "%04X k3 hello\n", protocol_crc16("k3 hello", 8) ^ 0x0100u);
+    CHECK_STR(talk_raw(expect), "* err seq=2 500 line failed its check\n");
+    snprintf(expect, sizeof expect, "%04X k4 hello\n", protocol_crc16("k4 hellp", 8));
+    CHECK_STR(talk_raw(expect), "* err seq=3 500 line failed its check\n");
+    snprintf(expect, sizeof expect, "%04Xk5 hello\n", protocol_crc16("k5 hello", 8));
+    CHECK_STR(talk_raw(expect), "* err seq=4 500 line failed its check\n");
+    CHECK_STR(talk_raw("abcd get tx.volume\n"), "* err seq=5 500 line failed its check\n");
+    CHECK_STR(talk("k6 get count.link_errors\n"), "k6 count.link_errors=5\nk6 ok\n");
+
+    // Lower case is accepted; blank lines need no check
+    snprintf(expect, sizeof expect, "%04x k7 get tx.volume\n\n", protocol_crc16("k7 get tx.volume", 16));
+    CHECK_STR(talk_raw(expect), "k7 tx.volume=-28\nk7 ok\n");
+
+    // Rubbish (as at power-up) between good lines costs only itself
+    snprintf(expect, sizeof expect, "\x13\xfe\x80garbage\n%04X k8 hello\n", protocol_crc16("k8 hello", 8));
+    CHECK_STR(talk_raw(expect),
+        "* err seq=6 500 line failed its check\nk8 proto=1 version=test id=0011223344556677\nk8 ok\n");
+
+    CHECK_STR(talk("k9 reset counters\nk10 get count.link_errors\n"), "k9 ok\nk10 count.link_errors=0\nk10 ok\n");
+}
+
 // The host stops reading: events are dropped and counted, commands wait,
 // and replies are never lost
 static void test_flow(void) {
@@ -355,8 +452,9 @@ static void test_flow(void) {
     CHECK(queued <= PROTOCOL_OUT_SIZE);
 
     // The first command is taken in but waits; the next isn't taken in yet
-    const char *cmds = "f1 get count.events_dropped\nf2 hello\n";
-    const size_t first = strlen("f1 get count.events_dropped\n");
+    static char cmds[128];
+    strcpy(cmds, encode("f1 get count.events_dropped\nf2 hello\n"));
+    const size_t first = (size_t)(strchr(cmds, '\n') + 1 - cmds);
     size_t used = protocol_input(&proto, cmds, strlen(cmds));
     CHECK_EQ_U(used, first);
     CHECK_EQ_U(protocol_input(&proto, cmds + used, strlen(cmds) - used), 0);
@@ -370,24 +468,33 @@ static void test_flow(void) {
         used += protocol_input(&proto, cmds + used, strlen(cmds) - used);
     }
     seen[total] = 0;
+    decode(seen);
+    strcpy(seen, out);
     char expect[64];
     snprintf(expect, sizeof expect, "f1 count.events_dropped=%lu\nf1 ok\n", (unsigned long)proto.events_dropped);
     CHECK(strstr(seen, expect) != NULL);
     CHECK(strstr(seen, "f2 ok\n") != NULL);
-    snprintf(expect, sizeof expect, "* overflow dropped=%lu\n", (unsigned long)proto.events_dropped);
+    // The notice follows the 100 packets (seq 1..100); the dropped ones
+    // left a gap in the sequence numbers just before it
+    snprintf(expect, sizeof expect, "* overflow seq=101 dropped=%lu\n", (unsigned long)proto.events_dropped);
     CHECK(strstr(seen, expect) != NULL);
+    const uint32_t delivered = 100u - proto.events_dropped;
+    snprintf(expect, sizeof expect, "* rx.packet seq=%lu ", (unsigned long)delivered);
+    CHECK(strstr(seen, expect) != NULL);
+    snprintf(expect, sizeof expect, "* rx.packet seq=%lu ", (unsigned long)delivered + 1u);
+    CHECK(strstr(seen, expect) == NULL);
     // Every event line that got through is whole
     uint32_t packets = 0;
     for (const char *s = seen; (s = strstr(s, "* rx.packet")) != NULL; s++) {
         const char *nl = strchr(s, '\n');
-        CHECK(nl && nl - s == (long)strlen("* rx.packet frame=7 crc=ok len=255 min_margin=1.500 weakest=0 weak=0 hex=") + 510);
+        CHECK(nl && strstr(s, " hex=") && nl - strstr(s, " hex=") == 5 + 510);
         packets++;
     }
     CHECK_EQ_U(packets + proto.events_dropped, 100);
 
     // Afterwards events flow again, and reset counters clears the count
     inject_packet(1);
-    CHECK(strncmp(drain(), "* rx.packet", 11) == 0);
+    CHECK(strncmp(drain(), "* rx.packet seq=102 ", 20) == 0);
     CHECK_STR(talk("f3 reset counters\nf4 get count.events_dropped\n"), "f3 ok\nf4 count.events_dropped=0\nf4 ok\n");
 }
 
@@ -401,6 +508,7 @@ int main(void) {
     RUN_TEST(test_input);
     RUN_TEST(test_nudge);
     RUN_TEST(test_save_load);
+    RUN_TEST(test_checks_on_lines);
     RUN_TEST(test_flow);
     printf("%d checks, %d failures\n", test_checks, test_failures);
     return test_failures != 0;

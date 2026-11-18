@@ -103,6 +103,7 @@ static const StatusDef_t STATUS[] = {
     S_U("count.lost", lost, "Packets abandoned when the signal went"),
     S_U("count.rx_dropped", rx_dropped, "Received packets lost between the cores"),
     S_U("count.events_dropped", events_dropped, "Events dropped because the host was not reading"),
+    S_U("count.link_errors", link_errors, "Lines from the host that failed their check (or were too long to check)"),
     S_U("tx.queued", tx_queued, "Packets waiting to be sent"),
     S_W("rx.state", rx_state, RX_STATES, "Packet receiver state"),
     S_U("rx.delay", rx_delay, "Receive window delay, samples (moved by alignment, tracking and nudge)"),
@@ -189,6 +190,49 @@ static void out_put(Protocol_t *p, const char *data, uint32_t n) {
     }
 }
 
+// CRC-16/CCITT (poly 0x1021, init 0xFFFF): the same CRC as the packets
+// (packet_crc16), table driven because every line in and out goes through it
+static uint16_t crc_table[256];
+
+static void crc_table_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint16_t c = (uint16_t)(i << 8);
+        for (int b = 0; b < 8; b++) c = (c & 0x8000u) ? (uint16_t)((c << 1) ^ 0x1021u) : (uint16_t)(c << 1);
+        crc_table[i] = c;
+    }
+}
+
+uint16_t protocol_crc16(const char *data, size_t length) {
+    if (crc_table[1] == 0) crc_table_init();
+    uint16_t crc = 0xFFFFu;
+    for (size_t i = 0; i < length; i++) {
+        crc = (uint16_t)((crc << 8) ^ crc_table[((crc >> 8) ^ (uint8_t)data[i]) & 0xFFu]);
+    }
+    return crc;
+}
+
+// Queues one line (text ends with its LF) with its check in front:
+// "XXXX text"; needs n + PROTOCOL_CHECK_LEN bytes free
+static void out_put_line(Protocol_t *p, const char *text, uint32_t n) {
+    static const char HEX[] = "0123456789ABCDEF";
+    const uint16_t crc = protocol_crc16(text, n - 1u);
+    const char check[PROTOCOL_CHECK_LEN] = {
+        HEX[crc >> 12], HEX[(crc >> 8) & 15], HEX[(crc >> 4) & 15], HEX[crc & 15], ' ' };
+    out_put(p, check, PROTOCOL_CHECK_LEN);
+    out_put(p, text, n);
+}
+
+// Queues every line of a block of text
+static void out_put_lines(Protocol_t *p, const char *text, uint32_t n) {
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (text[i] == '\n') {
+            out_put_line(p, text + start, i + 1u - start);
+            start = i + 1u;
+        }
+    }
+}
+
 size_t protocol_output(Protocol_t *p, char *buf, size_t max) {
     size_t n = 0;
     while (n < max && p->out_tail != p->out_head) {
@@ -200,15 +244,19 @@ size_t protocol_output(Protocol_t *p, char *buf, size_t max) {
 // ---------------------------------------------------------------------------
 // Building a reply
 // ---------------------------------------------------------------------------
+// Appends to the reply. Its size includes the check each line will get,
+// so a whole reply always fits in PROTOCOL_REPLY_MAX bytes of output
 static void reply_vadd(Protocol_t *p, const char *fmt, va_list ap) {
     if (p->reply_overflow) return;
     const size_t room = PROTOCOL_REPLY_MAX - p->reply_len;
     const int n = vsnprintf(p->reply + p->reply_len, room, fmt, ap);
     if (n < 0 || (size_t)n >= room) {
         p->reply_overflow = true;
-    } else {
-        p->reply_len += (uint32_t)n;
+        return;
     }
+    for (int i = 0; i < n; i++) p->reply_lines += p->reply[p->reply_len + (uint32_t)i] == '\n';
+    p->reply_len += (uint32_t)n;
+    if (p->reply_len + p->reply_lines * PROTOCOL_CHECK_LEN > PROTOCOL_REPLY_MAX) p->reply_overflow = true;
 }
 
 static void reply_add(Protocol_t *p, const char *fmt, ...) {
@@ -231,6 +279,7 @@ static void reply_line(Protocol_t *p, const char *tag, const char *fmt, ...) {
 // Replaces anything built so far with "<tag> err <code> <text>"
 static void reply_err(Protocol_t *p, const char *tag, int code, const char *fmt, ...) {
     p->reply_len = 0;
+    p->reply_lines = 0;
     p->reply_overflow = false;
     reply_add(p, "%s err %d ", tag, code);
     va_list ap;
@@ -289,6 +338,7 @@ static void fill_status(Protocol_t *p, ProtocolStatus_t *st) {
     st->link_symbols = symbols_for(p->settings.value[SETTING_LINK_SPACING]);
     st->link_bits = (uint32_t)__builtin_ctz(st->link_symbols);
     st->events_dropped = p->events_dropped;
+    st->link_errors = p->link_errors;
 }
 
 // "name" matches itself; "prefix.*" and "*" match by prefix
@@ -393,11 +443,13 @@ static void range_err(Protocol_t *p, const char *tag, const ProtocolSettings_t *
     if (d->choices) {
         reply_err(p, tag, PROTO_ERR_RANGE, "%s must be one of", d->name);
         p->reply_len--; // Before the newline
+        p->reply_lines--;
         for (uint32_t c = 0; d->choices[c]; c++) reply_add(p, "%s%s", c ? "," : " ", d->choices[c]);
         reply_add(p, "\n");
     } else if (d->allowed) {
         reply_err(p, tag, PROTO_ERR_RANGE, "%s must be one of", d->name);
         p->reply_len--;
+        p->reply_lines--;
         for (uint32_t c = 0; c < d->allowed_count; c++) reply_add(p, "%s%ld", c ? "," : " ", (long)d->allowed[c]);
         reply_add(p, "\n");
     } else {
@@ -504,6 +556,7 @@ static void cmd_reset(Protocol_t *p, const char *tag, uint32_t argc, char **argv
     if (strcmp(argv[0], "counters") == 0) {
         if (p->board->reset_counters) p->board->reset_counters(p->board->ctx);
         p->events_dropped = 0;
+        p->link_errors = 0;
     } else if (strcmp(argv[0], "rx") == 0) {
         if (p->board->reset_rx) p->board->reset_rx(p->board->ctx);
     } else if (strcmp(argv[0], "settings") == 0) {
@@ -584,6 +637,21 @@ static bool valid_tag(const char *t) {
     return true;
 }
 
+static void emit_link_error(Protocol_t *p, const char *why);
+
+// "XXXX text": four hex digits (either case), a space, then the text they
+// check
+static bool check_ok(const char *line, uint32_t n) {
+    if (n < PROTOCOL_CHECK_LEN || line[PROTOCOL_CHECK_LEN - 1u] != ' ') return false;
+    uint32_t value = 0;
+    for (uint32_t i = 0; i < 4u; i++) {
+        const int d = hex_digit(line[i]);
+        if (d < 0) return false;
+        value = value << 4 | (uint32_t)d;
+    }
+    return value == protocol_crc16(line + PROTOCOL_CHECK_LEN, n - PROTOCOL_CHECK_LEN);
+}
+
 static void reset_line(Protocol_t *p) {
     p->line_len = 0;
     p->line_too_long = false;
@@ -601,17 +669,36 @@ static bool run_line(Protocol_t *p) {
     if (p->line_len > 0 && p->line[p->line_len - 1] == '\r') p->line[--p->line_len] = 0;
 
     p->reply_len = 0;
+    p->reply_lines = 0;
     p->reply_overflow = false;
+
+    // Empty lines (or only spaces) are ignored
+    bool blank = !p->line_too_long;
+    for (uint32_t i = 0; i < p->line_len && blank; i++) blank = p->line[i] == ' ';
+    if (blank) {
+        reset_line(p);
+        return true;
+    }
+    // The check: nothing on a line that fails it can be trusted, not even
+    // the tag, so the answer is an event
+    if (p->line_too_long || !check_ok(p->line, p->line_len)) {
+        p->link_errors++;
+        emit_link_error(p, p->line_too_long ? "line too long" : "line failed its check");
+        reset_line(p);
+        return true;
+    }
+    char *const text = p->line + PROTOCOL_CHECK_LEN;
+    const uint32_t text_len = p->line_len - PROTOCOL_CHECK_LEN;
 
     // Split into words (runs of spaces count as one)
     char *argv[MAX_ARGS + 2];
     uint32_t argc = 0;
     bool too_many = false, bad_char = false;
-    for (uint32_t i = 0; i < p->line_len; i++) {
-        const char c = p->line[i];
+    for (uint32_t i = 0; i < text_len; i++) {
+        const char c = text[i];
         if (c < 0x20 || c > 0x7E) bad_char = true;
     }
-    for (char *s = p->line; *s;) {
+    for (char *s = text; *s;) {
         while (*s == ' ') *s++ = 0;
         if (!*s) break;
         if (argc == MAX_ARGS + 2) { too_many = true; break; }
@@ -619,14 +706,9 @@ static bool run_line(Protocol_t *p) {
         while (*s && *s != ' ') s++;
     }
 
-    if (argc == 0 && !p->line_too_long) {
-        reset_line(p); // Empty line: ignored
-        return true;
-    }
     if (argc == 0 || !valid_tag(argv[0])) {
-        reply_add(p, "* err %d line has no valid tag\n", PROTO_ERR_SYNTAX);
-    } else if (p->line_too_long) {
-        reply_err(p, argv[0], PROTO_ERR_SYNTAX, "line longer than %u characters", PROTOCOL_LINE_MAX);
+        // An event (there is no tag to reply to), so it takes a sequence number
+        reply_add(p, "* err seq=%lu %d line has no valid tag\n", (unsigned long)p->next_seq++, PROTO_ERR_SYNTAX);
     } else if (bad_char) {
         reply_err(p, argv[0], PROTO_ERR_SYNTAX, "characters other than printable ASCII");
     } else if (argc == 1) {
@@ -645,7 +727,7 @@ static bool run_line(Protocol_t *p) {
             if (p->reply_overflow) reply_err(p, tag, PROTO_ERR_SYNTAX, "reply too long; ask for less");
         }
     }
-    out_put(p, p->reply, p->reply_len);
+    out_put_lines(p, p->reply, p->reply_len);
     reset_line(p);
     return true;
 }
@@ -674,22 +756,31 @@ size_t protocol_input(Protocol_t *p, const char *data, size_t length) {
 static void report_overflow(Protocol_t *p) {
     if (p->events_dropped_pending == 0) return;
     char line[48];
-    const int n = snprintf(line, sizeof line, "* overflow dropped=%lu\n", (unsigned long)p->events_dropped_pending);
-    if (out_free(p) >= (uint32_t)n + PROTOCOL_LINE_MAX + 1u) {
-        out_put(p, line, (uint32_t)n);
+    const int n = snprintf(line, sizeof line, "* overflow seq=%lu dropped=%lu\n",
+        (unsigned long)p->next_seq, (unsigned long)p->events_dropped_pending);
+    if (out_free(p) >= (uint32_t)n + PROTOCOL_CHECK_LEN + PROTOCOL_LINE_MAX + 1u) {
+        p->next_seq++;
+        out_put_line(p, line, (uint32_t)n);
         p->events_dropped_pending = 0;
     }
 }
 
-// Queues a complete event line, or drops (and counts) it
+// Queues a complete event line, or drops (and counts) it. Its sequence
+// number was taken when it was made, so a dropped event leaves a gap
 static void emit(Protocol_t *p, const char *line, uint32_t n) {
     report_overflow(p);
-    if (p->events_dropped_pending == 0 && out_free(p) >= n) {
-        out_put(p, line, n);
+    if (p->events_dropped_pending == 0 && out_free(p) >= n + PROTOCOL_CHECK_LEN) {
+        out_put_line(p, line, n);
     } else {
         p->events_dropped++;
         p->events_dropped_pending++;
     }
+}
+
+static void emit_link_error(Protocol_t *p, const char *why) {
+    char line[80];
+    const int n = snprintf(line, sizeof line, "* err seq=%lu %d %s\n", (unsigned long)p->next_seq++, PROTO_ERR_SYNTAX, why);
+    emit(p, line, (uint32_t)n);
 }
 
 void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
@@ -697,35 +788,36 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
     char *line = p->event_line;
     const size_t size = sizeof p->event_line;
     const unsigned long frame = (unsigned long)e->frame;
+    const unsigned long seq = (unsigned long)p->next_seq++;
     int n = 0;
     switch (e->type) {
         case PROTO_EV_RX_LOCKED:
-            n = snprintf(line, size, "* rx.locked frame=%lu align=%+ld fraction=%+.3f moved=%+ld\n", frame,
+            n = snprintf(line, size, "* rx.locked seq=%lu frame=%lu align=%+ld fraction=%+.3f moved=%+ld\n", seq, frame,
                 (long)e->u.locked.align, (double)e->u.locked.fraction, (long)e->u.locked.moved);
             break;
         case PROTO_EV_RX_TRAINED:
-            n = snprintf(line, size, "* rx.trained frame=%lu b_start=%lu coherence=%.3f strongest=%+ld earliest=%+ld\n",
-                frame, (unsigned long)e->u.trained.b_start, (double)e->u.trained.coherence,
+            n = snprintf(line, size, "* rx.trained seq=%lu frame=%lu b_start=%lu coherence=%.3f strongest=%+ld earliest=%+ld\n",
+                seq, frame, (unsigned long)e->u.trained.b_start, (double)e->u.trained.coherence,
                 (long)e->u.trained.strongest, (long)e->u.trained.earliest);
             break;
         case PROTO_EV_RX_TRAIN_FAILED:
-            n = snprintf(line, size, "* rx.train_failed frame=%lu\n", frame);
+            n = snprintf(line, size, "* rx.train_failed seq=%lu frame=%lu\n", seq, frame);
             break;
         case PROTO_EV_RX_TONE:
-            n = snprintf(line, size, "* rx.tone frame=%lu\n", frame);
+            n = snprintf(line, size, "* rx.tone seq=%lu frame=%lu\n", seq, frame);
             break;
         case PROTO_EV_RX_HEADER_FAILED:
-            n = snprintf(line, size, "* rx.header_failed frame=%lu length=%lu\n", frame,
+            n = snprintf(line, size, "* rx.header_failed seq=%lu frame=%lu length=%lu\n", seq, frame,
                 (unsigned long)e->u.header_failed.length);
             break;
         case PROTO_EV_RX_LOST:
-            n = snprintf(line, size, "* rx.lost frame=%lu symbols=%lu\n", frame, (unsigned long)e->u.lost.symbols);
+            n = snprintf(line, size, "* rx.lost seq=%lu frame=%lu symbols=%lu\n", seq, frame, (unsigned long)e->u.lost.symbols);
             break;
         case PROTO_EV_RX_PACKET: {
             uint32_t len = e->u.packet.length;
             if (len > PROTOCOL_PAYLOAD_MAX) len = PROTOCOL_PAYLOAD_MAX;
-            n = snprintf(line, size, "* rx.packet frame=%lu crc=%s len=%lu min_margin=%.3f weakest=%lu weak=%lu hex=",
-                frame, e->u.packet.crc_ok ? "ok" : "bad", (unsigned long)len, (double)e->u.packet.min_margin,
+            n = snprintf(line, size, "* rx.packet seq=%lu frame=%lu crc=%s len=%lu min_margin=%.3f weakest=%lu weak=%lu hex=",
+                seq, frame, e->u.packet.crc_ok ? "ok" : "bad", (unsigned long)len, (double)e->u.packet.min_margin,
                 (unsigned long)e->u.packet.weakest, (unsigned long)e->u.packet.weak);
             for (uint32_t i = 0; i < len; i++) {
                 line[n++] = HEX[e->u.packet.payload[i] >> 4];
@@ -736,8 +828,8 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
         }
         case PROTO_EV_TX_START:
         case PROTO_EV_TX_DONE:
-            n = snprintf(line, size, "* tx.%s frame=%lu id=%lu\n", e->type == PROTO_EV_TX_START ? "start" : "done",
-                frame, (unsigned long)e->u.tx.id);
+            n = snprintf(line, size, "* tx.%s seq=%lu frame=%lu id=%lu\n", e->type == PROTO_EV_TX_START ? "start" : "done",
+                seq, frame, (unsigned long)e->u.tx.id);
             break;
     }
     if (n > 0) emit(p, line, (uint32_t)n);
@@ -764,7 +856,7 @@ void protocol_start(Protocol_t *p) {
     p->settings = s;
     if (p->board->apply) p->board->apply(p->board->ctx, &p->settings, BIT(SETTING_COUNT) - 1u);
     char line[160];
-    const int n = snprintf(line, sizeof line, "* hello proto=%d version=%s id=%s\n",
-        PROTOCOL_VERSION, p->board->version, p->board->board_id);
+    const int n = snprintf(line, sizeof line, "* hello seq=%lu proto=%d version=%s id=%s\n",
+        (unsigned long)p->next_seq++, PROTOCOL_VERSION, p->board->version, p->board->board_id);
     emit(p, line, (uint32_t)n);
 }

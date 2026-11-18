@@ -25,6 +25,17 @@ today must still be available (see the inventory at the end).
 
 ## Lines
 
+- **Every line, both ways, starts with a check:** four hex digits and a
+  space, then the line itself:
+  ```
+  38E8 k1 tx.volume=-28
+  ```
+  The four digits are the CRC-16/CCITT (poly 0x1021, init 0xFFFF, the same
+  CRC as the packets) of everything after the space, without the LF (or
+  CR). The board sends upper case and accepts either. The check is always
+  there, on every link; see Link errors for why. **The examples in this
+  document leave it out, for readability.** People typing use the PC
+  client, which adds and removes it.
 - ASCII text. Each line ends with LF (`\n`). The board accepts and ignores
   a CR before the LF, and sends LF only.
 - Words are separated by single spaces (the board forgives runs of
@@ -34,10 +45,11 @@ today must still be available (see the inventory at the end).
   A parser can take the rest of the line once it reaches it.
 - Printable ASCII only: a line with tabs or other control characters, or
   with bytes over 0x7E, is rejected (`err 500`).
-- Empty lines are ignored.
-- Maximum line length 1024 characters, both ways. That is enough for a
-  255-byte packet in hex (510 characters) plus the rest of the line. A
-  longer line is thrown away up to its LF and rejected with `err 500`.
+- Empty lines (or only spaces) are ignored, and need no check.
+- Maximum line length 1024 characters with the check, both ways. That is
+  enough for a 255-byte packet in hex (510 characters) plus the rest of the
+  line. A longer line can't be checked: it is thrown away up to its LF and
+  answered with the event `* err seq=<n> 500 line too long`.
 - Values:
 
   | Kind | Written as | Example |
@@ -54,13 +66,13 @@ today must still be available (see the inventory at the end).
 |---|---|---|
 | host | a tag | A command: `<tag> <command> [name=value ...]` |
 | board | the same tag | Part of that command's reply. The last line is `<tag> ok [...]` or `<tag> err <code> <text>` |
-| board | `*` | An event: `* <event> [name=value ...]`. It is never a reply to a command. |
+| board | `*` | An event: `* <event> seq=<n> [name=value ...]`. It is never a reply to a command. |
 
 A tag is 1–8 letters and digits, chosen by the host (e.g. `a1`, `7`,
 `x42`). The board doesn't check or remember tags, so the host may reuse
 them. If a line has no valid tag, the board can't address a reply to
-it, so it sends `* err 500 line has no valid tag`. That is the one event
-caused directly by the host.
+it, so it sends `* err seq=<n> 500 line has no valid tag`. That is the
+one event caused directly by the host.
 
 ### Ordering rules (the board promises these)
 
@@ -88,7 +100,7 @@ an event, and anything else is a reply to that tag.
 | `hello` | — | `proto=1 version=... id=...` | id: the Pico's unique id (useful with several boards) |
 | `get` | names (none = all) | one `name=value` line per setting/status | wildcards: `get rx.*` |
 | `set` | `name=value ...` | other settings it changed, on the `ok` line | all or nothing: one bad value rejects the whole command. E.g. `a8 set link.spacing=4` → `a8 ok test.symbol=8` (the symbol wrapped) |
-| `nudge` | `samples=<n>` (−1023 .. 1023) | `ok delay=<new>` | moves the receive window; positive = later (more delay). Today keys `z` `x` |
+| `nudge` | `samples=<n>` (−1023 .. 1023) | `ok delay=<new>` | moves the receive window; positive = later (more delay). Today keys `z` `x`. Relative, so not safe to repeat blindly (see Link errors) |
 | `list` | names (none = all) | one line per item: name, kind, type, range, units, help | for clients and humans; generated from the table |
 | `send` | `hex=<bytes>` | `ok id=<n>` | queues a packet; later `* tx.start id=` and `* tx.done id=` |
 | `sub` | `stream=<name> [every=<n>] [fields=a,b,...] [units=db\|power]` | — | start or change a stream (see Streams) |
@@ -109,10 +121,10 @@ board:  a2 ok
 host:   a3 set tx.volume=-60
 board:  a3 err 503 tx.volume out of range -55..-1
 host:   a4 send hex=6869
-board:  * rx.packet crc=ok len=16 min_margin=2.31 weak=0 hex=...
+board:  * rx.packet seq=40 frame=1803 crc=ok len=16 min_margin=2.310 weakest=3 weak=0 hex=...
 board:  a4 ok id=7
-board:  * tx.start id=7
-board:  * tx.done id=7
+board:  * tx.start seq=41 frame=1811 id=7
+board:  * tx.done seq=42 frame=1837 id=7
 ```
 
 ## Settings and status
@@ -148,6 +160,7 @@ a side effect, the `ok` line lists it. (See Decisions for the parked
 | `count.records_dropped` | per-frame records lost between the cores |
 | `count.good`, `count.bad`, `count.header_failed`, `count.lost`, `count.rx_dropped` | packets received (today: the display's Packets line) |
 | `count.events_dropped` | events thrown away because the host wasn't reading (see Flow) |
+| `count.link_errors` | lines from the host that failed their check (see Link errors) |
 | `tx.queued` | packets waiting to be sent |
 | `rx.state` | search, lock, train, header, payload |
 | `rx.delay` | receive window delay, 0 .. 1023 samples (start 960). Moved by alignment, tracking and `nudge` |
@@ -158,6 +171,13 @@ a side effect, the `ok` line lists it. (See Decisions for the parked
 
 Each event is sent when something happens. None are sent on a schedule;
 schedules are what Streams are for.
+
+Every event's first field is `seq=<n>`: 0 for `* hello` at start-up, then
+one more for each event the board makes, including any it has to drop. A
+gap in `seq` therefore means lines were lost, either dropped because the
+host wasn't reading (and then `* overflow` says how many) or damaged on
+the way. A `seq=0` means the board has restarted. The fields shown below
+come after `seq`.
 
 | Event | Fields | Today |
 |---|---|---|
@@ -171,6 +191,7 @@ schedules are what Streams are for.
 | `* rx.packet` | `frame crc=ok\|bad len min_margin weakest weak hex` | `# packet ...` |
 | `* tx.start` / `* tx.done` | `id` | (new) |
 | `* overflow` | `dropped=<n>` | (new) see Flow |
+| `* err` | `500 <text>` | (new) a line from the host that failed its check, was too long, or had no valid tag (see Link errors) |
 
 `rx.packet` is sent for bad packets too. The payload is often still
 useful for diagnosis, and the host can decide what to do with it.
@@ -210,8 +231,9 @@ up streams again, much like the current CSV.
 
 ## Flow: when the host doesn't read
 
-Output goes through one fixed-size queue on core 0 (*12 KB*); one reply is
-at most *4 KB* (`list` of everything is about 3.7 KB). If it fills:
+Output goes through one fixed-size queue on core 0 (*16 KB*); one reply is
+at most *6 KB* with its checks (`list` of everything is about 4 KB). If it
+fills:
 
 1. Stream events are dropped first. A missing frame number shows the gap.
 2. Then other events, which are counted. When there is room again (for
@@ -220,12 +242,56 @@ at most *4 KB* (`list` of everything is about 3.7 KB). If it fills:
    Once events are being dropped, every later one is dropped until that
    notice has gone, so nothing slips through out of order.
 3. Replies are never dropped. A command is only run when there is room for
-   the longest possible reply (4 KB). Until then it waits, untouched, and
+   the longest possible reply (6 KB). Until then it waits, untouched, and
    the board takes in no more input, so a host that sends faster than it
    reads is slowed down rather than losing replies.
 
+(`seq` makes this checkable: the dropped events used up sequence numbers,
+so the gap just before `* overflow` matches its `dropped=`.)
+
 Core 1 is never held up by any of this. It already drops records when its
 queue to core 0 is full, and counts them (`count.records_dropped`).
+
+## Link errors
+
+Over USB the link is reliable: USB puts a CRC on every packet and retries
+failures in hardware. A UART is not reliable. The usual faults are lost
+bytes (overruns, where one side didn't read in time) and rubbish at
+power-up or when a board resets in the middle of a line.
+
+The usual mess comes from adding error detection to a protocol that was
+first used on a reliable link. Hosts written without it break when moved
+to a worse link, and an optional checksum makes lines ambiguous. So this
+protocol has the check on every line, on every link, from the start.
+
+1. **Every line is checked** (see Lines). It costs 5 bytes a line and
+   about 1% of core 0 at the busiest (table-driven CRC). A microcontroller
+   host needs about 15 lines of C for it. A line from the host that fails
+   (no check, a wrong check, no space after it, or too long to check) is
+   thrown away and counted in `count.link_errors`. Nothing on it can be
+   trusted, not even its tag, so the board answers with an event, not a
+   reply: `* err seq=<n> 500 line failed its check`. Someone typing
+   without the client therefore sees why nothing happened, and power-up
+   rubbish shows as one or two such events.
+2. **Lines re-synchronise.** After any amount of rubbish, the next LF
+   starts clean, so damage stays within one line.
+3. **Recovery is the host's job, using the protocol's own tools:** tags
+   and time limits show a reply that never came; `seq` shows a missing
+   event (and `seq=0` a restart); almost everything can be read again with
+   `get`. Only the host knows whether a command is safe to repeat, so
+   nothing retransmits at the link level (no XMODEM-style acknowledgement
+   of each line). That would duplicate tags and time limits, the board
+   would have to keep state for every line, and nobody acknowledges
+   events. Commands are kept safe to repeat:
+   - `get`, `set`, `list`, `reset`, `save`, `load` and `hello` already are.
+   - `nudge` is not, because it is relative. Repeating it moves the
+     window twice. It is kept as it is: it is a diagnostic, mostly used
+     by hand. A host retrying it should first read `rx.delay` to see
+     whether the first one happened. It may be removed one day.
+   - `send` is not: a repeat would transmit the packet twice. *Not built
+     yet:* an optional host-chosen `ref=<word>`. The board remembers the
+     last few refs and, on a repeat, replies with the original
+     `ok id=<n>` without queuing again.
 
 ## Error codes
 
@@ -237,7 +303,7 @@ later; 5xx means the command is wrong.
 | 450 | transmit queue full |
 | 451 | busy (e.g. spacing change still being applied) |
 | 452 | not available yet (e.g. `save` before flash storage exists) |
-| 500 | line not understood (no tag, bad characters, too long) |
+| 500 | line not understood: bad characters (as a reply); failed its check, too long or no valid tag (as a `* err` event, since there is no trustworthy tag to reply to) |
 | 501 | unknown command |
 | 502 | unknown setting or status name |
 | 503 | value out of range or of the wrong type |
