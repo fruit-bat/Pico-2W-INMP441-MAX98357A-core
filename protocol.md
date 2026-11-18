@@ -2,8 +2,9 @@
 
 Status: the engine (`src/protocol.c`) runs on the PC against a pretend
 board (`tests/fake_board.c`). `tests/test_protocol.c` has the scenarios.
-Nothing runs on the board yet. Numbers in
-*italics* are guesses.
+The Python client (`tools/chirp_host.py`) talks to the same engine
+through `tests/build/protocol_sim`. Nothing runs on the board yet.
+Numbers in *italics* are guesses.
 
 The board talks to a host (a PC or another microcontroller) over a byte
 stream: USB serial today, perhaps a UART later. This replaces the key
@@ -366,10 +367,23 @@ Scenario tests run in ctest like the others, for example:
   of range, a reused tag, CR+LF line ends, an empty line, bytes that aren't
   ASCII.
 
-Then a small Python client runs against the PC build through a pipe, and
-the same client runs against a real board. The client can also write the
-existing CSV log format from the streams, so `analyse_log.py` and the
-chirp lab keep working.
+Then the Python client, `tools/chirp_host.py`, runs against the PC build
+through a pipe. `tests/build/protocol_sim` is the engine and the fake
+board as a program, on a real-time clock (`--speed x` runs it faster).
+`tests/test_client.py` drives it end to end, in ctest. The same client
+will talk to a real board over USB serial:
+
+```
+python3 tools/chirp_host.py console --sim tests/build/protocol_sim
+python3 tools/chirp_host.py console --port /dev/ttyACM0
+```
+
+The console adds the tag and the check to what you type, and prints
+replies and events as they come (stream lines only with `--streams`). A
+line starting with `!` is sent as typed, with its check but no tag added.
+
+*Still to do:* the client writing the existing CSV log format from the
+streams, so `analyse_log.py` and the chirp lab keep working.
 
 ## Inventory: today's diagnostics and where they go
 

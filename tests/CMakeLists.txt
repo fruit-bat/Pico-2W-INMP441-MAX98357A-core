@@ -123,3 +123,15 @@ target_link_libraries(test_protocol PRIVATE m)
 target_include_directories(test_protocol PRIVATE ${SRC_DIR} ${CMAKE_CURRENT_LIST_DIR})
 target_compile_options(test_protocol PRIVATE -Wall -Wextra)
 add_test(NAME protocol COMMAND test_protocol)
+
+# The engine and the pretend board as a program (stdin/stdout), for hosts
+add_executable(protocol_sim protocol_sim.c fake_board.c ${SRC_DIR}/protocol.c)
+target_include_directories(protocol_sim PRIVATE ${SRC_DIR} ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(protocol_sim PRIVATE -Wall -Wextra)
+target_link_libraries(protocol_sim PRIVATE m)
+
+# The Python host client against the simulator, through a pipe
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_test(NAME client COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/test_client.py $<TARGET_FILE:protocol_sim>)
+endif()
