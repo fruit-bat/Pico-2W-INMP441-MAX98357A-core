@@ -119,7 +119,7 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PA
 
 | State | Each frame | Leaves when |
 |---|---|---|
-| SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 3 frames in a row → LOCK, measuring how far the window is out from the agreeing A frames (main.c then moves it; `set rx.align=off` turns that off) |
+| SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 4 frames in a row → LOCK, measuring how far the window is out from those 4 agreeing A frames (not the frame the first agreed with: see below) (main.c then moves it; `set rx.align=off` turns that off) |
 | LOCK | correlate with A's average spectrum | below 0.4 → TRAIN (B has started); over 16 frames → a steady tone, ignored until it changes |
 | TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths → HEADER (deciding any data frames already in); else → SEARCH |
 | HEADER | matched decisions (`channel_template_decide`); collect 16 bits; check CRC-8 | CRC-8 good → PAYLOAD; bad → SEARCH |
@@ -181,6 +181,32 @@ minute.) With sub-bin alignment, 30 packets each way: all intact; lowest
 margin 1.005 (2 → 1) and 1.17 (1 → 2). For 2 → 1 the margins were best with
 the residual slightly negative, so its best target is a few samples off the
 bin centre; the target could be tuned per channel later.
+
+**Only whole A frames (2026-11-18).** The lock used to wait for 3
+agreements and measure from 4 frames: the 3 agreeing ones and the frame the
+first of them agreed with. With the window about half a frame out, that
+oldest frame holds only part of A. On board 2 it once held stray energy
+exactly 20 bins above A's peak, the edge of the earliest-path search. The
+lock moved the window 10 bins instead of 30, B's coherence fell to 0.42, and
+the packet failed. That happened twice in about 50 first packets, and was
+reproduced by nudging the window there after the board had heard itself.
+Now the lock waits for a 4th agreement and measures from the 4 agreeing
+frames, all whole A frames. A is 8 frames, so the window still moves before
+B. `test_partial_first_frame` replays the logged frames.
+
+| Packets intact of 40 (model) | Old (3 agreements + the frame before) | Measure the 3 agreeing only | Now: 4 agreements, measure those |
+|---|---|---|---|
+| 4 bins/symbol, measured room, 0 / −6 dB | 40 / 37 | 40 / 37 | 40 / 40 |
+| 4 bins/symbol, harsh room, 0 / −6 dB | 40 / 40 | 40 / 40 | 40 / 40 |
+| 1 bin/symbol, measured room, 0 / −6 dB | 40 / 37 | 40 / 37 | 40 / 40 |
+| 1 bin/symbol, harsh room, 0 / −6 dB | 40 / 40 | 38 / 35 | 38 / 36 |
+
+The cost is in the model's harsh room at 1 bin/symbol. Its echo 672
+samples late is as strong as the direct path, and from whole A frames it
+looks just as "early". The old partial frame came before that echo
+arrived, so it happened to favour the direct path. On the boards
+afterwards: 30/30 with the window moved −394 to −501 samples (the band that
+failed), and 20/20 in normal traffic.
 
 **Which path to align to:** aligning to the earliest strong copy (direct
 path) means late copies carry a little of the previous symbol; the other

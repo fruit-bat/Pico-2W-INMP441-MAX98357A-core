@@ -83,7 +83,7 @@
 
 // Thresholds on the frame-to-frame correlation and on B's coherence
 #define PACKET_RX_LOCK_CORRELATION   0.5f  // SEARCH -> LOCK when this many consecutive frames agree...
-#define PACKET_RX_LOCK_FRAMES        3u    // ...this many times in a row
+#define PACKET_RX_LOCK_FRAMES        4u    // ...this many times in a row (A is 8 frames: the window still moves before B)
 #define PACKET_RX_CHANGE_CORRELATION 0.4f  // LOCK -> TRAIN when a frame agrees with A less than this
 #define PACKET_RX_MAX_LOCK_FRAMES    16u   // Longer than this in LOCK: a steady tone, not a packet
 #define PACKET_RX_START_SEARCH       2     // B's start is looked for this many frames either side of the change

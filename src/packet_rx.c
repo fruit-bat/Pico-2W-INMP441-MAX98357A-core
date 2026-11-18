@@ -107,14 +107,19 @@ static void find_paths(const PacketRx_t *rx, const float32_t *shape, int32_t *st
     *earliest_out = signed_offset(earliest, n);
 }
 
-// Entering LOCK: the path shape of the agreeing A frames (this one and the
-// PACKET_RX_LOCK_FRAMES before it), each normalised as channel_template does,
-// and how far the window is out
+// Entering LOCK: the path shape of the agreeing A frames, each normalised as
+// channel_template does, and how far the window is out. The agreeing frames
+// are this one and the PACKET_RX_LOCK_FRAMES - 1 before it: each agreed with
+// the frame before. The frame before them (what the first agreed with) is
+// left out: with the window well out it holds only part of A, and its stray
+// energy was once taken for the earliest path (board 2, 2026-11-18: moved
+// 10 bins instead of 30, and the packet failed). Waiting for a fourth
+// agreement keeps four frames in the average (packet_format.md)
 static void __not_in_flash_func(measure_alignment)(PacketRx_t *rx, uint32_t frame) {
     const uint32_t n = rx->bins;
     float32_t shape[64];
     memset(shape, 0, n * sizeof(*shape));
-    for (uint32_t i = 0; i <= PACKET_RX_LOCK_FRAMES; i++) {
+    for (uint32_t i = 0; i < PACKET_RX_LOCK_FRAMES; i++) {
         const float32_t *p = history_frame(rx, frame - i);
         float32_t total = 0.0f;
         for (uint32_t k = 0; k < n; k++) total += p[k];
@@ -129,7 +134,7 @@ static void __not_in_flash_func(measure_alignment)(PacketRx_t *rx, uint32_t fram
     // values either side of a bin edge (+0.49, -0.49) average correctly
     const float32_t two_pi = 6.28318531f;
     float32_t c = 0.0f, s = 0.0f;
-    for (uint32_t i = 0; i <= PACKET_RX_LOCK_FRAMES; i++) {
+    for (uint32_t i = 0; i < PACKET_RX_LOCK_FRAMES; i++) {
         const float32_t x = rx->centre[(frame - i) % PACKET_RX_HISTORY];
         c += cosf(two_pi * x);
         s += sinf(two_pi * x);

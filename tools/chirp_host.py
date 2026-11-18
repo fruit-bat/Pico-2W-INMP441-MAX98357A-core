@@ -535,6 +535,8 @@ class CsvLog:
         self._train = {"coherence": "0.000", "b_start": "0", "strongest": "+0", "earliest": "+0"}
         self._last_frame = None
         self._chained = None
+        self._ready = False  # Set once every stream is subscribed
+        self._skip = None    # The frame in progress then: left out
 
     def start(self):
         b = self.board
@@ -578,6 +580,10 @@ class CsvLog:
         b.sub("band", units="power")
         b.sub("folded", units="power")
         b.sub("shape", units="power")
+        # The board sends its lines in order, so everything after the last
+        # sub's reply is for frames that had all four streams; anything
+        # earlier (a frame caught between two subs) is left out
+        self._ready = True
 
     def stop(self):
         b = self.board
@@ -594,8 +600,14 @@ class CsvLog:
     def _on_event(self, e):
         if self._chained:
             self._chained(e)
+        if not self._ready:
+            return
         frame = e.get("frame")
         if not isinstance(frame, int) or (e.name not in STREAMS and e.name not in LOG_EVENT_CODES):
+            return
+        if self._skip is None:
+            self._skip = frame  # _ready may have been set part-way through this frame's lines
+        if frame <= self._skip:
             return
         if self._last_frame is not None and frame <= self._last_frame:
             return  # Before the log started, or already written
