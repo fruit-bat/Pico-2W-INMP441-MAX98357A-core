@@ -119,6 +119,7 @@ add_test(NAME packet_rx COMMAND test_packet_rx)
 
 # Host protocol engine (no DSP) against a pretend board
 add_executable(test_protocol test_protocol.c fake_board.c ${SRC_DIR}/protocol.c)
+target_link_libraries(test_protocol PRIVATE m)
 target_include_directories(test_protocol PRIVATE ${SRC_DIR} ${CMAKE_CURRENT_LIST_DIR})
 target_compile_options(test_protocol PRIVATE -Wall -Wextra)
 add_test(NAME protocol COMMAND test_protocol)

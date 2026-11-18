@@ -162,7 +162,7 @@ static void test_get(void) {
 
     const char *all = talk("a7 get\n");
     printf("  get (all): %lu lines, %lu bytes\n", (unsigned long)count_lines(all), (unsigned long)strlen(all));
-    CHECK_EQ_U(count_lines(all), SETTING_COUNT + 34u + 1u);
+    CHECK_EQ_U(count_lines(all), SETTING_COUNT + 35u + 1u);
     CHECK(strstr(all, "a7 info.f0=15000.0\n") != NULL);
     CHECK(strstr(all, "a7 count.events_dropped=0\n") != NULL);
     CHECK(strcmp(all + strlen(all) - 6, "a7 ok\n") == 0);
@@ -440,6 +440,185 @@ static void test_checks_on_lines(void) {
     CHECK_STR(talk("k9 reset counters\nk10 get count.link_errors\n"), "k9 ok\nk10 count.link_errors=0\nk10 ok\n");
 }
 
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+
+static bool starts(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static uint32_t count_char(const char *s, char c) {
+    uint32_t n = 0;
+    for (; *s; s++) n += *s == c;
+    return n;
+}
+
+static void test_sub_commands(void) {
+    setup();
+    CHECK_STR(talk("s1 sub\n"), "s1 ok\n"); // None yet
+    CHECK_STR(talk("s2 sub stream=frame fields=delay,rx_symbol every=4\n"), "s2 ok\n");
+    CHECK_STR(talk("s3 sub stream=folded units=power\n"), "s3 ok\n");
+    CHECK_STR(talk("s4 sub stream=spectrum from=10 to=19\n"), "s4 ok\n");
+    CHECK_STR(talk("s5 sub stream=shape\n"), "s5 ok\n");
+    const char *list =
+        "s6 stream=frame every=4 fields=delay,rx_symbol\n"
+        "s6 stream=folded every=1 units=power\n"
+        "s6 stream=shape units=db\n"
+        "s6 stream=spectrum every=1 units=db from=10 to=19\n"
+        "s6 ok\n";
+    CHECK_STR(talk("s6 sub\n"), list);
+
+    CHECK_STR(talk("e1 sub stream=video\n"), "e1 err 507 unknown stream video\n");
+    CHECK_STR(talk("e2 sub stream=frame fields=delay,colour\n"), "e2 err 507 frame has no field colour\n");
+    CHECK_STR(talk("e3 sub stream=folded fields=delay\n"), "e3 err 505 folded has no fields\n");
+    CHECK_STR(talk("e4 sub stream=frame units=db\n"), "e4 err 505 frame has no units\n");
+    CHECK_STR(talk("e5 sub stream=band units=loud\n"), "e5 err 503 units must be one of db,power\n");
+    CHECK_STR(talk("e6 sub stream=frame every=0\n"), "e6 err 503 every out of range 1..1000\n");
+    CHECK_STR(talk("e7 sub stream=shape every=2\n"), "e7 err 505 shape is sent when it changes; no every\n");
+    CHECK_STR(talk("e8 sub stream=band from=1\n"), "e8 err 505 only spectrum takes from and to\n");
+    const char *range = "err 503 from..to must be within 0..1023, at most 512 bins\n";
+    char expect[128];
+    snprintf(expect, sizeof expect, "e9 %s", range);
+    CHECK_STR(talk("e9 sub stream=spectrum from=0 to=512\n"), expect);
+    snprintf(expect, sizeof expect, "f1 %s", range);
+    CHECK_STR(talk("f1 sub stream=spectrum from=600 to=1024\n"), expect);
+    snprintf(expect, sizeof expect, "f2 %s", range);
+    CHECK_STR(talk("f2 sub stream=spectrum from=9 to=5\n"), expect);
+    CHECK_STR(talk("f3 sub every=2\n"), "f3 err 505 sub needs stream=<name>\n");
+    CHECK_STR(talk("f4 sub stream=frame stream=band\n"), "f4 err 505 stream given twice\n");
+    CHECK_STR(talk("f5 sub stream=frame colour=red\n"), "f5 err 505 sub has no argument colour\n");
+    CHECK_STR(talk("f6 sub frame\n"), "f6 err 505 expected name=value, not frame\n");
+    // A failed sub leaves things as they were
+    CHECK_STR(talk("s6 sub\n"), list);
+
+    CHECK_STR(talk("u1 unsub stream=folded\n"), "u1 ok\n");
+    CHECK_STR(talk("u2 unsub stream=folded\n"), "u2 ok\n"); // Safe to repeat
+    CHECK_STR(talk("u3 unsub stream=video\n"), "u3 err 507 unknown stream video\n");
+    CHECK_STR(talk("u4 unsub\n"), "u4 err 505 unsub takes stream=<name> or all\n");
+    CHECK_STR(talk("u5 unsub all\n"), "u5 ok\n");
+    CHECK_STR(talk("u6 sub\n"), "u6 ok\n");
+}
+
+static void test_stream_lines(void) {
+    setup();
+    // One frame in 4, chosen fields; the frame number always comes first
+    CHECK_STR(talk("a1 sub stream=frame fields=delay,state every=4\n"), "a1 ok\n");
+    fake_board_advance_frames(&fb, 8);
+    CHECK_STR(drain(), "* frame seq=1 frame=1 delay=960 state=search\n* frame seq=2 frame=5 delay=960 state=search\n");
+
+    // A new sub replaces the old one: every field
+    CHECK_STR(talk("a2 sub stream=frame\n"), "a2 ok\n");
+    fake_board_advance_frames(&fb, 1);
+    CHECK_STR(drain(), "* frame seq=3 frame=9 tx_symbol=0 delay=960 rx_symbol=0 angle=0.00000 error_angle=+0.20000 "
+        "magnitude=0.3000 strength=1.0000e-06 peak=0.0020 timing_error=+3.000 timing_rate=+0.0000 state=search "
+        "corr=+0.300 data_symbol=0 data_margin=0.000 data_quality=0.300\n");
+
+    // Spectra, in dB and as raw power
+    CHECK_STR(talk("a3 unsub all\na4 sub stream=folded\n"), "a3 ok\na4 ok\n");
+    static float folded[PROTOCOL_CHIRP_BINS], band[2u * PROTOCOL_CHIRP_BINS], spectrum[1024];
+    for (uint32_t i = 0; i < PROTOCOL_CHIRP_BINS; i++) folded[i] = 1e-3f;
+    folded[0] = 1.0f; folded[1] = 0.5f; folded[2] = 0.0f; folded[3] = 100.0f; folded[4] = 2.0f;
+    for (uint32_t i = 0; i < 2u * PROTOCOL_CHIRP_BINS; i++) band[i] = 1.0f;
+    for (uint32_t i = 0; i < 1024u; i++) spectrum[i] = 1.25e-5f * (float)(i + 1u);
+    ProtocolFrame_t f = { .frame = 500, .folded = folded, .band = band, .spectrum = spectrum, .spectrum_len = 1024 };
+    protocol_frame(&proto, &f);
+    const char *line = drain();
+    CHECK(starts(line, "* folded seq=4 frame=500 units=db values=0.0,-3.0,-200.0,20.0,3.0,-30.0,-30.0,"));
+    CHECK_EQ_U(count_char(line, ','), PROTOCOL_CHIRP_BINS - 1u);
+    CHECK_STR(talk("a5 sub stream=folded units=power\n"), "a5 ok\n");
+    protocol_frame(&proto, &f);
+    line = drain();
+    CHECK(starts(line, "* folded seq=5 frame=500 units=power values=1.000e+00,5.000e-01,0.000e+00,1.000e+02,"));
+
+    CHECK_STR(talk("a6 unsub all\na7 sub stream=band\n"), "a6 ok\na7 ok\n");
+    protocol_frame(&proto, &f);
+    line = drain();
+    CHECK(starts(line, "* band seq=6 frame=500 units=db values=0.0,0.0,"));
+    CHECK_EQ_U(count_char(line, ','), 2u * PROTOCOL_CHIRP_BINS - 1u);
+
+    CHECK_STR(talk("a8 unsub all\na9 sub stream=spectrum from=10 to=19 units=power\n"), "a8 ok\na9 ok\n");
+    protocol_frame(&proto, &f);
+    CHECK_STR(drain(), "* spectrum seq=7 frame=500 units=power from=10 values="
+        "1.375e-04,1.500e-04,1.625e-04,1.750e-04,1.875e-04,2.000e-04,2.125e-04,2.250e-04,2.375e-04,2.500e-04\n");
+
+    // The longest line there is: 512 bins as raw power
+    CHECK_STR(talk("b1 sub stream=spectrum from=512 to=1023 units=power\n"), "b1 ok\n");
+    protocol_frame(&proto, &f);
+    line = drain_raw();
+    printf("  512-bin spectrum as power: %lu bytes (limit %u)\n", (unsigned long)strlen(line), PROTOCOL_OUT_LINE_MAX);
+    CHECK(strlen(line) <= PROTOCOL_OUT_LINE_MAX + 1u);
+    line = decode(line);
+    CHECK_EQ_U(count_char(line, ','), 511);
+    CHECK(strstr(line, "from=512 values=6.413e-03,") != NULL);
+    CHECK(strstr(line, ",1.280e-02\n") != NULL);
+
+    // The shape: only when it is learned, here from the board's own packet
+    CHECK_STR(talk("b2 unsub all\nb3 sub stream=shape\nb4 send hex=00\n"), "b2 ok\nb3 ok\nb4 ok id=1\n");
+    fake_board_advance_frames(&fb, 40);
+    line = drain();
+    CHECK_EQ_U(count_char(line, '\n'), 6); // tx.start, rx.locked, rx.trained, shape, tx.done, rx.packet
+    const char *shape = strstr(line, "* shape seq=");
+    const char *trained = strstr(line, "* rx.trained");
+    CHECK(shape && trained && trained < shape && strstr(shape, " values=0.0,") != NULL);
+    CHECK(shape && strstr(shape, ",-5.2\n") != NULL); // The early path, 0.3 = -5.2 dB
+}
+
+// A slow host: streams are dropped long before replies or events suffer,
+// and seq still runs without a gap
+static void test_stream_priority(void) {
+    setup();
+    CHECK_STR(talk("p1 sub stream=frame\np2 sub stream=band\np3 sub stream=spectrum units=power\n"),
+        "p1 ok\np2 ok\np3 ok\n");
+    fake_board_advance_frames(&fb, 200); // 4.6 s, and the host reads nothing
+    const uint32_t queued = protocol_output_pending(&proto);
+    printf("  200 frames unread: %lu bytes queued, %lu stream lines dropped\n",
+        (unsigned long)queued, (unsigned long)proto.stream_dropped);
+    CHECK(proto.stream_dropped > 0);
+    CHECK(queued <= PROTOCOL_OUT_SIZE - PROTOCOL_REPLY_MAX - PROTOCOL_EVENT_RESERVE);
+
+    // Events still get in, and a command is answered at once
+    for (int i = 0; i < 3; i++) inject_packet(255);
+    CHECK_EQ_U(proto.events_dropped, 0);
+    const char *cmd = encode("p4 get count.stream_dropped count.events_dropped\n");
+    CHECK_EQ_U(protocol_input(&proto, cmd, strlen(cmd)), strlen(cmd));
+
+    const char *all = drain();
+    CHECK(strstr(all, "p4 ok\n") != NULL);
+    CHECK_EQ_U(count_char(all, '\n') > 0, 1);
+    // seq: one more on every event line, frames: gaps where lines were dropped
+    uint32_t last_seq = 0, last_frame = 0, frame_gaps = 0, packets = 0;
+    bool seq_ok = true;
+    for (const char *l = all; *l; l = strchr(l, '\n') + 1) {
+        if (*l != '*') continue;
+        unsigned long seq = 0, frame = 0;
+        const char *q = strstr(l, " seq=");
+        seq_ok = seq_ok && q && sscanf(q, " seq=%lu", &seq) == 1 && seq == last_seq + 1u;
+        last_seq = (uint32_t)seq;
+        if (strncmp(l, "* frame ", 8) == 0 && sscanf(strstr(l, " frame=") , " frame=%lu", &frame) == 1) {
+            if (last_frame && frame != last_frame + 1u) frame_gaps++;
+            last_frame = (uint32_t)frame;
+        }
+        if (strncmp(l, "* rx.packet ", 12) == 0) packets++;
+    }
+    CHECK(seq_ok);
+    CHECK_EQ_U(frame_gaps, 0); // What got through came in order...
+    CHECK_EQ_U(packets, 3);
+    printf("  delivered seq 1..%lu without a gap; frame lines skipped frames %lu times\n",
+        (unsigned long)last_seq, (unsigned long)frame_gaps);
+
+    // ...and reading again, the streams flow again from the current frame:
+    // the frame numbers show what was dropped, and seq carries straight on
+    fake_board_advance_frames(&fb, 1);
+    all = drain();
+    unsigned long seq = 0, frame = 0;
+    CHECK(sscanf(all, "* frame seq=%lu frame=%lu", &seq, &frame) == 2);
+    CHECK_EQ_U(seq, last_seq + 1u);
+    CHECK_EQ_U(frame, 201);
+    printf("  frame lines resumed at frame %lu after frame %lu\n", frame, (unsigned long)last_frame);
+    CHECK(strstr(all, "* spectrum seq=") != NULL);
+}
+
 // The host stops reading: events are dropped and counted, commands wait,
 // and replies are never lost
 static void test_flow(void) {
@@ -509,6 +688,9 @@ int main(void) {
     RUN_TEST(test_nudge);
     RUN_TEST(test_save_load);
     RUN_TEST(test_checks_on_lines);
+    RUN_TEST(test_sub_commands);
+    RUN_TEST(test_stream_lines);
+    RUN_TEST(test_stream_priority);
     RUN_TEST(test_flow);
     printf("%d checks, %d failures\n", test_checks, test_failures);
     return test_failures != 0;

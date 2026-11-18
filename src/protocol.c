@@ -18,6 +18,7 @@
 
 #include "protocol.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +105,7 @@ static const StatusDef_t STATUS[] = {
     S_U("count.rx_dropped", rx_dropped, "Received packets lost between the cores"),
     S_U("count.events_dropped", events_dropped, "Events dropped because the host was not reading"),
     S_U("count.link_errors", link_errors, "Lines from the host that failed their check (or were too long to check)"),
+    S_U("count.stream_dropped", stream_dropped, "Stream lines dropped to keep room for replies and events"),
     S_U("tx.queued", tx_queued, "Packets waiting to be sent"),
     S_W("rx.state", rx_state, RX_STATES, "Packet receiver state"),
     S_U("rx.delay", rx_delay, "Receive window delay, samples (moved by alignment, tracking and nudge)"),
@@ -339,6 +341,7 @@ static void fill_status(Protocol_t *p, ProtocolStatus_t *st) {
     st->link_bits = (uint32_t)__builtin_ctz(st->link_symbols);
     st->events_dropped = p->events_dropped;
     st->link_errors = p->link_errors;
+    st->stream_dropped = p->stream_dropped;
 }
 
 // "name" matches itself; "prefix.*" and "*" match by prefix
@@ -360,6 +363,58 @@ static int find_status(const char *name) {
         if (strcmp(STATUS[i].name, name) == 0) return (int)i;
     }
     return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+static const char *const STREAM_NAMES[PROTO_STREAM_COUNT] = {
+    [PROTO_STREAM_FRAME] = "frame",
+    [PROTO_STREAM_FOLDED] = "folded",
+    [PROTO_STREAM_BAND] = "band",
+    [PROTO_STREAM_SHAPE] = "shape",
+    [PROTO_STREAM_SPECTRUM] = "spectrum",
+};
+
+typedef enum { FF_U32, FF_FLOAT, FF_STATE } FrameFieldType_t;
+
+typedef struct {
+    const char *name;
+    FrameFieldType_t type;
+    size_t offset;
+    const char *fmt;
+} FrameField_t;
+
+#define FF(n, t, f) { #n, t, offsetof(ProtocolFrame_t, n), f }
+static const FrameField_t FRAME_FIELDS[] = {
+    FF(tx_symbol, FF_U32, "%lu"),
+    FF(delay, FF_U32, "%lu"),
+    FF(rx_symbol, FF_U32, "%lu"),
+    FF(angle, FF_FLOAT, "%.5f"),
+    FF(error_angle, FF_FLOAT, "%+.5f"),
+    FF(magnitude, FF_FLOAT, "%.4f"),
+    FF(strength, FF_FLOAT, "%.4e"),
+    FF(peak, FF_FLOAT, "%.4f"),
+    FF(timing_error, FF_FLOAT, "%+.3f"),
+    FF(timing_rate, FF_FLOAT, "%+.4f"),
+    FF(state, FF_STATE, NULL),
+    FF(corr, FF_FLOAT, "%+.3f"),
+    FF(data_symbol, FF_U32, "%lu"),
+    FF(data_margin, FF_FLOAT, "%.3f"),
+    FF(data_quality, FF_FLOAT, "%.3f"),
+};
+#define FRAME_FIELD_COUNT (sizeof FRAME_FIELDS / sizeof FRAME_FIELDS[0])
+#define ALL_FIELDS ((1u << FRAME_FIELD_COUNT) - 1u)
+
+static int find_stream(const char *name) {
+    for (uint32_t i = 0; i < PROTO_STREAM_COUNT; i++) {
+        if (strcmp(STREAM_NAMES[i], name) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static bool is_spectral(uint32_t stream) {
+    return stream != PROTO_STREAM_FRAME;
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +612,7 @@ static void cmd_reset(Protocol_t *p, const char *tag, uint32_t argc, char **argv
         if (p->board->reset_counters) p->board->reset_counters(p->board->ctx);
         p->events_dropped = 0;
         p->link_errors = 0;
+        p->stream_dropped = 0;
     } else if (strcmp(argv[0], "rx") == 0) {
         if (p->board->reset_rx) p->board->reset_rx(p->board->ctx);
     } else if (strcmp(argv[0], "settings") == 0) {
@@ -596,6 +652,126 @@ static void cmd_load(Protocol_t *p, const char *tag, uint32_t argc, char **argv)
     reply_ok(p, tag);
 }
 
+// One line describing a subscription (for "sub" with no arguments)
+static void reply_sub(Protocol_t *p, const char *tag, uint32_t stream) {
+    const ProtocolSub_t *s = &p->subs[stream];
+    reply_add(p, "%s stream=%s", tag, STREAM_NAMES[stream]);
+    if (stream != PROTO_STREAM_SHAPE) reply_add(p, " every=%lu", (unsigned long)s->every);
+    if (stream == PROTO_STREAM_FRAME) {
+        if (s->fields == ALL_FIELDS) {
+            reply_add(p, " fields=all");
+        } else {
+            const char *sep = " fields=";
+            for (uint32_t f = 0; f < FRAME_FIELD_COUNT; f++) {
+                if (s->fields & BIT(f)) { reply_add(p, "%s%s", sep, FRAME_FIELDS[f].name); sep = ","; }
+            }
+        }
+    } else {
+        reply_add(p, " units=%s", s->power ? "power" : "db");
+    }
+    if (stream == PROTO_STREAM_SPECTRUM) reply_add(p, " from=%lu to=%lu", (unsigned long)s->from, (unsigned long)s->to);
+    reply_add(p, "\n");
+}
+
+// sub stream=<name> [every=<n>] [fields=a,b,...] [units=db|power] [from=<bin> to=<bin>]
+// sub (no arguments): the subscriptions in force
+static void cmd_sub(Protocol_t *p, const char *tag, uint32_t argc, char **argv) {
+    if (argc == 0) {
+        for (uint32_t i = 0; i < PROTO_STREAM_COUNT; i++) {
+            if (p->subs[i].on) reply_sub(p, tag, i);
+        }
+        reply_ok(p, tag);
+        return;
+    }
+    const char *names[] = { "stream", "every", "fields", "units", "from", "to" };
+    enum { A_STREAM, A_EVERY, A_FIELDS, A_UNITS, A_FROM, A_TO, A_COUNT };
+    const char *value[A_COUNT] = { NULL };
+    for (uint32_t a = 0; a < argc; a++) {
+        char *eq = strchr(argv[a], '=');
+        if (!eq) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "expected name=value, not %s", argv[a]); return; }
+        *eq = 0;
+        uint32_t k = 0;
+        while (k < A_COUNT && strcmp(names[k], argv[a]) != 0) k++;
+        if (k == A_COUNT) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "sub has no argument %s", argv[a]); return; }
+        if (value[k]) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "%s given twice", argv[a]); return; }
+        value[k] = eq + 1;
+    }
+    if (!value[A_STREAM]) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "sub needs stream=<name>"); return; }
+    const int stream = find_stream(value[A_STREAM]);
+    if (stream < 0) { reply_err(p, tag, PROTO_ERR_STREAM, "unknown stream %s", value[A_STREAM]); return; }
+    const char *name = STREAM_NAMES[stream];
+
+    ProtocolSub_t s = { .on = true, .every = 1, .fields = ALL_FIELDS, .from = 0, .to = PROTOCOL_SPECTRUM_MAX - 1u };
+    if (value[A_EVERY]) {
+        int32_t every;
+        if (stream == PROTO_STREAM_SHAPE) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "shape is sent when it changes; no every"); return; }
+        if (!parse_int(value[A_EVERY], &every) || every < 1 || every > 1000) {
+            reply_err(p, tag, PROTO_ERR_RANGE, "every out of range 1..1000");
+            return;
+        }
+        s.every = (uint32_t)every;
+    }
+    if (value[A_FIELDS]) {
+        if (stream != PROTO_STREAM_FRAME) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "%s has no fields", name); return; }
+        s.fields = 0;
+        if (strcmp(value[A_FIELDS], "all") == 0) {
+            s.fields = ALL_FIELDS;
+        } else {
+            char *field = (char *)value[A_FIELDS];
+            while (field) {
+                char *comma = strchr(field, ',');
+                if (comma) *comma = 0;
+                uint32_t f = 0;
+                while (f < FRAME_FIELD_COUNT && strcmp(FRAME_FIELDS[f].name, field) != 0) f++;
+                if (f == FRAME_FIELD_COUNT && strcmp(field, "frame") != 0) {
+                    reply_err(p, tag, PROTO_ERR_STREAM, "frame has no field %s", field);
+                    return;
+                }
+                if (f < FRAME_FIELD_COUNT) s.fields |= BIT(f);
+                field = comma ? comma + 1 : NULL;
+            }
+        }
+    }
+    if (value[A_UNITS]) {
+        if (!is_spectral((uint32_t)stream)) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "%s has no units", name); return; }
+        if (strcmp(value[A_UNITS], "db") == 0) s.power = false;
+        else if (strcmp(value[A_UNITS], "power") == 0) s.power = true;
+        else { reply_err(p, tag, PROTO_ERR_RANGE, "units must be one of db,power"); return; }
+    }
+    if (value[A_FROM] || value[A_TO]) {
+        if (stream != PROTO_STREAM_SPECTRUM) { reply_err(p, tag, PROTO_ERR_ARGUMENT, "only spectrum takes from and to"); return; }
+        int32_t from = 0, to = (int32_t)PROTOCOL_SPECTRUM_MAX - 1;
+        if ((value[A_FROM] && !parse_int(value[A_FROM], &from)) || (value[A_TO] && !parse_int(value[A_TO], &to))
+            || from < 0 || to < from || to >= (int32_t)PROTOCOL_FFT_SIZE || to - from >= (int32_t)PROTOCOL_SPECTRUM_MAX) {
+            reply_err(p, tag, PROTO_ERR_RANGE, "from..to must be within 0..%u, at most %u bins",
+                PROTOCOL_FFT_SIZE - 1u, PROTOCOL_SPECTRUM_MAX);
+            return;
+        }
+        s.from = (uint32_t)from;
+        s.to = (uint32_t)to;
+    }
+    s.count = s.every - 1u; // The next frame is sent
+    p->subs[stream] = s;
+    reply_ok(p, tag);
+}
+
+// unsub stream=<name> | unsub all. Unsubscribing what isn't subscribed is fine
+static void cmd_unsub(Protocol_t *p, const char *tag, uint32_t argc, char **argv) {
+    if (argc == 1 && strcmp(argv[0], "all") == 0) {
+        for (uint32_t i = 0; i < PROTO_STREAM_COUNT; i++) p->subs[i].on = false;
+        reply_ok(p, tag);
+        return;
+    }
+    if (argc != 1 || strncmp(argv[0], "stream=", 7) != 0) {
+        reply_err(p, tag, PROTO_ERR_ARGUMENT, "unsub takes stream=<name> or all");
+        return;
+    }
+    const int stream = find_stream(argv[0] + 7);
+    if (stream < 0) { reply_err(p, tag, PROTO_ERR_STREAM, "unknown stream %s", argv[0] + 7); return; }
+    p->subs[stream].on = false;
+    reply_ok(p, tag);
+}
+
 static void cmd_help(Protocol_t *p, const char *tag, uint32_t argc, char **argv);
 
 static const struct {
@@ -608,6 +784,8 @@ static const struct {
     { "set",   cmd_set,   "set name=value ...: change settings (all or nothing); ok lists side effects" },
     { "list",  cmd_list,  "list [name|prefix.* ...]: describe settings and status" },
     { "send",  cmd_send,  "send hex=<bytes>: queue a packet; ok id=<n>, then * tx.start and * tx.done" },
+    { "sub",   cmd_sub,   "sub stream=frame|folded|band|shape|spectrum [every=n] [fields=a,b] [units=db|power] [from= to=]; sub alone lists" },
+    { "unsub", cmd_unsub, "unsub stream=<name> | unsub all" },
     { "nudge", cmd_nudge, "nudge samples=<n>: move the receive window (positive = later)" },
     { "reset", cmd_reset, "reset counters|rx|settings: clear counters, abandon reception, or restore defaults" },
     { "save",  cmd_save,  "save: keep the current settings for start-up" },
@@ -833,6 +1011,107 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
             break;
     }
     if (n > 0) emit(p, line, (uint32_t)n);
+}
+
+// Queues a stream line if it leaves room for a whole reply and some events;
+// else drops and counts it. It takes its sequence number only if it is sent
+// (so seq gaps still mean lost events), and nothing is sent while an
+// overflow is waiting to be reported (so the gap stays just before it)
+static void emit_stream(Protocol_t *p, uint32_t n) {
+    if (p->events_dropped_pending == 0
+        && out_free(p) >= n + PROTOCOL_CHECK_LEN + PROTOCOL_REPLY_MAX + PROTOCOL_EVENT_RESERVE) {
+        p->next_seq++;
+        out_put_line(p, p->event_line, n);
+    } else {
+        p->stream_dropped++;
+    }
+}
+
+static char *put_uint(char *o, uint32_t v) {
+    char digits[10];
+    int n = 0;
+    do { digits[n++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    while (n) *o++ = digits[--n];
+    return o;
+}
+
+// Power as dB to 0.1 (10 log10; -200.0 for nothing), without printf: a
+// spectrum is hundreds of values a frame
+static char *put_db(char *o, float power) {
+    const float db = power > 1e-20f ? 10.0f * log10f(power) : -200.0f;
+    int32_t tenths = (int32_t)lroundf(db * 10.0f);
+    if (tenths < 0) { *o++ = '-'; tenths = -tenths; }
+    o = put_uint(o, (uint32_t)tenths / 10u);
+    *o++ = '.';
+    *o++ = (char)('0' + (uint32_t)tenths % 10u);
+    return o;
+}
+
+// "* <stream> seq=<n> frame=<f> units=<u> [from=<b>] values=v,v,...\n"
+static void stream_values(Protocol_t *p, uint32_t stream, uint32_t frame, const float *v, uint32_t count, uint32_t from) {
+    const ProtocolSub_t *s = &p->subs[stream];
+    char *const line = p->event_line;
+    char *o = line + snprintf(line, 96, "* %s seq=%lu frame=%lu units=%s", STREAM_NAMES[stream],
+        (unsigned long)p->next_seq, (unsigned long)frame, s->power ? "power" : "db");
+    if (stream == PROTO_STREAM_SPECTRUM) o += snprintf(o, 24, " from=%lu", (unsigned long)from);
+    o += sprintf(o, " values=");
+    for (uint32_t i = 0; i < count; i++) {
+        if (i) *o++ = ',';
+        if (s->power) o += snprintf(o, 16, "%.3e", (double)v[i]);
+        else o = put_db(o, v[i]);
+    }
+    *o++ = '\n';
+    emit_stream(p, (uint32_t)(o - line));
+}
+
+static void stream_frame(Protocol_t *p, const ProtocolFrame_t *f) {
+    const ProtocolSub_t *s = &p->subs[PROTO_STREAM_FRAME];
+    char *const line = p->event_line;
+    const size_t size = sizeof p->event_line;
+    int n = snprintf(line, size, "* frame seq=%lu frame=%lu", (unsigned long)p->next_seq, (unsigned long)f->frame);
+    for (uint32_t i = 0; i < FRAME_FIELD_COUNT; i++) {
+        if (!(s->fields & BIT(i))) continue;
+        const FrameField_t *d = &FRAME_FIELDS[i];
+        const void *v = (const uint8_t *)f + d->offset;
+        n += snprintf(line + n, size - (size_t)n, " %s=", d->name);
+        switch (d->type) {
+            case FF_U32: n += snprintf(line + n, size - (size_t)n, d->fmt, (unsigned long)*(const uint32_t *)v); break;
+            case FF_FLOAT: n += snprintf(line + n, size - (size_t)n, d->fmt, (double)*(const float *)v); break;
+            case FF_STATE: {
+                const uint32_t st = *(const uint32_t *)v;
+                n += snprintf(line + n, size - (size_t)n, "%s", st <= PROTO_RX_PAYLOAD ? RX_STATES[st] : "?");
+                break;
+            }
+        }
+    }
+    line[n++] = '\n';
+    emit_stream(p, (uint32_t)n);
+}
+
+// True if this subscription is due on this frame
+static bool due(ProtocolSub_t *s) {
+    if (!s->on) return false;
+    if (++s->count < s->every) return false;
+    s->count = 0;
+    return true;
+}
+
+void protocol_frame(Protocol_t *p, const ProtocolFrame_t *f) {
+    if (due(&p->subs[PROTO_STREAM_FRAME])) stream_frame(p, f);
+    if (due(&p->subs[PROTO_STREAM_FOLDED]) && f->folded) {
+        stream_values(p, PROTO_STREAM_FOLDED, f->frame, f->folded, PROTOCOL_CHIRP_BINS, 0);
+    }
+    if (due(&p->subs[PROTO_STREAM_BAND]) && f->band) {
+        stream_values(p, PROTO_STREAM_BAND, f->frame, f->band, 2u * PROTOCOL_CHIRP_BINS, 0);
+    }
+    if (p->subs[PROTO_STREAM_SHAPE].on && f->shape_changed && f->shape) {
+        stream_values(p, PROTO_STREAM_SHAPE, f->frame, f->shape, PROTOCOL_CHIRP_BINS, 0);
+    }
+    ProtocolSub_t *sp = &p->subs[PROTO_STREAM_SPECTRUM];
+    if (due(sp) && f->spectrum && sp->from < f->spectrum_len) {
+        const uint32_t to = sp->to < f->spectrum_len ? sp->to : f->spectrum_len - 1u;
+        stream_values(p, PROTO_STREAM_SPECTRUM, f->frame, f->spectrum + sp->from, to - sp->from + 1u, sp->from);
+    }
 }
 
 void protocol_poll(Protocol_t *p) {

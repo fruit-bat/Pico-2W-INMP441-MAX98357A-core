@@ -2,7 +2,7 @@
 
 Status: the engine (`src/protocol.c`) runs on the PC against a pretend
 board (`tests/fake_board.c`). `tests/test_protocol.c` has the scenarios.
-Streams aren't done yet, and nothing runs on the board yet. Numbers in
+Nothing runs on the board yet. Numbers in
 *italics* are guesses.
 
 The board talks to a host (a PC or another microcontroller) over a byte
@@ -46,9 +46,11 @@ today must still be available (see the inventory at the end).
 - Printable ASCII only: a line with tabs or other control characters, or
   with bytes over 0x7E, is rejected (`err 500`).
 - Empty lines (or only spaces) are ignored, and need no check.
-- Maximum line length 1024 characters with the check, both ways. That is
-  enough for a 255-byte packet in hex (510 characters) plus the rest of the
-  line. A longer line can't be checked: it is thrown away up to its LF and
+- Maximum line length 1024 characters with the check from the host. That
+  is enough for a 255-byte packet in hex (510 characters) plus the rest of
+  the line. Lines from the board can be up to 6 KB: a 512-bin spectrum as
+  raw power is about 5.2 KB. A host with little memory just doesn't
+  subscribe to the long ones. A longer line can't be checked: it is thrown away up to its LF and
   answered with the event `* err seq=<n> 500 line too long`.
 - Values:
 
@@ -103,8 +105,8 @@ an event, and anything else is a reply to that tag.
 | `nudge` | `samples=<n>` (−1023 .. 1023) | `ok delay=<new>` | moves the receive window; positive = later (more delay). Today keys `z` `x`. Relative, so not safe to repeat blindly (see Link errors) |
 | `list` | names (none = all) | one line per item: name, kind, type, range, units, help | for clients and humans; generated from the table |
 | `send` | `hex=<bytes>` | `ok id=<n>` | queues a packet; later `* tx.start id=` and `* tx.done id=` |
-| `sub` | `stream=<name> [every=<n>] [fields=a,b,...] [units=db\|power]` | — | start or change a stream (see Streams) |
-| `unsub` | `stream=<name>` or `all` | — | |
+| `sub` | `stream=<name> [every=<n>] [fields=a,b,...] [units=db\|power] [from=<bin> to=<bin>]`; or nothing | with no arguments: one line per subscription in force | start or replace a stream (see Streams) |
+| `unsub` | `stream=<name>` or `all` | — | safe to repeat: unsubscribing what isn't subscribed is fine |
 | `reset` | `counters` / `rx` / `settings` | — | clear counters, abandon the packet being received, restore the built-in default settings (the saved ones are not touched) |
 | `save` | — | — | save the current settings; used at start-up. *Until flash storage exists: `err 452`* |
 | `load` | — | — | go back to the saved settings (the defaults if none are saved) |
@@ -161,6 +163,7 @@ a side effect, the `ok` line lists it. (See Decisions for the parked
 | `count.good`, `count.bad`, `count.header_failed`, `count.lost`, `count.rx_dropped` | packets received (today: the display's Packets line) |
 | `count.events_dropped` | events thrown away because the host wasn't reading (see Flow) |
 | `count.link_errors` | lines from the host that failed their check (see Link errors) |
+| `count.stream_dropped` | stream lines dropped to keep room for replies and events (see Flow) |
 | `tx.queued` | packets waiting to be sent |
 | `rx.state` | search, lock, train, header, payload |
 | `rx.delay` | receive window delay, 0 .. 1023 samples (start 960). Moved by alignment, tracking and `nudge` |
@@ -199,21 +202,43 @@ useful for diagnosis, and the host can decide what to do with it.
 ## Streams (subscriptions)
 
 A stream is a regular event, one per frame (every 23.2 ms), that the host
-must ask for. `every=n` sends one frame in n. `fields=` picks which fields
-to send, where a stream has any.
+must ask for with `sub`. A second `sub` for the same stream replaces the
+first, and a rejected one leaves it as it was. `sub` on its own lists what
+is in force:
 
-| Stream | Content | Size per event (about) | Today |
-|---|---|---|---|
-| `frame` | the scalars: `frame tx_symbol delay rx_symbol angle error_angle magnitude strength peak timing_error timing_rate state corr data_symbol data_margin data_quality` | 200 B | log columns other than b, f, s |
-| `folded` | 64 values: what the decoder decides from | 400 B | log `f0..f63`; folded display view (`f`) |
-| `band` | 128 values: bins −64..63 around the de-chirped band | 800 B | log `b-64..b63` |
-| `shape` | 64 values: the learned channel shape, sent only when it changes | 400 B | log `s0..s63` |
-| `spectrum` | the full FFT magnitude (`from= to=` bins, default all 512) | 3 KB | the paged display (`c` `v`) |
+```
+host:   a1 sub stream=frame fields=delay,rx_symbol every=4
+board:  a1 ok
+host:   a2 sub stream=spectrum from=10 to=19 units=power
+board:  a2 ok
+host:   a3 sub
+board:  a3 stream=frame every=4 fields=delay,rx_symbol
+board:  a3 stream=spectrum every=1 units=power from=10 to=19
+board:  a3 ok
+board:  * frame seq=12 frame=4005 delay=960 rx_symbol=3
+board:  * spectrum seq=13 frame=4005 units=power from=10 values=1.375e-04,1.500e-04,...
+```
+
+| Stream | Content | Arguments | Size per line (about) | Today |
+|---|---|---|---|---|
+| `frame` | `tx_symbol delay rx_symbol angle error_angle magnitude strength peak timing_error timing_rate state corr data_symbol data_margin data_quality` | `every`, `fields` (default `all`) | 290 B | log columns other than b, f, s |
+| `folded` | 64 values: what the decoder decides from | `every`, `units` | 350 B (dB) | log `f0..f63`; folded display view (`f`) |
+| `band` | 128 values: bins −64..63 of the de-chirped FFT | `every`, `units` | 700 B (dB) | log `b-64..b63` |
+| `shape` | 64 values: the learned channel shape | `units`; sent only when a new shape is learned, so no `every` | 350 B (dB) | log `s0..s63` |
+| `spectrum` | the de-chirped FFT, bins `from`..`to` (default 0..511, at most 512 of 0..1023) | `every`, `units`, `from`, `to` | 3 KB (512 in dB), 5.2 KB (512 as power) | the paged display (`c` `v`) |
+
+Every stream line is `* <stream> seq=<n> frame=<f> ...`. The frame number
+always comes first, so the host can line streams up with each other and
+with events, much like the current CSV, and see which frames are missing.
+`every=n` (1..1000) sends the next frame and then one in n.
 
 Spectrum streams (`folded`, `band`, `shape`, `spectrum`) take
-`units=db` (the default) or `units=power`:
-- `db` gives one decimal place, e.g. `-61.2`. That is short, and it is
-  what we plot.
+`units=db` (the default) or `units=power`, and say which on every line
+(`units=db values=...`):
+- `db` gives 10 log10 of the power to one decimal place, e.g. `-61.2`, or
+  `-200.0` for nothing at all. It is short, and it is what we plot. The
+  board formats it without printf, because a spectrum is hundreds of
+  values a frame.
 - `power` gives the raw value as the log writes it now (`%.3e`), for the
   offline analysis.
 
@@ -231,11 +256,17 @@ up streams again, much like the current CSV.
 
 ## Flow: when the host doesn't read
 
-Output goes through one fixed-size queue on core 0 (*16 KB*); one reply is
-at most *6 KB* with its checks (`list` of everything is about 4 KB). If it
-fills:
+Output goes through one fixed-size queue on core 0 (*24 KB*); one reply is
+at most *6 KB* with its checks (`list` of everything is about 4 KB). The
+protocol's state comes to 37 KB of RAM on core 0 in all. If the queue fills:
 
-1. Stream events are dropped first. A missing frame number shows the gap.
+1. Stream lines are dropped first. A stream line is only queued if it
+   leaves room for a whole reply and *2 KB* of events, so streams never
+   delay a reply or crowd out an event. Dropped stream lines are counted
+   in `count.stream_dropped` and show as missing frame numbers. They
+   don't use up sequence numbers, so a gap in `seq` still means lost
+   events and nothing else. While an overflow is waiting to be reported,
+   stream lines are dropped too.
 2. Then other events, which are counted. When there is room again (for
    the notice and the longest event after it), the board sends one
    `* overflow dropped=<n>`, and `count.events_dropped` keeps the total.

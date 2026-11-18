@@ -23,12 +23,71 @@ uint32_t fake_board_packet_frames(const FakeBoard_t *fb, uint32_t length) {
     return 16u + (bits + b - 1u) / b;
 }
 
+// Made-up spectra: low noise, with the symbol's bin standing out while a
+// packet is being sent (the board hears itself)
+static float folded[PROTOCOL_CHIRP_BINS];
+static float band[2u * PROTOCOL_CHIRP_BINS];
+static float shape[PROTOCOL_CHIRP_BINS];
+static float spectrum[FFT_SIZE];
+
+static float noise(uint32_t *seed) {
+    *seed = *seed * 1664525u + 1013904223u;
+    return 1e-4f * (0.5f + (float)(*seed >> 8) / 16777216.0f);
+}
+
+static void report_frame(FakeBoard_t *fb, bool learned) {
+    const uint32_t spacing = (uint32_t)fb->settings.value[SETTING_LINK_SPACING];
+    const uint32_t symbols = PROTOCOL_CHIRP_BINS / spacing;
+    const bool on_air = fb->sending && fb->settings.value[SETTING_RX_DURING_TX] != 0;
+    const uint32_t symbol = on_air ? fb->sent_frames * 7u % symbols : 0u;
+    uint32_t seed = fb->frame;
+    for (uint32_t i = 0; i < PROTOCOL_CHIRP_BINS; i++) folded[i] = noise(&seed);
+    for (uint32_t i = 0; i < 2u * PROTOCOL_CHIRP_BINS; i++) band[i] = noise(&seed);
+    for (uint32_t i = 0; i < FFT_SIZE; i++) spectrum[i] = noise(&seed);
+    if (on_air) {
+        folded[symbol * spacing] = 1.0f;
+        band[PROTOCOL_CHIRP_BINS + symbol * spacing] = 1.0f;
+        spectrum[symbol * spacing] = 1.0f;
+    }
+    if (learned) {
+        for (uint32_t i = 0; i < PROTOCOL_CHIRP_BINS; i++) shape[i] = noise(&seed);
+        shape[0] = 1.0f;
+        shape[PROTOCOL_CHIRP_BINS - 1u] = 0.3f; // A path a bin early
+    }
+    const ProtocolFrame_t f = {
+        .frame = fb->frame,
+        .tx_symbol = symbol,
+        .delay = fb->status.rx_delay,
+        .rx_symbol = symbol,
+        .angle = 2.0f * 3.14159265f * (float)(symbol * spacing) / (float)PROTOCOL_CHIRP_BINS,
+        .error_angle = on_air ? 0.01f : 0.2f,
+        .magnitude = on_air ? 0.95f : 0.3f,
+        .strength = on_air ? 2.5e-3f : 1.0e-6f,
+        .peak = on_air ? 0.31f : 0.002f,
+        .timing_error = on_air ? 0.2f : 3.0f,
+        .timing_rate = 0.0f,
+        .state = fb->status.rx_state,
+        .corr = on_air ? 0.9f : 0.3f,
+        .data_symbol = symbol,
+        .data_margin = on_air ? 2.1f : 0.0f,
+        .data_quality = on_air ? 0.85f : 0.3f,
+        .folded = folded,
+        .band = band,
+        .shape = shape,
+        .shape_changed = learned,
+        .spectrum = spectrum,
+        .spectrum_len = FFT_SIZE,
+    };
+    protocol_frame(fb->proto, &f);
+}
+
 static void event(FakeBoard_t *fb, ProtocolEvent_t e) {
     e.frame = fb->frame;
     protocol_event(fb->proto, &e);
 }
 
 static void one_frame(FakeBoard_t *fb) {
+    bool learned = false;
     fb->frame++;
     fb->status.frames = fb->frame;
     const bool hear = fb->settings.value[SETTING_RX_DURING_TX] != 0;
@@ -59,6 +118,7 @@ static void one_frame(FakeBoard_t *fb) {
             fb->status.train_strongest = e.u.trained.strongest;
             fb->status.train_earliest = e.u.trained.earliest;
             event(fb, e);
+            learned = true;
         }
         if (fb->sent_frames == fb->total_frames) {
             fb->sending = false;
@@ -93,6 +153,7 @@ static void one_frame(FakeBoard_t *fb) {
         event(fb, e);
     }
     fb->status.tx_queued = fb->queued;
+    report_frame(fb, learned);
 }
 
 void fake_board_advance_us(FakeBoard_t *fb, uint64_t us) {

@@ -36,11 +36,15 @@
 #define PROTOCOL_VERSION 1
 #define PROTOCOL_LINE_MAX 1024u    // Longest line either way, with its check, without the LF
 #define PROTOCOL_CHECK_LEN 5u      // "XXXX ": CRC-16 in hex and a space, at the start of every line
-#define PROTOCOL_OUT_SIZE 16384u   // Output queue, bytes
+#define PROTOCOL_OUT_LINE_MAX 6144u // Longest line from the board, with its check (a 512-bin spectrum as raw power)
+#define PROTOCOL_OUT_SIZE 24576u   // Output queue, bytes
 #define PROTOCOL_REPLY_MAX 6144u   // Longest reply to one command, bytes, with its checks ("list" of everything is about 4 KB)
 #define PROTOCOL_TAG_MAX 8u
 #define PROTOCOL_PAYLOAD_MAX 255u  // Bytes in a packet (as packet_format.h)
 #define PROTOCOL_CHIRP_BINS 64u    // FFT bins the chirp spans (CHIRP_BINS in main.c)
+#define PROTOCOL_FFT_SIZE 1024u    // Bins in the spectrum stream's source
+#define PROTOCOL_SPECTRUM_MAX 512u // Most spectrum bins one subscription may ask for
+#define PROTOCOL_EVENT_RESERVE 2048u // Queue space streams leave for events (beyond a reply's worth)
 
 // Error codes (protocol.md, "Error codes")
 enum {
@@ -90,7 +94,7 @@ typedef struct {
     uint32_t link_symbols, link_bits;
     // Counters (count.*)
     uint32_t frames, rx_missed, tx_missed, records_dropped;
-    uint32_t good, bad, header_failed, lost, rx_dropped, events_dropped, link_errors;
+    uint32_t good, bad, header_failed, lost, rx_dropped, events_dropped, link_errors, stream_dropped;
     // Now
     uint32_t tx_queued;
     uint32_t rx_state;  // PROTO_RX_*
@@ -140,6 +144,43 @@ typedef struct {
 } ProtocolEvent_t;
 
 // ---------------------------------------------------------------------------
+// One received frame, for the streams (protocol_frame). Arrays are power
+// (|X|^2) and need only last for the call; NULL if not available.
+// ---------------------------------------------------------------------------
+typedef struct {
+    uint32_t frame, tx_symbol, delay, rx_symbol;
+    float angle, error_angle, magnitude, strength, peak, timing_error, timing_rate;
+    uint32_t state;              // PROTO_RX_*
+    float corr;
+    uint32_t data_symbol;
+    float data_margin, data_quality;
+    const float *folded;         // PROTOCOL_CHIRP_BINS: what the decoder decides from
+    const float *band;           // 2 * PROTOCOL_CHIRP_BINS: bins -bins .. bins-1 of the de-chirped FFT
+    const float *shape;          // PROTOCOL_CHIRP_BINS: the learned channel shape
+    bool shape_changed;          // shape was learned on this frame
+    const float *spectrum;       // spectrum_len bins of the de-chirped FFT
+    uint32_t spectrum_len;
+} ProtocolFrame_t;
+
+typedef enum {
+    PROTO_STREAM_FRAME,
+    PROTO_STREAM_FOLDED,
+    PROTO_STREAM_BAND,
+    PROTO_STREAM_SHAPE,
+    PROTO_STREAM_SPECTRUM,
+    PROTO_STREAM_COUNT
+} ProtocolStream_t;
+
+typedef struct {
+    bool on;
+    bool power;          // units=power (else db)
+    uint32_t every;      // Send one frame in this many
+    uint32_t count;      // Frames since the last one sent
+    uint32_t fields;     // frame: bit per field
+    uint32_t from, to;   // spectrum: bins (inclusive)
+} ProtocolSub_t;
+
+// ---------------------------------------------------------------------------
 // What the protocol needs from the board. Optional hooks may be NULL.
 // ---------------------------------------------------------------------------
 typedef struct {
@@ -179,7 +220,10 @@ typedef struct {
     uint32_t reply_len;
     uint32_t reply_lines;  // Each will get a check in front
     bool reply_overflow;
-    char event_line[PROTOCOL_LINE_MAX + 2]; // An event being formatted (not on core 0's small stack)
+    char event_line[PROTOCOL_OUT_LINE_MAX + 2]; // An event being formatted (not on core 0's small stack)
+
+    ProtocolSub_t subs[PROTO_STREAM_COUNT];
+    uint32_t stream_dropped;
 
     uint32_t next_seq;               // Every event gets the next one (0 = "* hello" at start-up)
     uint32_t link_errors;            // Lines that failed their check
@@ -197,6 +241,10 @@ size_t protocol_input(Protocol_t *p, const char *data, size_t length);
 
 // Something happened on the board
 void protocol_event(Protocol_t *p, const ProtocolEvent_t *event);
+
+// A frame was received: sends whatever the streams ask for. Stream lines
+// are dropped (and counted) before they would crowd out replies or events
+void protocol_frame(Protocol_t *p, const ProtocolFrame_t *frame);
 
 // Retries a held command and reports dropped events, once there is room
 void protocol_poll(Protocol_t *p);
