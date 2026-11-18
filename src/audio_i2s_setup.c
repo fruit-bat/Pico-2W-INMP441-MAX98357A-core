@@ -18,14 +18,13 @@ static uint sm_tx = 0;
 PIO i2s_get_pio(void) { return pio_tx; }
 uint i2s_get_sm(void) { return sm_tx; }
 
+// No printing here: the USB serial port carries only the host protocol
 void audio_i2s_hardware_init(uint32_t sample_rate) {
-    printf("[I2S] Loading I2S PIO program at %lu Hz...\n", (unsigned long)sample_rate);
 
     // One state machine clocks the bus, drives the amp (DIN) and samples the mic (SD).
     uint offset_tx = pio_add_program(pio_tx, &audio_i2s_tx_program);
 
     sm_tx = pio_claim_unused_sm(pio_tx, true);
-    printf("[I2S] Assigned TX state machine: SM=%u on pio0\n", sm_tx);
 
     // Configure PIO0 (TX / Speaker Master Engine)
     pio_sm_config c_tx = audio_i2s_tx_program_get_default_config(offset_tx);
@@ -53,12 +52,10 @@ void audio_i2s_hardware_init(uint32_t sample_rate) {
     // Calculate precise Audio Clock Division for the speaker master clock.
     uint32_t sys_clk = clock_get_hz(clk_sys);
     float clk_div = (float)sys_clk / (float)(sample_rate * 32 * 2 * 4);
-    printf("[I2S] sys_clk=%lu clk_div=%.4f\n", (unsigned long)sys_clk, clk_div);
 
     sm_config_set_clkdiv(&c_tx, clk_div);
 
     // Initialize and start the state machine; it stalls until DMA starts feeding it.
     pio_sm_init(pio_tx, sm_tx, offset_tx + audio_i2s_tx_offset_entry_point, &c_tx);
     pio_sm_set_enabled(pio_tx, sm_tx, true);
-    printf("[I2S] State machine enabled.\n");
 }

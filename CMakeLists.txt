@@ -55,6 +55,7 @@ add_executable(Pico-2W-INMP441-MAX98357A-core-test
     src/packet_format.c
     src/packet_tx.c
     src/packet_rx.c
+    src/protocol.c
     
     # Target precisely the Float32 Transform source files
     ${cmsisdsp_SOURCE_DIR}/Source/TransformFunctions/TransformFunctions.c
@@ -91,6 +92,7 @@ target_link_libraries(Pico-2W-INMP441-MAX98357A-core-test
     hardware_dma 
     hardware_irq
     hardware_clocks
+    pico_unique_id
     cmsis_core
 )
 

@@ -92,6 +92,15 @@ static void one_frame(FakeBoard_t *fb) {
     fb->status.frames = fb->frame;
     const bool hear = fb->settings.value[SETTING_RX_DURING_TX] != 0;
 
+    if (fb->sending && fb->abandon) {
+        // As main.c: a spacing change cuts the packet short (reported on core 1's next pass)
+        fb->sending = false;
+        ProtocolEvent_t done = { .type = PROTO_EV_TX_DONE };
+        done.u.tx.id = fb->current.id;
+        done.u.tx.abandoned = true;
+        event(fb, done);
+    }
+    fb->abandon = false;
     if (fb->sending) {
         fb->sent_frames++;
         if (hear && fb->sent_frames == LOCK_FRAME) {
@@ -180,6 +189,7 @@ void fake_board_advance_frames(FakeBoard_t *fb, uint32_t frames) {
 // ---------------------------------------------------------------------------
 static void fb_apply(void *ctx, const ProtocolSettings_t *s, uint32_t changed) {
     FakeBoard_t *fb = ctx;
+    if ((changed & (1u << SETTING_LINK_SPACING)) && fb->sending) fb->abandon = true;
     fb->settings = *s;
     fb->apply_calls++;
     fb->last_changed = changed;

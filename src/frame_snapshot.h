@@ -29,6 +29,7 @@
 typedef struct {
     float32_t *buffer;  // Snapshot storage (length = length)
     uint32_t length;    // Number of samples per frame
+    uint32_t tag;       // Producer's label for the frame copied (e.g. its frame number)
     atomic_uint state;  // FRAME_SNAPSHOT_REQUESTED or FRAME_SNAPSHOT_READY
 } FrameSnapshot_t;
 
@@ -51,14 +52,22 @@ void frame_snapshot_init(FrameSnapshot_t *snapshot, float32_t *buffer, uint32_t 
  *
  * @param snapshot Snapshot state.
  * @param frame    Source frame of length samples.
+ * @param tag      Label kept with the copy (e.g. the frame number).
  */
-void frame_snapshot_offer(FrameSnapshot_t *snapshot, const float32_t *frame);
+void frame_snapshot_offer(FrameSnapshot_t *snapshot, const float32_t *frame, uint32_t tag);
 
 /**
  * Consumer: returns the snapshot buffer if a snapshot is ready, otherwise NULL.
  * The buffer remains valid until frame_snapshot_release() is called.
  */
 const float32_t* frame_snapshot_acquire(FrameSnapshot_t *snapshot);
+
+/**
+ * Consumer: the tag offered with the ready snapshot (valid while acquired).
+ */
+static inline uint32_t frame_snapshot_tag(const FrameSnapshot_t *snapshot) {
+    return snapshot->tag;
+}
 
 /**
  * Consumer: finishes with the current snapshot and requests the next one.

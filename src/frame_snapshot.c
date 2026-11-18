@@ -8,12 +8,13 @@ void frame_snapshot_init(FrameSnapshot_t *snapshot, float32_t *buffer, uint32_t 
     atomic_init(&snapshot->state, FRAME_SNAPSHOT_REQUESTED);
 }
 
-void __not_in_flash_func(frame_snapshot_offer)(FrameSnapshot_t *snapshot, const float32_t *frame) {
+void __not_in_flash_func(frame_snapshot_offer)(FrameSnapshot_t *snapshot, const float32_t *frame, uint32_t tag) {
     if (atomic_load_explicit(&snapshot->state, memory_order_acquire) != FRAME_SNAPSHOT_REQUESTED) {
         return;
     }
 
     memcpy(snapshot->buffer, frame, snapshot->length * sizeof(*frame));
+    snapshot->tag = tag;
 
     // Publish the copy only after it has been fully written
     atomic_store_explicit(&snapshot->state, FRAME_SNAPSHOT_READY, memory_order_release);

@@ -4,7 +4,9 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "pico/multicore.h"
+#include "pico/unique_id.h"
 #include "hardware/clocks.h"
+#include "tusb.h"
 #include "i2s_core.h"
 
 #include "arm_math.h" // For CMSIS DSP functions (e.g., sinf, cosf, etc.)
@@ -14,18 +16,22 @@
 #include "chirp_decoder.h"
 #include "chirp_encoder.h"
 #include "chirp_symbol_rx.h"
-#include "fft_visualise.h"
 #include "frame_snapshot.h"
 #include "rx_sample_window.h"
 #include "spsc_ring.h"
 #include "channel_template.h"
 #include "packet_rx.h"
 #include "packet_tx.h"
+#include "protocol.h"
 #include "symbol_sequence.h"
 #include "symbol_timing_tracker.h"
 
+// The host talks to the board over USB serial with the protocol in
+// protocol.md (src/protocol.c); tools/chirp_host.py is a client.
+#define FIRMWARE_VERSION "0.2.0"
+
 // The chirp sweeps CHIRP_BINS FFT bins (64 bins = 2.76 kHz from F0). Symbols
-// are spaced bins_per_symbol bins apart (key 'b' cycles 1, 2, 4 while
+// are spaced bins_per_symbol bins apart (setting link.spacing: 1, 2 or 4 while
 // running; both boards must match): 1 gives 64 symbols (6 bits each),
 // 2 gives 32 (5 bits), 4 gives 16 (4 bits). Wider spacing costs rate but
 // tolerates a channel that smears each symbol over neighbouring bins (the
@@ -35,7 +41,7 @@
 // did not; 4 has the most margin (board 2's speaker is ~10 dB weaker in band).
 #define CHIRP_BINS 64u
 #define DEFAULT_BINS_PER_SYMBOL 4u // 1, 2 or 4
-static volatile uint32_t bins_per_symbol_request = DEFAULT_BINS_PER_SYMBOL; // Set by core 0 (key 'b')
+static volatile uint32_t bins_per_symbol_request = DEFAULT_BINS_PER_SYMBOL; // Set by core 0 (link.spacing)
 static volatile uint32_t bins_per_symbol = DEFAULT_BINS_PER_SYMBOL;         // In use; core 1 applies requests
 static inline uint32_t num_symbols(void) { return CHIRP_BINS / bins_per_symbol; }
 static inline uint32_t bits_per_symbol(void) { return (uint32_t)__builtin_ctz(num_symbols()); }
@@ -49,28 +55,21 @@ static const float32_t BW = BPB * CHIRP_BINS; // Total bandwidth for the chirp s
 static const float32_t F0 = 15000.0f;
 static const float32_t T  = (float32_t)FFT_SIZE / FS;
 static const float32_t chirp_rate = BW / T;
-// Chirp transmit level, dB relative to full scale (keys '[' and ']'; core 1
-// applies changes between blocks). -28 dB is the x8 level used so far.
+// Chirp transmit level, dB relative to full scale (setting tx.volume, -55..-1;
+// core 1 applies changes between blocks). -28 dB is the x8 level used so far.
 #define TX_VOLUME_DEFAULT_DB (-28)
-#define TX_VOLUME_STEP_DB    3
-#define TX_VOLUME_MIN_DB     (-55)
-#define TX_VOLUME_MAX_DB     (-1)
 static volatile int32_t tx_volume_db = TX_VOLUME_DEFAULT_DB;
 
 static float32_t volume_from_db(int32_t db) {
     return powf(10.0f, (float32_t)db / 20.0f);
 }
 
-#define DISPLAY_PERIOD_MS 100
 #define LOG_BAND_BINS (2u * CHIRP_BINS) // FFT bins logged per frame: -CHIRP_BINS .. CHIRP_BINS-1
 #define TONE_STARTUP_STEPS 32
 #define RX_RECORD_QUEUE_CAPACITY 64u // Must be a power of two
 #define TX_PACKET_QUEUE_CAPACITY 2u  // Packets waiting to be sent; must be a power of two
-#define TEST_PACKET_LENGTH 16u       // Payload of the packet queued by the 's' key
 #define RX_PACKET_QUEUE_CAPACITY 4u  // Received packets waiting for core 0; must be a power of two
-// The packet receiver also runs while this board is transmitting, so a single
-// board hears its own packets (useful for testing). Set to 0 for half duplex.
-#define PACKET_RX_WHILE_TRANSMITTING 1
+#define TX_EVENT_QUEUE_CAPACITY 8u   // Packet starts/ends waiting for core 0; must be a power of two
 
 // Symbol timing tracking (see symbol_timing_tracker.h)
 #define TRACK_ALPHA          0.25f // Proportional gain
@@ -110,10 +109,11 @@ static volatile enum test_mode current_mode = MODE_PACKET; // Silent until a pac
 static volatile uint32_t tx_symbol = 0;        // Symbol transmitted in chirp modes
 static volatile uint32_t tone_step_index = 0;  // Reset by core 0 to restart the tone ramp
 static volatile enum tracking_mode tracking_mode = TRACK_OFF;
-static volatile bool packet_align = true;      // Move the window when the packet receiver locks (key 'a')
-
-// Core 0 only: which spectrum the display shows
-static bool display_folded = false; // false: de-chirped FFT spectrum (paged); true: folded spectrum
+static volatile bool packet_align = true;      // Move the window when the packet receiver locks (rx.align)
+// The packet receiver also runs while this board is transmitting, so a single
+// board hears its own packets (useful for testing); rx.during_tx=off for half duplex
+static volatile bool packet_rx_during_tx = true;
+static volatile bool packet_rx_reset_request = false; // Core 0 asks core 1 to abandon reception ("reset rx")
 
 // Core 1 writes these counters; core 0 reads them.
 static volatile uint32_t rx_blocks_missed = 0;  // RX blocks not processed in time
@@ -122,8 +122,8 @@ static volatile uint32_t rx_records_dropped = 0; // Records lost because the que
 
 //
 // One record per received frame, passed from core 1 to core 0.
-// This is the receiver's output: today it is displayed, later it can be
-// streamed to a host or fed to a packet decoder.
+// This is the receiver's output: core 0 turns it into protocol events and
+// stream lines for the host.
 //
 typedef struct {
     uint32_t frame;          // RX block count when this frame was decoded
@@ -141,14 +141,24 @@ typedef struct {
                                          // (bin = index mod FFT_SIZE)
     float32_t folded_power[CHIRP_BINS]; // Coherently folded power the decoder decides from, bins 0 .. CHIRP_BINS-1
     PacketRxStatus_t packet;             // Packet receiver after this frame (see packet_rx.h)
+    int32_t align_moved;                 // Samples the window was moved on this frame (when it locked)
     float32_t packet_shape[CHIRP_BINS];  // Channel shape it last learned (from a packet's B)
 } RxFrameRecord_t;
 
 // A packet queued by core 0 for core 1 to send
 typedef struct {
+    uint32_t id;     // The protocol's id for it (tx.start / tx.done)
     uint32_t length;
     uint8_t payload[PACKET_MAX_PAYLOAD];
 } TxPacketRequest_t;
+
+// A packet started or ended (core 1 to core 0)
+typedef struct {
+    uint32_t id;
+    uint32_t frame;  // RX block count at the time
+    bool start;      // Else done
+    bool abandoned;  // Done, but cut short (spacing change)
+} TxEvent_t;
 
 static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
 static SpscRing_t rx_record_queue;
@@ -168,7 +178,10 @@ static volatile uint32_t rx_packets_dropped = 0; // Received packets lost becaus
 static uint8_t tx_packet_storage[SPSC_RING_STORAGE_LEN(sizeof(TxPacketRequest_t), TX_PACKET_QUEUE_CAPACITY)];
 static SpscRing_t tx_packet_queue;
 
-// Consistent copy of the latest FFT magnitude spectrum for display
+static uint8_t tx_event_storage[SPSC_RING_STORAGE_LEN(sizeof(TxEvent_t), TX_EVENT_QUEUE_CAPACITY)];
+static SpscRing_t tx_event_queue;
+
+// Consistent copy of a frame's FFT power spectrum (the spectrum stream), tagged with its frame
 static float32_t spectrum_snapshot_buffer[FFT_SIZE];
 static FrameSnapshot_t spectrum_snapshot;
 
@@ -203,6 +216,7 @@ static SymbolSequence_t tx_sequence;   // MODE_SEQUENCE: the symbols being sent
 static uint32_t tx_sequence_symbol;    // MODE_SEQUENCE: the symbol most recently sent
 static PacketTx_t packet_tx;           // MODE_PACKET: the packet being sent
 static uint32_t packet_tx_symbol;      // MODE_PACKET: the symbol most recently sent
+static uint32_t packet_tx_id;          // MODE_PACKET: the protocol's id for it
 static float32_t packet_rx_storage[PACKET_RX_STORAGE_LEN(CHIRP_BINS)];
 static float32_t channel_template_storage[CHANNEL_TEMPLATE_STORAGE_LEN(CHIRP_BINS)];
 static ChannelTemplate_t channel_template;
@@ -210,11 +224,6 @@ static PacketRx_t packet_rx;
 static BiquadFilter_t rx_highpass; // Applied to the microphone stream, block by block
 
 static float tone_phase = 0.0f;
-
-// ---------------------------------------------------------------------------
-// Core 0 only.
-// ---------------------------------------------------------------------------
-static FftVisualise_t fft_visualise;
 
 static void init_audio_system(void) {
     const ChirpParams_t chirp_params = {
@@ -270,44 +279,6 @@ static void init_audio_system(void) {
     packet_tx_init(&packet_tx, bits_per_symbol());
     channel_template_init(&channel_template, CHIRP_BINS, channel_template_storage);
     packet_rx_init(&packet_rx, CHIRP_BINS, bits_per_symbol(), packet_rx_storage, &channel_template);
-}
-
-static const char *tracking_name(enum tracking_mode mode) {
-    switch (mode) {
-        case TRACK_OFF:      return "off";
-        case TRACK_DECISION: return "decision";
-        case TRACK_PILOT:    return "pilot";
-    }
-    return "unknown";
-}
-
-static const char *mode_name(enum test_mode mode) {
-    switch (mode) {
-        case MODE_LOOPBACK:   return "loopback";
-        case MODE_MIC_LEVEL:  return "mic-level";
-        case MODE_TONE_440:   return "tone-440";
-        case MODE_TONE_CHIRP: return "chirp";
-        case MODE_SEQUENCE:   return "sequence";
-        case MODE_PACKET:     return "packet";
-    }
-    return "unknown";
-}
-
-static const char *packet_state_name(PacketRxState_t state) {
-    switch (state) {
-        case PACKET_RX_SEARCH: return "search";
-        case PACKET_RX_LOCK:   return "lock";
-        case PACKET_RX_TRAIN:  return "train";
-        case PACKET_RX_HEADER:  return "header";
-        case PACKET_RX_PAYLOAD: return "payload";
-    }
-    return "?";
-}
-
-static void set_mode(enum test_mode mode) {
-    current_mode = mode;
-    tone_step_index = 0;
-    printf("[MODE] Selected mode: %s\n", mode_name(mode));
 }
 
 static float32_t __not_in_flash_func(peak_abs)(const float32_t *buffer, uint32_t size) {
@@ -419,7 +390,11 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
     memcpy(record.folded_power, chirp_decoder.folded_power_buffer, sizeof(record.folded_power));
 
     // Packet receiver (optionally not while this board is sending a packet)
-    if (PACKET_RX_WHILE_TRANSMITTING || !packet_tx_busy(&packet_tx)) {
+    if (packet_rx_reset_request) {
+        packet_rx_reset(&packet_rx);
+        packet_rx_reset_request = false;
+    }
+    if (packet_rx_during_tx || !packet_tx_busy(&packet_tx)) {
         const float32_t centre_bins = record.symbol.angle * (float32_t)CHIRP_BINS / (2.0f * (float32_t)M_PI);
         record.packet = *packet_rx_frame(&packet_rx, chirp_decoder.folded_power_buffer, centre_bins);
         // Preamble A found: move the window onto the earliest path, with its
@@ -427,6 +402,7 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
         const int32_t move = (int32_t)lroundf(
             ((float32_t)record.packet.align_bins + record.packet.align_fraction) * (float32_t)(FFT_SIZE / CHIRP_BINS)); // Samples earlier
         if (packet_align && record.packet.event == PACKET_RX_EVENT_LOCKED && move != 0) {
+            record.align_moved = move;
             const uint32_t delay = (uint32_t)(((int32_t)record.delay + move) % (int32_t)FFT_SIZE + (int32_t)FFT_SIZE) % FFT_SIZE;
             rx_sample_window_set_delay(&rx_window, delay);
             packet_rx_window_moved(&packet_rx, record.packet.align_bins);
@@ -445,11 +421,12 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
     }
     memcpy(record.packet_shape, channel_template.shape, sizeof(record.packet_shape));
 
+    // The spectrum first, so it is ready when core 0 sees this frame's record
+    frame_snapshot_offer(&spectrum_snapshot, chirp_decoder.fft_magnitude_buffer, frame);
+
     if (!spsc_ring_push(&rx_record_queue, &record)) {
         rx_records_dropped++;
     }
-
-    frame_snapshot_offer(&spectrum_snapshot, chirp_decoder.fft_magnitude_buffer);
 }
 
 // Core 1: produce the next block of audio to transmit.
@@ -467,9 +444,16 @@ static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
             static TxPacketRequest_t request;
             if (!packet_tx_busy(&packet_tx) && spsc_ring_pop(&tx_packet_queue, &request)) {
                 packet_tx_start(&packet_tx, request.payload, request.length);
+                packet_tx_id = request.id;
+                const TxEvent_t e = { .id = request.id, .frame = i2s_core_get_rx_block_count(), .start = true };
+                spsc_ring_push(&tx_event_queue, &e); // 8 deep and 2 a packet: can't fill
             }
             if (packet_tx_next_symbol(&packet_tx, &packet_tx_symbol)) {
                 chirp_encoder_symbol_to_samples(&chirp_encoder, packet_tx_symbol, buffer);
+                if (!packet_tx_busy(&packet_tx)) { // That was the last symbol
+                    const TxEvent_t e = { .id = packet_tx_id, .frame = i2s_core_get_rx_block_count() };
+                    spsc_ring_push(&tx_event_queue, &e);
+                }
             } else {
                 memset(buffer, 0, I2S_BUFFER_SIZE * sizeof(*buffer));
             }
@@ -499,6 +483,10 @@ static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
 // Core 1: changes the symbol spacing (between blocks, so the transmitter and
 // receiver change together). A packet being sent or received is abandoned.
 static void apply_spacing(uint32_t bps) {
+    if (packet_tx_busy(&packet_tx)) {
+        const TxEvent_t e = { .id = packet_tx_id, .frame = i2s_core_get_rx_block_count(), .abandoned = true };
+        spsc_ring_push(&tx_event_queue, &e);
+    }
     bins_per_symbol = bps;
     const uint32_t n = num_symbols();
     chirp_encoder.number_of_symbols = n;
@@ -565,288 +553,231 @@ static void __not_in_flash_func(core1_main)(void) {
     }
 }
 
-// Core 0: received packets, for the display
+// ---------------------------------------------------------------------------
+// Core 0: the host protocol (protocol.md). Core 0 owns the USB serial port:
+// it turns host lines into settings and packets for core 1, and core 1's
+// records, received packets and transmissions into events and streams.
+// Nothing else may print: any other output would break the protocol's lines.
+// ---------------------------------------------------------------------------
+static Protocol_t protocol;
+
+// Core 0's picture of the receiver, for status and the last lock/training
 static struct {
+    uint32_t frame;                 // Latest record's frame
     uint32_t good, bad, header_failed, lost;
-    char last_text[PACKET_MAX_PAYLOAD * 4 + 1]; // Last payload, printable (\xNN for other bytes)
-    PacketRxStatus_t last;
-} rx_packet_stats;
+    PacketRxState_t state;
+    PacketRxStatus_t last_lock, last_train;
+    int32_t last_moved;
+} rx_view;
 
-// Core 0: redraw the terminal display. Always prints the same number of rows.
-static void draw_display(const float32_t *spectrum, const RxFrameRecord_t *record, uint32_t records_received) {
-    if (display_folded) {
-        fft_visualise_draw_columns_db(&fft_visualise, "FOLDED SPECTRUM (decoder input, one column per symbol)",
-            record->folded_power, CHIRP_BINS);
-    } else {
-        fft_visualise_draw(&fft_visualise, spectrum);
-    }
+static char board_id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
 
-    printf("Mode %-9s  %lu bins/symbol (%lu bits)  TX %+ld dBFS  TX symbol %3lu of %lu  RX delay %4lu  peak %5.1f%%          \n",
-        mode_name(current_mode),
-        (unsigned long)record->bins_per_symbol,
-        (unsigned long)__builtin_ctz(CHIRP_BINS / record->bins_per_symbol),
-        (long)record->tx_volume_db,
-        (unsigned long)tx_symbol,
-        (unsigned long)(CHIRP_BINS / record->bins_per_symbol),
-        (unsigned long)record->delay,
-        record->peak * 100.0f);
-    printf("RX symbol %3lu  centroid %8.4f  error %+.4f rad  strength %e          \n",
-        (unsigned long)record->symbol.symbol_index,
-        record->symbol.angle * symbol_rx_config.symbols_per_radian,
-        record->symbol.error_angle,
-        record->symbol.strength);
-
-    // One character per bin, lined up with the folded view: '.' on each
-    // symbol's bin, '*' on the decided one, blank between symbols
-    for (uint32_t i = 0; i < CHIRP_BINS; ++i) {
-        if (i % record->bins_per_symbol != 0) putchar(' ');
-        else putchar(i / record->bins_per_symbol == record->symbol.symbol_index ? '*' : '.');
-    }
-    putchar('\n');
-
-    printf("Tracking %-8s  timing error %+7.2f smp  drift %+.3f smp/frame  magnitude %.3f          \n",
-        tracking_name((enum tracking_mode)record->tracking),
-        record->timing_error,
-        record->timing_rate,
-        record->symbol.magnitude);
-    {
-        // Last packet preamble found (kept on core 0)
-        static PacketRxStatus_t last;
-        static uint32_t found = 0, failed = 0;
-        if (record->packet.event == PACKET_RX_EVENT_TRAINED) { last = record->packet; found++; }
-        if (record->packet.event == PACKET_RX_EVENT_TRAIN_FAILED) failed++;
-        printf("Packet RX %-6s corr %+.2f  found %lu failed %lu  last: B at frame %lu coherence %.2f paths strongest %+ld earliest %+ld          \n",
-            packet_state_name(record->packet.state), record->packet.correlation,
-            (unsigned long)found, (unsigned long)failed, (unsigned long)last.b_start_frame, last.coherence,
-            (long)last.strongest_offset, (long)last.earliest_offset);
-        printf("Packet align %-3s  last lock: window %+.2f bins out          \n",
-            packet_align ? "on" : "off", (double)((float32_t)record->packet.align_bins + record->packet.align_fraction));
-        printf("Packets good %lu bad %lu header failed %lu lost %lu dropped %lu  last: %s margin %.2f weak %lu \"%.40s\"          \n",
-            (unsigned long)rx_packet_stats.good, (unsigned long)rx_packet_stats.bad,
-            (unsigned long)rx_packet_stats.header_failed, (unsigned long)rx_packet_stats.lost,
-            (unsigned long)rx_packets_dropped,
-            rx_packet_stats.good + rx_packet_stats.bad == 0 ? "-" : (rx_packet_stats.last.crc_ok ? "ok" : "BAD"),
-            rx_packet_stats.last.min_margin, (unsigned long)rx_packet_stats.last.weak_symbols,
-            rx_packet_stats.last_text);
-    }
-    printf("Frames %lu  missed rx %lu tx %lu  dropped records %lu          \n",
-        (unsigned long)records_received,
-        (unsigned long)rx_blocks_missed,
-        (unsigned long)tx_blocks_missed,
-        (unsigned long)rx_records_dropped);
-    printf("Keys: 1-6 mode  b spacing  [/] volume  o/p symbol  z/x delay  t tracking  s/S send packet (16/255 bytes)  a align  c/v page  f folded view  l log\n");
-}
-
-// ---------------------------------------------------------------------------
-// CSV logging (core 0). One line per received frame; lines starting with '#'
-// are comments, so the output can be loaded directly by most CSV readers.
-// ---------------------------------------------------------------------------
-static bool logging = false;
-
-static void print_log_header(void) {
-    printf("# chirp receiver log v8\n");
-    printf("# sample_rate=%.1f fft_size=%u bins=%u bins_per_symbol=%u symbols=%u f0=%.1f bandwidth=%.2f samples_per_symbol_step=%u\n",
-        FS, (unsigned)FFT_SIZE, (unsigned)CHIRP_BINS, (unsigned)bins_per_symbol, (unsigned)num_symbols(),
-        F0, BW, (unsigned)(FFT_SIZE / num_symbols()));
-    printf("# track_alpha=%g track_beta=%g track_max_rate=%g track_rate_window=%g track_min_magnitude=%g\n",
-        TRACK_ALPHA, TRACK_BETA, TRACK_MAX_RATE, TRACK_RATE_WINDOW, TRACK_MIN_MAGNITUDE);
-    printf("# rx_highpass_hz=%g (2nd order, applied to the mic stream; peak is measured after it)\n", RX_HIGHPASS_HZ);
-    printf("# delay: window delay used for this frame (samples); timing_error: samples, positive = increase delay\n");
-    printf("# angle/error_angle: radians; b<k>: de-chirped FFT power |X|^2 of bin k (k mod fft_size)\n");
-    printf("# f<k>: coherently folded power of bin k, which the decoder decides from\n");
-    printf("# packet_*: packet receiver (packet_rx.h) after this frame; packet_event 2 = preamble found (b_start, paths);\n");
-    printf("# s<k>: channel shape it last learned, by bin offset k from the window position\n");
-    printf("# packet_data_symbol/margin/quality: last data symbol decided, its margin (best/second score)\n");
-    printf("#   and quality (correlation with the learned shape; noise ~0.3, symbols ~0.85)\n");
-    printf("# '# packet lost' lines: header or payload abandoned when the signal went\n");
-    printf("# '# packet' lines: a received packet (after its frame's row); '# packet header failed': bad CRC-8\n");
-    printf("# packet_align (+ packet_align_fraction): at the last lock, bins the window was late (moved by that if packet_align_on)\n");
-    printf("frame,mode,tx_symbol,delay,tracking,rx_symbol,angle,error_angle,magnitude,strength,peak,"
-           "timing_error,timing_rate,rx_missed,tx_missed,dropped");
-    for (int32_t k = -(int32_t)CHIRP_BINS; k < (int32_t)CHIRP_BINS; k++) {
-        printf(",b%ld", (long)k);
-    }
-    for (uint32_t k = 0; k < CHIRP_BINS; k++) {
-        printf(",f%lu", (unsigned long)k);
-    }
-    printf(",packet_state,packet_event,packet_corr,packet_coherence,packet_b_start,packet_strongest,packet_earliest");
-    for (uint32_t k = 0; k < CHIRP_BINS; k++) {
-        printf(",s%lu", (unsigned long)k);
-    }
-    printf(",packet_align,packet_align_on,packet_data_symbol,packet_data_margin,packet_align_fraction,bins_per_symbol,tx_volume_db,packet_data_quality\n");
-}
-
-static void print_log_record(const RxFrameRecord_t *record) {
-    printf("%lu,%s,%lu,%lu,%s,%lu,%.5f,%+.5f,%.4f,%.4e,%.4f,%+.3f,%+.4f,%lu,%lu,%lu",
-        (unsigned long)record->frame,
-        mode_name((enum test_mode)record->mode),
-        (unsigned long)record->tx_symbol,
-        (unsigned long)record->delay,
-        tracking_name((enum tracking_mode)record->tracking),
-        (unsigned long)record->symbol.symbol_index,
-        record->symbol.angle,
-        record->symbol.error_angle,
-        record->symbol.magnitude,
-        record->symbol.strength,
-        record->peak,
-        record->timing_error,
-        record->timing_rate,
-        (unsigned long)rx_blocks_missed,
-        (unsigned long)tx_blocks_missed,
-        (unsigned long)rx_records_dropped);
-    for (uint32_t i = 0; i < LOG_BAND_BINS; i++) {
-        printf(",%.3e", record->band_power[i]);
-    }
-    for (uint32_t i = 0; i < CHIRP_BINS; i++) {
-        printf(",%.3e", record->folded_power[i]);
-    }
-    printf(",%s,%u,%+.3f,%.3f,%lu,%+ld,%+ld",
-        packet_state_name(record->packet.state), (unsigned)record->packet.event,
-        record->packet.correlation, record->packet.coherence, (unsigned long)record->packet.b_start_frame,
-        (long)record->packet.strongest_offset, (long)record->packet.earliest_offset);
-    for (uint32_t i = 0; i < CHIRP_BINS; i++) {
-        printf(",%.3e", record->packet_shape[i]);
-    }
-    printf(",%+ld,%u,%lu,%.3f", (long)record->packet.align_bins, (unsigned)packet_align,
-        (unsigned long)record->packet.data_symbol, record->packet.data_margin);
-    printf(",%+.3f,%lu,%+ld,%.3f\n", record->packet.align_fraction, (unsigned long)record->bins_per_symbol,
-        (long)record->tx_volume_db, record->packet.data_quality);
-}
-
-// Core 0: a received packet; logged as a comment line when logging
-static void note_rx_packet(const RxFrameRecord_t *record, const RxPacket_t *packet) {
-    const PacketRxStatus_t *st = &record->packet;
-    if (st->crc_ok) rx_packet_stats.good++; else rx_packet_stats.bad++;
-    rx_packet_stats.last = *st;
-    char *t = rx_packet_stats.last_text;
-    for (uint32_t i = 0; i < packet->length; i++) {
-        const uint8_t c = packet->payload[i];
-        if (c >= 0x20 && c < 0x7F && c != '\\') *t++ = (char)c;
-        else t += sprintf(t, "\\x%02X", c);
-    }
-    *t = 0;
-    if (logging) {
-        printf("# packet frame=%lu crc_ok=%u length=%lu data_symbols=%lu min_margin=%.3f weakest=%lu weak=%lu payload=%s\n",
-            (unsigned long)record->frame, (unsigned)st->crc_ok, (unsigned long)st->length,
-            (unsigned long)st->data_count, st->min_margin, (unsigned long)st->weakest_symbol,
-            (unsigned long)st->weak_symbols, rx_packet_stats.last_text);
+static void board_apply(void *ctx, const ProtocolSettings_t *s, uint32_t changed) {
+    (void)ctx;
+    const int32_t *v = s->value;
+    if (changed & (1u << SETTING_LINK_SPACING)) bins_per_symbol_request = (uint32_t)v[SETTING_LINK_SPACING];
+    if (changed & (1u << SETTING_TX_VOLUME)) tx_volume_db = v[SETTING_TX_VOLUME];
+    if (changed & (1u << SETTING_RX_ALIGN)) packet_align = v[SETTING_RX_ALIGN] != 0;
+    if (changed & (1u << SETTING_RX_TRACKING)) tracking_mode = (enum tracking_mode)v[SETTING_RX_TRACKING];
+    if (changed & (1u << SETTING_RX_DURING_TX)) packet_rx_during_tx = v[SETTING_RX_DURING_TX] != 0;
+    if (changed & (1u << SETTING_TEST_SYMBOL)) tx_symbol = (uint32_t)v[SETTING_TEST_SYMBOL];
+    if (changed & (1u << SETTING_TEST_MODE)) {
+        current_mode = (enum test_mode)v[SETTING_TEST_MODE]; // Same order as the protocol's choices
+        tone_step_index = 0;
     }
 }
 
-// Core 0: queues a 16-byte test packet ("chirp packet NNN", NNN counting up),
-// or, with 'long', a PACKET_MAX_PAYLOAD-byte one ("chirp long NNN|" then a
-// repeating printable pattern, so a slip shows where it happened)
-static void queue_test_packet(bool long_packet) {
-    static uint32_t count = 0;
+static void board_get_status(void *ctx, ProtocolStatus_t *st) {
+    (void)ctx;
+    st->sample_rate = FS;
+    st->fft_size = FFT_SIZE;
+    st->bins = CHIRP_BINS;
+    st->f0 = F0;
+    st->bandwidth = BW;
+    st->highpass_hz = RX_HIGHPASS_HZ;
+    st->track_alpha = TRACK_ALPHA;
+    st->track_beta = TRACK_BETA;
+    st->track_max_rate = TRACK_MAX_RATE;
+    st->track_rate_window = TRACK_RATE_WINDOW;
+    st->track_min_magnitude = TRACK_MIN_MAGNITUDE;
+    st->frames = rx_view.frame;
+    st->rx_missed = rx_blocks_missed;
+    st->tx_missed = tx_blocks_missed;
+    st->records_dropped = rx_records_dropped;
+    st->good = rx_view.good;
+    st->bad = rx_view.bad;
+    st->header_failed = rx_view.header_failed;
+    st->lost = rx_view.lost;
+    st->rx_dropped = rx_packets_dropped;
+    st->tx_queued = atomic_load(&tx_packet_queue.head) - atomic_load(&tx_packet_queue.tail);
+    st->rx_state = (uint32_t)rx_view.state;
+    st->rx_delay = rx_sample_window_get_delay(&rx_window);
+    st->lock_align = rx_view.last_lock.align_bins;
+    st->lock_fraction = rx_view.last_lock.align_fraction;
+    st->lock_moved = rx_view.last_moved;
+    st->train_frame = rx_view.last_train.b_start_frame;
+    st->train_coherence = rx_view.last_train.coherence;
+    st->train_strongest = rx_view.last_train.strongest_offset;
+    st->train_earliest = rx_view.last_train.earliest_offset;
+}
+
+static int board_send(void *ctx, const uint8_t *payload, uint32_t length, uint32_t id) {
+    (void)ctx;
     static TxPacketRequest_t request;
-    char head[24];
-    if (long_packet) {
-        static const char pattern[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-";
-        request.length = PACKET_MAX_PAYLOAD;
-        for (uint32_t i = 0; i < PACKET_MAX_PAYLOAD; i++) request.payload[i] = (uint8_t)pattern[i % 64u];
-        const int n = snprintf(head, sizeof head, "chirp long %03lu|", (unsigned long)(count % 1000u));
-        memcpy(request.payload, head, (size_t)n);
-    } else {
-        request.length = TEST_PACKET_LENGTH;
-        snprintf(head, sizeof head, "chirp packet %03lu", (unsigned long)(count % 1000u));
-        memcpy(request.payload, head, TEST_PACKET_LENGTH);
-    }
-    if (spsc_ring_push(&tx_packet_queue, &request)) {
-        count++;
-        printf("[PACKET] Queued test packet %lu%s\n", (unsigned long)count,
-            current_mode == MODE_PACKET ? "" : " (sent in packet mode, key 6)");
-    } else {
-        printf("[PACKET] Queue full\n");
-    }
+    request.id = id;
+    request.length = length;
+    memcpy(request.payload, payload, length);
+    return spsc_ring_push(&tx_packet_queue, &request) ? 0 : PROTO_ERR_QUEUE_FULL;
 }
 
-static void handle_key(int ch) {
-    switch (ch) {
-        case '1':
-            set_mode(MODE_LOOPBACK);
+static uint32_t board_nudge(void *ctx, int32_t samples) {
+    (void)ctx;
+    const int32_t n = (int32_t)FFT_SIZE;
+    const uint32_t delay = (uint32_t)((((int32_t)rx_sample_window_get_delay(&rx_window) + samples) % n + n) % n);
+    rx_sample_window_set_delay(&rx_window, delay);
+    return delay;
+}
+
+static void board_reset_counters(void *ctx) {
+    (void)ctx;
+    rx_blocks_missed = tx_blocks_missed = rx_records_dropped = rx_packets_dropped = 0;
+    rx_view.good = rx_view.bad = rx_view.header_failed = rx_view.lost = 0;
+}
+
+static void board_reset_rx(void *ctx) {
+    (void)ctx;
+    packet_rx_reset_request = true;
+}
+
+static const ProtocolBoard_t board = {
+    .version = FIRMWARE_VERSION,
+    .board_id = board_id,
+    .apply = board_apply,
+    .get_status = board_get_status,
+    .send = board_send,
+    .nudge = board_nudge,
+    .reset_counters = board_reset_counters,
+    .reset_rx = board_reset_rx,
+    // save/load: no flash storage yet ("save" answers err 452)
+};
+
+// Core 0: one record from core 1 -> events and stream lines
+static void handle_record(const RxFrameRecord_t *r) {
+    const PacketRxStatus_t *st = &r->packet;
+    rx_view.frame = r->frame;
+    rx_view.state = st->state;
+
+    ProtocolEvent_t e = { .frame = r->frame };
+    bool have_event = true;
+    switch (st->event) {
+        case PACKET_RX_EVENT_LOCKED:
+            rx_view.last_lock = *st;
+            rx_view.last_moved = r->align_moved;
+            e.type = PROTO_EV_RX_LOCKED;
+            e.u.locked.align = st->align_bins;
+            e.u.locked.fraction = st->align_fraction;
+            e.u.locked.moved = r->align_moved;
             break;
-        case '2':
-            set_mode(MODE_MIC_LEVEL);
+        case PACKET_RX_EVENT_TRAINED:
+            rx_view.last_train = *st;
+            e.type = PROTO_EV_RX_TRAINED;
+            e.u.trained.b_start = st->b_start_frame;
+            e.u.trained.coherence = st->coherence;
+            e.u.trained.strongest = st->strongest_offset;
+            e.u.trained.earliest = st->earliest_offset;
             break;
-        case '3':
-            set_mode(MODE_TONE_440);
+        case PACKET_RX_EVENT_TRAIN_FAILED:
+            e.type = PROTO_EV_RX_TRAIN_FAILED;
             break;
-        case '4':
-            set_mode(MODE_TONE_CHIRP);
+        case PACKET_RX_EVENT_TONE:
+            e.type = PROTO_EV_RX_TONE;
             break;
-        case '5':
-            set_mode(MODE_SEQUENCE);
+        case PACKET_RX_EVENT_HEADER_FAILED:
+            rx_view.header_failed++;
+            e.type = PROTO_EV_RX_HEADER_FAILED;
+            e.u.header_failed.length = st->length;
             break;
-        case '6':
-            set_mode(MODE_PACKET);
+        case PACKET_RX_EVENT_LOST:
+            rx_view.lost++;
+            e.type = PROTO_EV_RX_LOST;
+            e.u.lost.symbols = st->data_count;
             break;
-        case 's':
-            queue_test_packet(false);
-            break;
-        case 'S':
-            queue_test_packet(true);
-            break;
-        case 'p':
-            tx_symbol = (tx_symbol + 1) % num_symbols();
-            break;
-        case 'o':
-            tx_symbol = (tx_symbol == 0) ? (num_symbols() - 1) : (tx_symbol - 1);
-            break;
-        case 'z': {
-            const uint32_t delay = rx_sample_window_get_delay(&rx_window);
-            rx_sample_window_set_delay(&rx_window, delay > 0 ? delay - 1 : (FFT_SIZE - 1));
+        case PACKET_RX_EVENT_PACKET: {
+            // Its payload was queued just before this record
+            static RxPacket_t rx_packet;
+            if (!spsc_ring_pop(&rx_packet_queue, &rx_packet)) rx_packet.length = 0;
+            if (st->crc_ok) rx_view.good++; else rx_view.bad++;
+            e.type = PROTO_EV_RX_PACKET;
+            e.u.packet.crc_ok = st->crc_ok;
+            e.u.packet.length = rx_packet.length;
+            e.u.packet.min_margin = st->min_margin;
+            e.u.packet.weakest = st->weakest_symbol;
+            e.u.packet.weak = st->weak_symbols;
+            e.u.packet.payload = rx_packet.payload;
             break;
         }
-        case 'x': {
-            const uint32_t delay = rx_sample_window_get_delay(&rx_window);
-            rx_sample_window_set_delay(&rx_window, delay < (FFT_SIZE - 1) ? delay + 1 : 0);
-            break;
-        }
-        case 'a':
-            packet_align = !packet_align;
-            break;
-        case 'b': {
-            const uint32_t next = bins_per_symbol_request >= 4u ? 1u : bins_per_symbol_request * 2u;
-            tx_symbol %= CHIRP_BINS / next;
-            bins_per_symbol_request = next;
-            printf("[SPACING] %lu bins per symbol (%lu bits); set the other board to match\n",
-                (unsigned long)next, (unsigned long)__builtin_ctz(CHIRP_BINS / next));
-            break;
-        }
-        case '[':
-        case ']': {
-            const int32_t step = ch == ']' ? TX_VOLUME_STEP_DB : -TX_VOLUME_STEP_DB;
-            int32_t db = tx_volume_db + step;
-            if (db < TX_VOLUME_MIN_DB) db = TX_VOLUME_MIN_DB;
-            if (db > TX_VOLUME_MAX_DB) db = TX_VOLUME_MAX_DB;
-            tx_volume_db = db;
-            printf("[VOLUME] TX %+ld dBFS\n", (long)db);
-            break;
-        }
-        case 't':
-            tracking_mode = (enum tracking_mode)((tracking_mode + 1) % 3);
-            break;
-        case 'c':
-            fft_visualise_page_prev(&fft_visualise);
-            break;
-        case 'v':
-            fft_visualise_page_next(&fft_visualise);
-            break;
-        case 'f':
-            display_folded = !display_folded;
-            break;
-        case 'l':
-            logging = !logging;
-            if (logging) {
-                printf("\033[2J\033[H"); // Clear the display
-                print_log_header();
-            } else {
-                printf("# log end\n");
-            }
-            break;
         default:
+            have_event = false;
             break;
     }
+    if (have_event) protocol_event(&protocol, &e);
+
+    // The spectrum, if core 1 copied this frame's (it copies one frame
+    // after each release, so the stream gets as many as it can)
+    const float32_t *spectrum = frame_snapshot_acquire(&spectrum_snapshot);
+    if (spectrum && frame_snapshot_tag(&spectrum_snapshot) != r->frame) {
+        if ((int32_t)(frame_snapshot_tag(&spectrum_snapshot) - r->frame) < 0) frame_snapshot_release(&spectrum_snapshot); // Stale
+        spectrum = NULL; // (or a later frame's: keep it for that record)
+    }
+    const ProtocolFrame_t f = {
+        .frame = r->frame,
+        .tx_symbol = r->tx_symbol,
+        .delay = r->delay,
+        .rx_symbol = r->symbol.symbol_index,
+        .angle = r->symbol.angle,
+        .error_angle = r->symbol.error_angle,
+        .magnitude = r->symbol.magnitude,
+        .strength = r->symbol.strength,
+        .peak = r->peak,
+        .timing_error = r->timing_error,
+        .timing_rate = r->timing_rate,
+        .state = (uint32_t)st->state,
+        .corr = st->correlation,
+        .data_symbol = st->data_symbol,
+        .data_margin = st->data_margin,
+        .data_quality = st->data_quality,
+        .folded = r->folded_power,
+        .band = r->band_power,
+        .shape = r->packet_shape,
+        .shape_changed = st->event == PACKET_RX_EVENT_TRAINED,
+        .spectrum = spectrum,
+        .spectrum_len = spectrum ? FFT_SIZE : 0,
+    };
+    protocol_frame(&protocol, &f);
+    if (spectrum) frame_snapshot_release(&spectrum_snapshot);
+}
+
+// Core 0: bytes to the host, only as many as USB will take now (never blocks)
+static void write_output(void) {
+    static char buf[CFG_TUD_CDC_TX_BUFSIZE];
+    if (!stdio_usb_connected()) return; // Nobody listening: output waits (and events are dropped when full)
+    const uint32_t room = tud_cdc_write_available();
+    if (room == 0) return;
+    const size_t n = protocol_output(&protocol, buf, room < sizeof buf ? room : sizeof buf);
+    if (n > 0) stdio_put_string(buf, (int)n, false, false);
+}
+
+// Core 0: bytes from the host. A command waiting for room in the output
+// keeps its remaining bytes here until the engine takes them
+static void read_input(void) {
+    static char buf[64];
+    static size_t len = 0, pos = 0;
+    if (pos == len) {
+        pos = len = 0;
+        int c;
+        while (len < sizeof buf && (c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) buf[len++] = (char)c;
+    }
+    if (pos < len) pos += protocol_input(&protocol, buf + pos, len - pos);
 }
 
 int main() {
@@ -855,17 +786,7 @@ int main() {
     set_sys_clock_khz(200000, true);
 
     stdio_init_all();
-    sleep_ms(2000);
-
-    printf("=== Pico 2 W (RP2350) I2S Audio Core Test System ===\n");
-    printf("[CORE] Available modes:\n");
-    printf("  1 = loopback test\n");
-    printf("  2 = mic level meter\n");
-    printf("  3 = 440Hz sine tone\n");
-    printf("  4 = chirp tone\n");
-    printf("  5 = pseudo-random symbol sequence (link test; restarts each time it is selected)\n");
-    printf("  6 = packets (silent until 's' queues a test packet)\n");
-    printf("[CORE] Initializing DMA and PIO peripherals...\n");
+    pico_get_unique_board_id_string(board_id, sizeof board_id);
 
     i2s_core_init();
 
@@ -873,6 +794,7 @@ int main() {
     spsc_ring_init(&rx_record_queue, rx_record_storage, sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY);
     spsc_ring_init(&rx_packet_queue, rx_packet_storage, sizeof(RxPacket_t), RX_PACKET_QUEUE_CAPACITY);
     spsc_ring_init(&tx_packet_queue, tx_packet_storage, sizeof(TxPacketRequest_t), TX_PACKET_QUEUE_CAPACITY);
+    spsc_ring_init(&tx_event_queue, tx_event_storage, sizeof(TxEvent_t), TX_EVENT_QUEUE_CAPACITY);
     frame_snapshot_init(&spectrum_snapshot, spectrum_snapshot_buffer, FFT_SIZE);
     rx_sample_window_init(
         &rx_window,
@@ -882,65 +804,35 @@ int main() {
         960 // Initial delay in samples to phase align with the input signal
     );
 
-    fft_visualise_init(
-        &fft_visualise,
-        FFT_SIZE,
-        FS,
-        50,      // Bins per page
-        1500.0f, // Magnitude to bar length; tune for microphone gain
-        120      // Max bar width in characters
-    );
+    // Settings go to the shared controls before core 1 reads them; "* hello"
+    // waits in the output queue until the host connects
+    protocol_init(&protocol, &board);
+    protocol_start(&protocol);
 
-    set_mode(MODE_PACKET);
-    printf("[CORE] Starting in packet mode (silent until a packet is queued: s or S; 3 for the 440 Hz test tone)\n");
     i2s_core_start();
 
     // Start core 1
     multicore_launch_core1(core1_main);
 
-    // Static: records are large (band_power) and the stack is small
-    static RxFrameRecord_t latest_record;
-    static RxFrameRecord_t record;
-    uint32_t records_received = 0;
-    uint32_t last_display_ms = 0;
+    static RxFrameRecord_t record; // Static: records are large (band_power) and the stack is small
+    static TxEvent_t tx_event;
 
     while (true) {
-        int ch = getchar_timeout_us(500);
-        if (ch != PICO_ERROR_TIMEOUT) {
-            handle_key(ch);
-        }
+        read_input();
 
-        // Drain every record from the receiver, keeping the latest for display
-        // and logging each one when logging is on
+        // Packet starts/ends, then the receiver's frames, in order
+        while (spsc_ring_pop(&tx_event_queue, &tx_event)) {
+            ProtocolEvent_t e = { .type = tx_event.start ? PROTO_EV_TX_START : PROTO_EV_TX_DONE, .frame = tx_event.frame };
+            e.u.tx.id = tx_event.id;
+            e.u.tx.abandoned = tx_event.abandoned;
+            protocol_event(&protocol, &e);
+        }
         while (spsc_ring_pop(&rx_record_queue, &record)) {
-            if (logging) {
-                print_log_record(&record);
-            }
-            if (record.packet.event == PACKET_RX_EVENT_PACKET) {
-                static RxPacket_t rx_packet;
-                if (spsc_ring_pop(&rx_packet_queue, &rx_packet)) note_rx_packet(&record, &rx_packet);
-            } else if (record.packet.event == PACKET_RX_EVENT_HEADER_FAILED) {
-                rx_packet_stats.header_failed++;
-                if (logging) printf("# packet header failed: length byte %lu\n", (unsigned long)record.packet.length);
-            } else if (record.packet.event == PACKET_RX_EVENT_LOST) {
-                rx_packet_stats.lost++;
-                if (logging) printf("# packet lost: signal gone after %lu data symbols\n", (unsigned long)record.packet.data_count);
-            }
-            latest_record = record;
-            records_received++;
+            handle_record(&record);
         }
 
-        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-
-        if (!logging && now_ms - last_display_ms >= DISPLAY_PERIOD_MS) {
-            const float32_t *spectrum = frame_snapshot_acquire(&spectrum_snapshot);
-            if (spectrum != NULL) {
-                draw_display(spectrum, &latest_record, records_received);
-                frame_snapshot_release(&spectrum_snapshot);
-                last_display_ms = now_ms;
-            }
-        }
-
+        protocol_poll(&protocol);
+        write_output();
         tight_loop_contents();
     }
 

@@ -119,7 +119,7 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PA
 
 | State | Each frame | Leaves when |
 |---|---|---|
-| SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 3 frames in a row → LOCK, measuring how far the window is out from the agreeing A frames (main.c then moves it; key `a` turns that off) |
+| SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 3 frames in a row → LOCK, measuring how far the window is out from the agreeing A frames (main.c then moves it; `set rx.align=off` turns that off) |
 | LOCK | correlate with A's average spectrum | below 0.4 → TRAIN (B has started); over 16 frames → a steady tone, ignored until it changes |
 | TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths → HEADER (deciding any data frames already in); else → SEARCH |
 | HEADER | matched decisions (`channel_template_decide`); collect 16 bits; check CRC-8 | CRC-8 good → PAYLOAD; bad → SEARCH |
@@ -128,8 +128,8 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PA
 
 No timing tracking during the data yet: the crystals agree to 0.6 ppm, about
 0.2 samples over the longest packet, and each packet re-aligns from its A.
-Core 0 shows good/bad counts and the last payload on the display, and
-writes a `# packet ...` comment line into the log for each packet.
+Core 0 reports each packet to the host as an `* rx.packet` event (good or
+bad, with its payload), and counts them (`count.good`, `count.bad`).
 
 Measured so far: in the model, preambles are found down to −12 dB, and
 2000 frames of noise never lock. Between the boards the coherence was
@@ -211,7 +211,7 @@ in most packets, set by the previous symbol (paths 16–48 samples late carry
 its tail into the next frame). At 2 bins per symbol: 2 → 1 8/8, 9/9 and 4/4,
 1 → 2 5/5; at 4: 3/3 each way, then 6/6 each way with room noise and no
 close decisions at all. So the default is now 4 (4 bits per symbol, 12.4 s
-for 255 bytes; 2 gives 5 bits, 10.0 s); key `b` cycles 1, 2, 4 while running (both boards
+for 255 bytes; 2 gives 5 bits, 10.0 s); `set link.spacing=1|2|4` changes it while running (both boards
 must match; a packet in progress is abandoned), and the log records the
 spacing on every row.
 

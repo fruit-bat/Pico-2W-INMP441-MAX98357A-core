@@ -188,6 +188,7 @@ class SerialTransport:
     def __init__(self, port, baud=115200):
         self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
         tty.setraw(self.fd)
+        termios.tcflush(self.fd, termios.TCIOFLUSH)  # Nothing stale either way
         attrs = termios.tcgetattr(self.fd)
         speed = getattr(termios, "B%d" % baud, termios.B115200)
         attrs[4] = attrs[5] = speed
@@ -259,7 +260,11 @@ class Board:
 
     @classmethod
     def serial(cls, port, baud=115200, **kw):
-        return cls(SerialTransport(port, baud), **kw)
+        board = cls(SerialTransport(port, baud), **kw)
+        # An empty line ends any half-line left in the board's input (from a
+        # previous program, or rubbish); the board ignores empty lines
+        board.send_bytes(b"\n")
+        return board
 
     @classmethod
     def sim(cls, path, speed=1.0, save=False, **kw):

@@ -5,9 +5,10 @@ An acoustic data link experiment for the Raspberry Pi Pico 2 W (RP2350), using a
 sent as frequency-shifted chirps (chirp spread spectrum) in the 15–17.8 kHz band
 and decoded with a de-chirp + FFT receiver.
 
-The project is a work in progress: the I2S engine, symbol encoder, symbol
-decoder and symbol timing tracking work; packet framing is still to come. A
-terminal display is provided to see what the receiver is doing.
+The project is a work in progress. The I2S engine, the symbol encoder and
+decoder, and packets (see [packet_format.md](packet_format.md)) work between
+two boards. A host talks to a board over USB serial with a line protocol (see
+[protocol.md](protocol.md)), which gives access to every setting and diagnostic.
 
 All code avoids dynamic memory allocation; every module takes caller-provided
 (typically static) storage.
@@ -42,37 +43,33 @@ Notes:
 
 ## 2. Using It
 
-Connect to the USB serial port (e.g. `minicom -D /dev/ttyACM0`). The display
-shows a page of the FFT spectrum of the received (de-chirped) signal, followed
-by the transmitted and decoded symbols and receiver statistics.
+The USB serial port carries only the host protocol ([protocol.md](protocol.md)).
+Every line both ways starts with a CRC-16 check, so use the client rather than
+a terminal program:
 
-| Key | Action |
+```sh
+python3 tools/chirp_host.py console --port /dev/ttyACM0
+```
+
+Type commands without a tag or check; the console adds both:
+
+| Command | Does |
 | :--- | :--- |
-| `1` | Loopback: generated chirps are fed straight to the receiver (speaker silent) |
-| `2` | Mic level: speaker silent, receive from the microphone |
-| `3` | 440 Hz test tone (start-up default, to check the speaker path) |
-| `4` | Chirp: transmit chirps through the speaker, receive from the microphone |
-| `o` / `p` | Previous / next transmitted symbol |
-| `z` / `x` | Decrease / increase the receive alignment delay by one sample |
-| `t` | Cycle timing tracking: off → decision → pilot (see below) |
-| `c` / `v` | Previous / next page of the spectrum display |
-| `l` | Toggle CSV logging (replaces the display; see below) |
+| `help`, `list` | The commands; every setting and status item, with ranges and help |
+| `get [name ...]` | Settings and status, e.g. `get count.*` or `get rx.*` |
+| `set name=value ...` | e.g. `set tx.volume=-31`, `set link.spacing=2`, `set test.mode=chirp test.symbol=5` |
+| `send hex=<bytes>` | Send a packet; `* tx.start`, `* tx.done` and the receiver's `* rx.*` events follow |
+| `sub stream=frame\|folded\|band\|shape\|spectrum ...` | Per-frame data (shown with `--streams`) |
+| `nudge samples=<n>` | Move the receive window (the old `z` / `x` keys) |
 
-The status lines show:
+Without a board, `--sim tests/build/protocol_sim` gives the same console
+against a pretend board. In Python, `tools/chirp_host.py` is also a library
+(`Board.serial(...)`, `get`, `set`, `send`, `sub`, `wait_event`, ...).
 
-* **TX symbol / RX symbol** – what is being sent and what was decoded.
-* **centroid / error** – the decoded position in symbol units and its offset
-  from the nearest symbol in radians.
-* **Tracking / timing error / drift** – the tracking mode, the measured timing
-  error in samples and the tracker's drift estimate. The timing error is shown
-  even with tracking off, as a guide for adjusting the delay by hand.
-* **magnitude** – how clearly one tone stands out (0–1); tracking ignores
-  frames below 0.8.
-* **peak** – peak received level as a percentage of full scale.
-* **missed rx / tx** – DMA blocks the processing core failed to service in time
-  (should stay at 0).
-* **dropped records** – receiver results lost because the display core fell
-  behind.
+The old keys and full-screen display are gone; their settings, status and
+data are all in the protocol (protocol.md has the full mapping, in its
+Inventory section). `set test.mode=` selects `loopback`, `mic`, `tone` (440 Hz),
+`chirp`, `sequence` or `packet` (the default).
 
 ### Timing tracking
 
@@ -93,8 +90,9 @@ flipping when echoes give the peak two humps.
 It can also learn a steady drift (e.g. clock mismatch between two boards), but
 that is disabled (`TRACK_BETA` = 0) while one board both transmits and receives,
 as there is no drift to learn and it only picked up noise. Frames without a
-clear tone are ignored, and pressing `z`/`x` while tracking simply moves it to
-the new delay, from where it re-locks.
+clear tone are ignored, and a `nudge` while tracking simply moves it to the
+new delay, from where it re-locks. `set rx.tracking=off|decision|pilot`
+chooses the mode.
 
 * **decision** – uses the error from the nearest symbol, as a real receiver
   must. It aligns to the symbol grid (±8 samples pull-in), but because a
@@ -107,35 +105,16 @@ The gains are `TRACK_*` constants near the top of `main.c`.
 
 ### Logging
 
-Pressing `l` replaces the display with one CSV line per received frame
-(about 43 lines per second), starting with `#` comment lines describing the
-configuration and a column header. Each line holds the transmitted symbol, the
-decoded symbol (angle, error, magnitude, strength), the tracker state, the
-missed/dropped counters, and the FFT power of the 128 bins either side of DC
-(`b-64` … `b63`) that the decoder uses.
+The per-frame data the CSV log held is now in the protocol's streams: `frame`
+(the decoded symbol, timing and packet receiver values), `band` (the 128 bins
+either side of DC), `folded` and `shape`, with `units=power` for raw values.
+Each line carries its frame number.
 
-[tools/capture_log.py](tools/capture_log.py) captures a log without needing a
-terminal program (standard library only):
-
-```sh
-# chirp mode, pilot tracking, 30 s
-python3 tools/capture_log.py --keys 4tt --seconds 30 pilot.csv
-
-# chirp mode, tracking off, step through all 64 symbols for 1 s each
-python3 tools/capture_log.py --keys 4 --sweep 1 sweep.csv
-```
-
-It reports gaps in the frame numbers; if the board cannot keep up, the
-`dropped` column will also increase.
-
-[tools/analyse_log.py](tools/analyse_log.py) summarises a log per transmitted
-symbol (skipping the frames just after each symbol change): decode accuracy,
-the decoded position relative to the transmitted symbol in samples, the
-decoder's error, and magnitude.
-
-```sh
-python3 tools/analyse_log.py sweep.csv
-```
+*Still to do:* the client writing the old CSV format from the streams, so
+that [tools/analyse_log.py](tools/analyse_log.py) and the chirp lab work on
+new captures. Until then, [tools/capture_log.py](tools/capture_log.py)
+(which drives the old keys) only works with firmware from before the
+protocol.
 
 ---
 
@@ -174,9 +153,10 @@ whose position is estimated with a circular weighted centroid.
 * **Core 1 – real-time DSP.** Polls the DMA block counters. For each TX block it
   generates audio; for each RX block it aligns the frame, decodes a symbol and
   publishes the result. It never blocks and does no I/O.
-* **Core 0 – user interface.** Handles keys and the terminal display. It reads
-  the receiver's results from a lock-free queue and the spectrum from a
-  snapshot handshake, so it always sees complete, consistent data.
+* **Core 0 – host protocol.** Runs `protocol.c` over USB serial: commands in,
+  replies, events and streams out, never blocking. It reads the receiver's
+  results from a lock-free queue and the spectrum from a snapshot handshake
+  (tagged with its frame), so it always sees complete, consistent data.
 
 ### Receive chain (core 1)
 
@@ -191,14 +171,15 @@ I2S RX DMA block (q31)
 ```
 
 Each `RxFrameRecord_t` carries the frame number, delay, transmitted symbol, peak
-level, decoded symbol and timing tracking state. This queue is the receiver's output: today it feeds
-the display; it is intended to feed logging to a host and packet decoding later.
+level, decoded symbol, timing tracking state and packet receiver state. Core 0
+turns it into protocol events and stream lines.
 
 ### Source files
 
 | File | Purpose |
 | :--- | :--- |
-| `main.c` | Application: mode handling, core 1 audio loop, core 0 display |
+| `main.c` | Application: core 1 audio loop, core 0 host protocol glue |
+| `protocol.c/.h` | Host protocol engine: lines, checks, commands, settings, events, streams (no Pico calls) |
 | `i2s_core.c/.h` | Chained DMA ping-pong buffers, interrupt handler, block counters, pin definitions |
 | `audio_i2s_setup.c/.h`, `audio_i2s.pio` | PIO program and state machine setup |
 | `chirp_encoder.c/.h` | Symbol → transmitted chirp samples |
@@ -209,10 +190,11 @@ the display; it is intended to feed logging to a host and packet decoding later.
 | `symbol_timing_tracker.c/.h` | Second-order loop keeping the receive window aligned to the symbols |
 | `spsc_ring.c/.h` | Lock-free single-producer/single-consumer queue between cores |
 | `frame_snapshot.c/.h` | Request/ready handshake for copying a frame between cores |
-| `fft_visualise.c/.h` | Paged terminal bar graph of a spectrum |
+| `fft_visualise.c/.h` | Paged terminal bar graph of a spectrum (no longer used) |
 | `running_moving_average.h`, `window_moving_average.h` | Averaging helpers |
 | `audio_i2s_stereo.pio` | Alternative PIO program (not currently built) |
-| `tools/capture_log.py` | Captures the CSV log over USB serial, optionally sweeping all symbols |
+| `tools/chirp_host.py` | Host client library and console for the protocol |
+| `tools/capture_log.py` | Captures the old CSV log (firmware before the protocol) |
 | `tools/analyse_log.py` | Per-symbol statistics from a CSV log |
 
 ---

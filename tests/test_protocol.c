@@ -245,7 +245,7 @@ static void test_send(void) {
     CHECK_STR(drain(),
         "* rx.locked seq=2 frame=4 align=+0 fraction=+0.120 moved=+2\n"
         "* rx.trained seq=3 frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0\n"
-        "* tx.done seq=4 frame=29 id=1\n"
+        "* tx.done seq=4 frame=29 id=1 result=sent\n"
         "* rx.packet seq=5 frame=29 crc=ok len=2 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
     CHECK_STR(talk("p3 get count.good rx.delay rx.last_train.coherence\n"),
         "p3 count.good=1\np3 rx.delay=962\np3 rx.last_train.coherence=0.830\np3 ok\n");
@@ -266,7 +266,7 @@ static void test_send(void) {
     fake_board_advance_us(&fb, 12000000u);
     CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
     fake_board_advance_us(&fb, 500000u);
-    CHECK_STR(drain(), "* tx.done seq=2 frame=535 id=1\n");
+    CHECK_STR(drain(), "* tx.done seq=2 frame=535 id=1 result=sent\n");
 
     // Bad hex
     CHECK_STR(talk("q1 send hex=486\n"), "q1 err 506 odd number of hex digits\n");
@@ -564,6 +564,17 @@ static void test_stream_lines(void) {
     CHECK(shape && strstr(shape, ",-5.2\n") != NULL); // The early path, 0.3 = -5.2 dB
 }
 
+// A spacing change cuts a packet short; the host still hears how it ended
+static void test_abandoned(void) {
+    setup();
+    CHECK_STR(talk("x1 set rx.during_tx=off\nx2 send hex=0102030405\n"), "x1 ok\nx2 ok id=1\n");
+    fake_board_advance_frames(&fb, 10);
+    CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
+    CHECK_STR(talk("x3 set link.spacing=2\n"), "x3 ok\n"); // The reply comes first...
+    fake_board_advance_frames(&fb, 1);
+    CHECK_STR(drain(), "* tx.done seq=2 frame=11 id=1 result=abandoned\n"); // ...then what it caused
+}
+
 // A slow host: streams are dropped long before replies or events suffer,
 // and seq still runs without a gap
 static void test_stream_priority(void) {
@@ -684,6 +695,7 @@ int main(void) {
     RUN_TEST(test_set);
     RUN_TEST(test_send);
     RUN_TEST(test_ordering);
+    RUN_TEST(test_abandoned);
     RUN_TEST(test_input);
     RUN_TEST(test_nudge);
     RUN_TEST(test_save_load);

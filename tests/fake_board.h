@@ -45,6 +45,7 @@ typedef struct {
     bool sending;
     FakePacket_t current;
     uint32_t sent_frames, total_frames;
+    bool abandon;               // Spacing changed mid-packet: report it on the next frame
 
     // Saved settings (RAM only); save fails unless save_enabled
     bool save_enabled, have_saved;

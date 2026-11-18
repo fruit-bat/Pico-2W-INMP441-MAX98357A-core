@@ -3,7 +3,8 @@
 Status: the engine (`src/protocol.c`) runs on the PC against a pretend
 board (`tests/fake_board.c`). `tests/test_protocol.c` has the scenarios.
 The Python client (`tools/chirp_host.py`) talks to the same engine
-through `tests/build/protocol_sim`. Nothing runs on the board yet.
+through `tests/build/protocol_sim`, and to the boards: since firmware
+0.2.0 the protocol is the board's only interface over USB serial.
 Numbers in *italics* are guesses.
 
 The board talks to a host (a PC or another microcontroller) over a byte
@@ -127,7 +128,7 @@ host:   a4 send hex=6869
 board:  * rx.packet seq=40 frame=1803 crc=ok len=16 min_margin=2.310 weakest=3 weak=0 hex=...
 board:  a4 ok id=7
 board:  * tx.start seq=41 frame=1811 id=7
-board:  * tx.done seq=42 frame=1837 id=7
+board:  * tx.done seq=42 frame=1837 id=7 result=sent
 ```
 
 ## Settings and status
@@ -193,7 +194,8 @@ come after `seq`.
 | `* rx.header_failed` | `frame length` | `# packet header failed` |
 | `* rx.lost` | `frame symbols` | `# packet lost` |
 | `* rx.packet` | `frame crc=ok\|bad len min_margin weakest weak hex` | `# packet ...` |
-| `* tx.start` / `* tx.done` | `id` | (new) |
+| `* tx.start` | `frame id` | (new) |
+| `* tx.done` | `frame id result=sent\|abandoned` | (new). `abandoned`: cut short, e.g. by a `link.spacing` change, so a host waiting on that id always hears how it ended |
 | `* overflow` | `dropped=<n>` | (new) see Flow |
 | `* err` | `500 <text>` | (new) a line from the host that failed its check, was too long, or had no valid tag (see Link errors) |
 
@@ -226,7 +228,7 @@ board:  * spectrum seq=13 frame=4005 units=power from=10 values=1.375e-04,1.500e
 | `folded` | 64 values: what the decoder decides from | `every`, `units` | 350 B (dB) | log `f0..f63`; folded display view (`f`) |
 | `band` | 128 values: bins −64..63 of the de-chirped FFT | `every`, `units` | 700 B (dB) | log `b-64..b63` |
 | `shape` | 64 values: the learned channel shape | `units`; sent only when a new shape is learned, so no `every` | 350 B (dB) | log `s0..s63` |
-| `spectrum` | the de-chirped FFT, bins `from`..`to` (default 0..511, at most 512 of 0..1023) | `every`, `units`, `from`, `to` | 3 KB (512 in dB), 5.2 KB (512 as power) | the paged display (`c` `v`) |
+| `spectrum` | the de-chirped FFT, bins `from`..`to` (default 0..511, at most 512 of 0..1023); core 1 copies a frame's spectrum only when core 0 has finished with the last, so it may skip frames (on the boards it kept up with every frame) | `every`, `units`, `from`, `to` | 3 KB (512 in dB), 5.2 KB (512 as power) | the paged display (`c` `v`) |
 
 Every stream line is `* <stream> seq=<n> frame=<f> ...`. The frame number
 always comes first, so the host can line streams up with each other and

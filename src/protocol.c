@@ -1005,9 +1005,11 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
             break;
         }
         case PROTO_EV_TX_START:
+            n = snprintf(line, size, "* tx.start seq=%lu frame=%lu id=%lu\n", seq, frame, (unsigned long)e->u.tx.id);
+            break;
         case PROTO_EV_TX_DONE:
-            n = snprintf(line, size, "* tx.%s seq=%lu frame=%lu id=%lu\n", e->type == PROTO_EV_TX_START ? "start" : "done",
-                seq, frame, (unsigned long)e->u.tx.id);
+            n = snprintf(line, size, "* tx.done seq=%lu frame=%lu id=%lu result=%s\n", seq, frame,
+                (unsigned long)e->u.tx.id, e->u.tx.abandoned ? "abandoned" : "sent");
             break;
     }
     if (n > 0) emit(p, line, (uint32_t)n);

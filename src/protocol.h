@@ -139,7 +139,7 @@ typedef struct {
             uint32_t weakest, weak;
             const uint8_t *payload; // Only needs to last for the protocol_event() call
         } packet;
-        struct { uint32_t id; } tx; // TX_START, TX_DONE
+        struct { uint32_t id; bool abandoned; } tx; // TX_START, TX_DONE (abandoned: cut short, e.g. by a spacing change)
     } u;
 } ProtocolEvent_t;
 
