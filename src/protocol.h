@@ -154,6 +154,7 @@ typedef struct {
     float corr;
     uint32_t data_symbol;
     float data_margin, data_quality;
+    uint32_t rx_missed, tx_missed, records_dropped; // The counters, as of this frame
     const float *folded;         // PROTOCOL_CHIRP_BINS: what the decoder decides from
     const float *band;           // 2 * PROTOCOL_CHIRP_BINS: bins -bins .. bins-1 of the de-chirped FFT
     const float *shape;          // PROTOCOL_CHIRP_BINS: the learned channel shape
@@ -178,6 +179,7 @@ typedef struct {
     uint32_t count;      // Frames since the last one sent
     uint32_t fields;     // frame: bit per field
     uint32_t from, to;   // spectrum: bins (inclusive)
+    bool pending;        // shape: send the current one on the next frame (just subscribed)
 } ProtocolSub_t;
 
 // ---------------------------------------------------------------------------

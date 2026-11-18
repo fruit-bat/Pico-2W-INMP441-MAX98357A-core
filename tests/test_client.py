@@ -114,6 +114,65 @@ class WithSim(unittest.TestCase):
         self.assertEqual(e["text"], "line has no valid tag")
         self.assertEqual(self.b.get("count.link_errors")["count.link_errors"], 1)
 
+    def test_csv_log(self):
+        import io
+        import csv
+        out = io.StringIO()
+        log = chirp_host.CsvLog(self.b, out)
+        log.start()
+        pid = self.b.send(b"chirp packet 042")
+        self.b.wait_event("rx.packet", timeout=10)
+        time.sleep(0.2)
+        log.stop()
+        self.assertEqual(self.b.wait_event("tx.done", lambda e: e["id"] == pid, timeout=1)["result"], "sent")
+        text = out.getvalue()
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "# chirp receiver log v8")
+        self.assertIn("# sample_rate=44100.0 fft_size=1024 bins=64 bins_per_symbol=4 symbols=16", text)
+        self.assertEqual(lines[-1], "# log end")
+        rows = list(csv.DictReader(l for l in lines if l and not l.startswith("#")))
+        self.assertEqual(list(rows[0].keys()), chirp_host.LOG_COLUMNS)
+        self.assertEqual((log.incomplete, log.gaps), (0, 0))
+        frames = [int(r["frame"]) for r in rows]
+        self.assertEqual(frames, list(range(frames[0], frames[0] + len(frames))))
+        events = {int(r["packet_event"]): r for r in rows if r["packet_event"] != "0"}
+        self.assertEqual(sorted(events), [1, 2, 6])  # Locked, trained, packet
+        trained = events[2]
+        self.assertEqual((trained["packet_coherence"], trained["packet_strongest"]), ("0.830", "-1"))
+        self.assertEqual(trained["s0"], "1.000e+00")  # The shape learned on that frame
+        self.assertEqual(events[1]["packet_align_fraction"], "+0.120")
+        self.assertEqual((rows[0]["mode"], rows[0]["tracking"], rows[0]["bins_per_symbol"], rows[0]["tx_volume_db"],
+                          rows[0]["packet_align_on"]), ("packet", "off", "4", "-28", "1"))
+        # The packet's comment line follows its row
+        i = lines.index(next(l for l in lines if l.startswith(events[6]["frame"] + ",")))
+        self.assertEqual(lines[i + 1], "# packet frame=%s crc_ok=1 length=16 data_symbols=40 min_margin=2.000 "
+                                       "weakest=0 weak=0 payload=chirp packet 042" % events[6]["frame"])
+
+    def test_log_command(self):
+        """The CLI: a sweep through every symbol in chirp mode, settings restored after, and analyse_log.py reads it."""
+        import subprocess
+        import tempfile
+        tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools")
+        self.b.close()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sweep.csv")
+            r = subprocess.run([sys.executable, os.path.join(tools, "chirp_host.py"), "log", "--sim", SIM,
+                                "--speed", str(SPEED), "--set", "rx.tracking=pilot", "--sweep", "0.05", path],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("0 incomplete frames left out, 0 gaps; events lost 0, bad lines 0", r.stdout)
+            with open(path) as f:
+                text = f.read()
+            self.assertIn(",chirp,", text)
+            self.assertIn(",pilot,", text)
+            a = subprocess.run([sys.executable, os.path.join(tools, "analyse_log.py"), path],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(a.returncode, 0, a.stderr)
+            table = [l.split() for l in a.stdout.splitlines() if l.strip()[:1].isdigit()]
+            self.assertEqual([int(t[0]) for t in table], list(range(16)))  # Every symbol, each decoded right
+            self.assertTrue(all(t[2] == "100.0" for t in table))
+        self.b = Board.sim(SIM, speed=SPEED)  # For tearDown
+
     def test_nudge(self):
         self.assertEqual(self.b.nudge(-8), 952)
         self.assertEqual(self.b.get("rx.delay")["rx.delay"], 952)

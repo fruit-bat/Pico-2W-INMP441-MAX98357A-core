@@ -105,16 +105,39 @@ The gains are `TRACK_*` constants near the top of `main.c`.
 
 ### Logging
 
-The per-frame data the CSV log held is now in the protocol's streams: `frame`
-(the decoded symbol, timing and packet receiver values), `band` (the 128 bins
-either side of DC), `folded` and `shape`, with `units=power` for raw values.
-Each line carries its frame number.
+`tools/chirp_host.py log` writes the CSV log the firmware used to print: one
+line per received frame (about 43 a second), `#` comment lines describing the
+configuration, and the same 287 columns in the same order and number formats
+(the decoded symbol, the timing, the packet receiver, the FFT power of the 128
+bins either side of DC `b-64` … `b63`, the folded power `f0` … `f63` and the
+learned shape `s0` … `s63`), with a `# packet ...` line after each packet's
+row. It is rebuilt from the protocol's streams and events (about 100 KB/s, so
+USB rather than a slow UART); a frame whose lines didn't all arrive is left
+out and counted.
 
-*Still to do:* the client writing the old CSV format from the streams, so
-that [tools/analyse_log.py](tools/analyse_log.py) and the chirp lab work on
-new captures. Until then, [tools/capture_log.py](tools/capture_log.py)
-(which drives the old keys) only works with firmware from before the
-protocol.
+```sh
+# 30 s of whatever the board is doing
+python3 tools/chirp_host.py log --port /dev/ttyACM0 --seconds 30 run.csv
+
+# chirp mode, every symbol for 1 s each (settings given with --set are restored afterwards)
+python3 tools/chirp_host.py log --port /dev/ttyACM0 --set rx.align=off --sweep 1 sweep.csv
+```
+
+For a sweep, turn `rx.align` off: otherwise the packet receiver takes each
+held symbol for a packet preamble (which is symbol 0) and moves the window to
+"correct" it. From a script, `CsvLog(board, file)` does the same while the
+script sends packets or changes settings (`board.set()` changes show in the
+log's settings columns). [tools/capture_log.py](tools/capture_log.py) drives
+the old keys, so it only works with firmware from before the protocol.
+
+[tools/analyse_log.py](tools/analyse_log.py) summarises a log per transmitted
+symbol (skipping the frames just after each symbol change): decode accuracy,
+the decoded position relative to the transmitted symbol in samples, the
+decoder's error, and magnitude.
+
+```sh
+python3 tools/analyse_log.py sweep.csv
+```
 
 ---
 

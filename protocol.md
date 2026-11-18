@@ -224,10 +224,10 @@ board:  * spectrum seq=13 frame=4005 units=power from=10 values=1.375e-04,1.500e
 
 | Stream | Content | Arguments | Size per line (about) | Today |
 |---|---|---|---|---|
-| `frame` | `tx_symbol delay rx_symbol angle error_angle magnitude strength peak timing_error timing_rate state corr data_symbol data_margin data_quality` | `every`, `fields` (default `all`) | 290 B | log columns other than b, f, s |
+| `frame` | `tx_symbol delay rx_symbol angle error_angle magnitude strength peak timing_error timing_rate state corr data_symbol data_margin data_quality rx_missed tx_missed records_dropped` | `every`, `fields` (default `all`) | 330 B | log columns other than b, f, s |
 | `folded` | 64 values: what the decoder decides from | `every`, `units` | 350 B (dB) | log `f0..f63`; folded display view (`f`) |
 | `band` | 128 values: bins −64..63 of the de-chirped FFT | `every`, `units` | 700 B (dB) | log `b-64..b63` |
-| `shape` | 64 values: the learned channel shape | `units`; sent only when a new shape is learned, so no `every` | 350 B (dB) | log `s0..s63` |
+| `shape` | 64 values: the learned channel shape | `units`; sent once on the next frame after subscribing (the current shape), then only when a new one is learned, so no `every` | 350 B (dB) | log `s0..s63` |
 | `spectrum` | the de-chirped FFT, bins `from`..`to` (default 0..511, at most 512 of 0..1023); core 1 copies a frame's spectrum only when core 0 has finished with the last, so it may skip frames (on the boards it kept up with every frame) | `every`, `units`, `from`, `to` | 3 KB (512 in dB), 5.2 KB (512 as power) | the paged display (`c` `v`) |
 
 Every stream line is `* <stream> seq=<n> frame=<f> ...`. The frame number
@@ -384,8 +384,10 @@ The console adds the tag and the check to what you type, and prints
 replies and events as they come (stream lines only with `--streams`). A
 line starting with `!` is sent as typed, with its check but no tag added.
 
-*Still to do:* the client writing the existing CSV log format from the
-streams, so `analyse_log.py` and the chirp lab keep working.
+`chirp_host.py log` (and the `CsvLog` class) rebuilds the old CSV log
+from the `frame`, `band`, `folded` and `shape` streams and the events, with
+the same columns and formats, so `analyse_log.py` and older scripts read it
+unchanged.
 
 ## Inventory: today's diagnostics and where they go
 

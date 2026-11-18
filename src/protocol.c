@@ -402,6 +402,9 @@ static const FrameField_t FRAME_FIELDS[] = {
     FF(data_symbol, FF_U32, "%lu"),
     FF(data_margin, FF_FLOAT, "%.3f"),
     FF(data_quality, FF_FLOAT, "%.3f"),
+    FF(rx_missed, FF_U32, "%lu"),
+    FF(tx_missed, FF_U32, "%lu"),
+    FF(records_dropped, FF_U32, "%lu"),
 };
 #define FRAME_FIELD_COUNT (sizeof FRAME_FIELDS / sizeof FRAME_FIELDS[0])
 #define ALL_FIELDS ((1u << FRAME_FIELD_COUNT) - 1u)
@@ -751,6 +754,7 @@ static void cmd_sub(Protocol_t *p, const char *tag, uint32_t argc, char **argv) 
         s.to = (uint32_t)to;
     }
     s.count = s.every - 1u; // The next frame is sent
+    s.pending = stream == PROTO_STREAM_SHAPE; // And the shape as it is now
     p->subs[stream] = s;
     reply_ok(p, tag);
 }
@@ -1106,8 +1110,10 @@ void protocol_frame(Protocol_t *p, const ProtocolFrame_t *f) {
     if (due(&p->subs[PROTO_STREAM_BAND]) && f->band) {
         stream_values(p, PROTO_STREAM_BAND, f->frame, f->band, 2u * PROTOCOL_CHIRP_BINS, 0);
     }
-    if (p->subs[PROTO_STREAM_SHAPE].on && f->shape_changed && f->shape) {
+    ProtocolSub_t *sh = &p->subs[PROTO_STREAM_SHAPE];
+    if (sh->on && (f->shape_changed || sh->pending) && f->shape) {
         stream_values(p, PROTO_STREAM_SHAPE, f->frame, f->shape, PROTOCOL_CHIRP_BINS, 0);
+        sh->pending = false;
     }
     ProtocolSub_t *sp = &p->subs[PROTO_STREAM_SPECTRUM];
     if (due(sp) && f->spectrum && sp->from < f->spectrum_len) {

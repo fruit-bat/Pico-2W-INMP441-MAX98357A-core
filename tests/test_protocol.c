@@ -512,7 +512,7 @@ static void test_stream_lines(void) {
     fake_board_advance_frames(&fb, 1);
     CHECK_STR(drain(), "* frame seq=3 frame=9 tx_symbol=0 delay=960 rx_symbol=0 angle=0.00000 error_angle=+0.20000 "
         "magnitude=0.3000 strength=1.0000e-06 peak=0.0020 timing_error=+3.000 timing_rate=+0.0000 state=search "
-        "corr=+0.300 data_symbol=0 data_margin=0.000 data_quality=0.300\n");
+        "corr=+0.300 data_symbol=0 data_margin=0.000 data_quality=0.300 rx_missed=0 tx_missed=0 records_dropped=0\n");
 
     // Spectra, in dB and as raw power
     CHECK_STR(talk("a3 unsub all\na4 sub stream=folded\n"), "a3 ok\na4 ok\n");
@@ -553,11 +553,15 @@ static void test_stream_lines(void) {
     CHECK(strstr(line, "from=512 values=6.413e-03,") != NULL);
     CHECK(strstr(line, ",1.280e-02\n") != NULL);
 
-    // The shape: only when it is learned, here from the board's own packet
+    // The shape: the current one on subscribing, then only when one is
+    // learned, here from the board's own packet
     CHECK_STR(talk("b2 unsub all\nb3 sub stream=shape\nb4 send hex=00\n"), "b2 ok\nb3 ok\nb4 ok id=1\n");
     fake_board_advance_frames(&fb, 40);
     line = drain();
-    CHECK_EQ_U(count_char(line, '\n'), 6); // tx.start, rx.locked, rx.trained, shape, tx.done, rx.packet
+    CHECK(starts(line, "* tx.start seq=")); // Then the current shape, on the same frame
+    CHECK(strstr(line, "\n* shape seq=") != NULL && strstr(line, " units=db values=") != NULL);
+    line = strchr(strchr(line, '\n') + 1, '\n') + 1; // Past both
+    CHECK_EQ_U(count_char(line, '\n'), 5); // rx.locked, rx.trained, shape, tx.done, rx.packet
     const char *shape = strstr(line, "* shape seq=");
     const char *trained = strstr(line, "* rx.trained");
     CHECK(shape && trained && trained < shape && strstr(shape, " values=0.0,") != NULL);

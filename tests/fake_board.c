@@ -38,8 +38,11 @@ static float noise(uint32_t *seed) {
 static void report_frame(FakeBoard_t *fb, bool learned) {
     const uint32_t spacing = (uint32_t)fb->settings.value[SETTING_LINK_SPACING];
     const uint32_t symbols = PROTOCOL_CHIRP_BINS / spacing;
-    const bool on_air = fb->sending && fb->settings.value[SETTING_RX_DURING_TX] != 0;
-    const uint32_t symbol = on_air ? fb->sent_frames * 7u % symbols : 0u;
+    // Chirp mode sends test.symbol all the time; packets are heard while being sent
+    const bool chirp = fb->settings.value[SETTING_TEST_MODE] == 3;
+    const bool on_air = chirp || (fb->sending && fb->settings.value[SETTING_RX_DURING_TX] != 0);
+    const uint32_t symbol = chirp ? (uint32_t)fb->settings.value[SETTING_TEST_SYMBOL] % symbols
+                          : on_air ? fb->sent_frames * 7u % symbols : 0u;
     uint32_t seed = fb->frame;
     for (uint32_t i = 0; i < PROTOCOL_CHIRP_BINS; i++) folded[i] = noise(&seed);
     for (uint32_t i = 0; i < 2u * PROTOCOL_CHIRP_BINS; i++) band[i] = noise(&seed);
@@ -71,6 +74,9 @@ static void report_frame(FakeBoard_t *fb, bool learned) {
         .data_symbol = symbol,
         .data_margin = on_air ? 2.1f : 0.0f,
         .data_quality = on_air ? 0.85f : 0.3f,
+        .rx_missed = fb->status.rx_missed,
+        .tx_missed = fb->status.tx_missed,
+        .records_dropped = fb->status.records_dropped,
         .folded = folded,
         .band = band,
         .shape = shape,
