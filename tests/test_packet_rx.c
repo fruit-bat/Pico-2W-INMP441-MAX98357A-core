@@ -16,6 +16,7 @@
 #include "packet_rx.h"
 #include "packet_tx.h"
 #include "test_util.h"
+#include "logged_ghost_lock.h"
 
 int test_failures = 0;
 int test_checks = 0;
@@ -66,12 +67,19 @@ typedef struct {
     float32_t min_quality;                  // Lowest data frame quality seen
     PacketRxStatus_t last_packet;
     int32_t last_align;           // align_bins at the last LOCKED
+    int32_t realigned;            // realign_bins at the last TRAINED (0: none)
     double final_offset;          // Window offset at the end (after any moves)
     PacketRxStatus_t last_trained;
 } Events_t;
 
+// A ghost for the lock to fall for: with 'align', the window is moved this
+// many bins further than the receiver asked (as when A's earliest path is a
+// long echo's wrapped image)
+static int32_t wrong_lock_move = 0;
+
 // Runs 'length' frames of the stream through the channel and the receiver.
-// With 'align', the window is moved when the receiver locks, as main.c does.
+// With 'align', the window is moved when the receiver locks, and back if
+// training says that move was wrong, as main.c does.
 static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEcho_t *echoes, uint32_t echo_count, bool align) {
     static float32_t frame[N];
     ChirpChannel_t ch = {
@@ -96,11 +104,20 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
                 e.locked++;
                 e.last_align = st->align_bins;
                 if (align) {
-                    ch.offset -= round((st->align_bins + st->align_fraction) * (double)(N / BINS)); // Earlier
-                    packet_rx_window_moved(&prx, st->align_bins);
+                    const int32_t bins = st->align_bins + wrong_lock_move;
+                    ch.offset -= round((bins + st->align_fraction) * (double)(N / BINS)); // Earlier
+                    packet_rx_window_moved(&prx, bins);
                 }
                 break;
-            case PACKET_RX_EVENT_TRAINED: e.trained++; e.last_trained = *st; break;
+            case PACKET_RX_EVENT_TRAINED:
+                e.trained++;
+                e.last_trained = *st;
+                e.realigned = st->realign_bins;
+                if (align && st->realign_bins != 0) {
+                    ch.offset -= (double)(st->realign_bins * (int32_t)(N / BINS));
+                    packet_rx_window_moved(&prx, st->realign_bins);
+                }
+                break;
             case PACKET_RX_EVENT_TRAIN_FAILED: e.failed++; break;
             case PACKET_RX_EVENT_TONE: e.tone++; break;
             case PACKET_RX_EVENT_HEADER_FAILED: e.header_failed++; break;
@@ -260,6 +277,7 @@ static void test_alignment(void) {
         CHECK(fabs(e.final_offset) <= 1.0);
         CHECK_EQ_U(e.trained, 1);
         CHECK_EQ_U(e.failed, 0);
+        CHECK_EQ_U(e.realigned, 0);
         if (e.trained) {
             CHECK_EQ_U(e.last_trained.b_start_frame, b_frame);
             CHECK(e.last_trained.coherence > 0.9);
@@ -278,6 +296,7 @@ static void test_alignment(void) {
         printf("    moved %+d bins, window now %+.0f samples\n", e.last_align, e.final_offset);
         CHECK(fabs(e.final_offset) <= 24.0);
         CHECK_EQ_U(e.trained, 1);
+        CHECK_EQ_U(e.realigned, 0);
         if (e.trained) {
             CHECK_EQ_U(e.last_trained.b_start_frame, b_frame);
             CHECK(abs(e.last_trained.earliest_offset) <= 1);
@@ -317,7 +336,53 @@ static void test_packets(void) {
         CHECK_EQ_U(e.packets, 1);
         CHECK_EQ_U(e.good, 1);
         CHECK_EQ_U(e.lost, 0);
+        CHECK_EQ_U(e.realigned, 0); // A right lock is left alone, even with echoes as strong as the direct path
     }
+    rig_setup_spacing(1);
+}
+
+// The lock falls for a ghost (soak test 2026-11-19: a long echo's wrapped
+// image, ~19 bins above the true path): the window is moved that much too
+// far. Training sees the strongest path back where the window was, the
+// whole move is undone before the header (the window goes back where it
+// was: a fair start, as the window was right for the last packet), and the
+// packet comes through. Up to
+// PACKET_RX_START_SEARCH + 2 data frames are decided before the window
+// moves back, through the misplaced window: at 4 bins per symbol (the
+// default) the margin absorbs them; it's checked at 1 and 2 as well.
+static void test_wrong_lock_move(void) {
+    static const struct { uint32_t spacing; int32_t wrong; double offset, snr; bool room; } cases[] = {
+        { 4, +19, 0.0, 100.0, false }, { 4, -19, 0.0, 100.0, false }, { 4, +19, 30.0, 0.0, true },
+        { 4, +12, -40.0, -3.0, true }, { 4, -10, 0.0, 0.0, true }, { 2, +19, 0.0, 0.0, true },
+        { 1, +19, 0.0, 100.0, true },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        rig_setup_spacing(cases[i].spacing);
+        chirp_channel_seed(90 + i);
+        build_packet_stream(80);
+        wrong_lock_move = cases[i].wrong;
+        const Events_t e = run(80, cases[i].offset, cases[i].snr,
+            cases[i].room ? measured_echoes : NULL, cases[i].room ? 3 : 0, true);
+        wrong_lock_move = 0;
+        char label[64];
+        snprintf(label, sizeof label, "%s, %u bin, lock moved %+d too far", cases[i].room ? "room" : "clean",
+            cases[i].spacing, cases[i].wrong);
+        print_packet(label, e);
+        printf("    lock %+d, training strongest %+d, moved back %+d, window now %+.0f samples\n",
+            e.last_align, e.last_trained.strongest_offset, e.realigned, e.final_offset);
+        CHECK_EQ_U(e.trained, 1);
+        CHECK_EQ_U((uint32_t)(e.realigned + 64), (uint32_t)(-(e.last_align + cases[i].wrong) + 64));
+        // The whole move is undone: the window is back where it was (less the lock's fraction of a bin)
+        CHECK(fabs(e.final_offset - cases[i].offset) <= 8.0);
+        CHECK_EQ_U(e.good, 1);
+    }
+    // A wrong move below PACKET_RX_UNDO_MIN_BINS is left for the template to absorb
+    rig_setup_spacing(4);
+    build_packet_stream(80);
+    wrong_lock_move = 5;
+    const Events_t e = run(80, 0.0, 100.0, NULL, 0, true);
+    wrong_lock_move = 0;
+    CHECK_EQ_U(e.realigned, 0);
     rig_setup_spacing(1);
 }
 
@@ -467,6 +532,39 @@ static void test_partial_first_frame(void) {
     CHECK_NEAR(st->align_fraction, atan2f(sn, c) / 6.2831853f, 0.001);
 }
 
+// The soak test's failure, replayed (logged_ghost_lock.h): the lock moves
+// the window 16 bins the wrong way, as the board did, and training must
+// then ask for the move to be undone. (What follows can't be replayed: the
+// board's later frames were taken through the wrong window.)
+static void test_ghost_lock(void) {
+    channel_template_init(&tmpl, BINS, template_storage);
+    packet_rx_init(&prx, BINS, 4, rx_storage, &tmpl);
+    int32_t locked_at = -1, trained_at = -1;
+    PacketRxStatus_t lock, trained;
+    memset(&lock, 0, sizeof lock);
+    memset(&trained, 0, sizeof trained);
+    for (uint32_t f = 0; f < LOGGED_GHOST_FRAMES; f++) {
+        const PacketRxStatus_t *st = packet_rx_frame(&prx, logged_ghost_folded[f], logged_ghost_centre[f]);
+        if (st->event == PACKET_RX_EVENT_LOCKED) {
+            locked_at = (int32_t)f;
+            lock = *st;
+            packet_rx_window_moved(&prx, st->align_bins); // As the board did
+        }
+        if (st->event == PACKET_RX_EVENT_TRAINED) {
+            trained_at = (int32_t)f;
+            trained = *st;
+        }
+    }
+    printf("  lock on %d: align %+ld; trained on %d: coherence %.2f, strongest %+ld, earliest %+ld, realign %+ld\n",
+        (int)locked_at, (long)lock.align_bins, (int)trained_at, (double)trained.coherence,
+        (long)trained.strongest_offset, (long)trained.earliest_offset, (long)trained.realign_bins);
+    CHECK_EQ_U((uint32_t)locked_at, LOGGED_GHOST_LOCK_FRAME);       // Where the board locked...
+    CHECK_EQ_U((uint32_t)(lock.align_bins + 64), (uint32_t)(16 + 64)); // ...and the ghost it took
+    CHECK_EQ_U((uint32_t)trained_at, LOGGED_GHOST_TRAINED_FRAME);
+    CHECK_EQ_U((uint32_t)(trained.strongest_offset + 64), (uint32_t)(-18 + 64)); // As the board reported
+    CHECK_EQ_U((uint32_t)(trained.realign_bins + 64), (uint32_t)(-16 + 64));    // Undo the whole move
+}
+
 int main(void) {
     channel_template_init(&tmpl, BINS, template_storage);
 
@@ -478,7 +576,9 @@ int main(void) {
     RUN_TEST(test_steady_tone);
     RUN_TEST(test_alignment);
     RUN_TEST(test_partial_first_frame);
+    RUN_TEST(test_ghost_lock);
     RUN_TEST(test_packets);
+    RUN_TEST(test_wrong_lock_move);
     RUN_TEST(test_long_packets);
     RUN_TEST(test_bad_crc);
     RUN_TEST(test_bad_header);

@@ -1,5 +1,6 @@
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include "packet_rx.h"
 #include "packet_format.h"
 #include "pico/stdlib.h"
@@ -19,6 +20,7 @@ void packet_rx_init(
     rx->reference = rx->previous + bins;
     rx->shape_vector = rx->reference + bins;
     rx->tmpl = tmpl;
+    rx->lock_moved = 0;
     memset(storage, 0, PACKET_RX_STORAGE_LEN(bins) * sizeof(*storage));
     memset(&rx->status, 0, sizeof(rx->status));
     packet_rx_reset(rx);
@@ -154,11 +156,15 @@ void packet_rx_window_moved(PacketRx_t *rx, int32_t bins) {
     if (rx->bins > 64) return;
     rotate_down(rx->reference, rx->bins, bins);
     rotate_down(rx->previous, rx->bins, bins);
+    rotate_down(rx->tmpl->shape, rx->bins, bins);
+    rotate_down(rx->shape_vector, rx->bins, bins);
+    rx->lock_moved += bins;
 }
 
 // B is complete: find its start, learn the channel, report the paths
 static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
     PacketRxStatus_t *st = &rx->status;
+    st->realign_bins = 0;
     float32_t best = -1.0f;
     int32_t best_adjust = 0;
     for (int32_t s = -PACKET_RX_START_SEARCH; s <= PACKET_RX_START_SEARCH; s++) {
@@ -189,6 +195,13 @@ static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
     st->b_start_frame = start;
     st->strongest_offset = strongest;
     st->earliest_offset = earliest;
+
+    // The lock's move was onto a long echo's wrapped image if the strongest
+    // path is back where the window was before it (packet_rx.h): undo it
+    const int32_t moved = rx->lock_moved;
+    if (abs(moved) >= PACKET_RX_UNDO_MIN_BINS && abs(strongest + moved) <= PACKET_RX_UNDO_TOLERANCE) {
+        st->realign_bins = -moved;
+    }
 
     // The shape as a correlation vector, for the data frames' quality
     // (correlation_vector takes power and square-roots it; the shape is
@@ -310,6 +323,7 @@ const PacketRxStatus_t *__not_in_flash_func(packet_rx_frame)(PacketRx_t *rx, con
                 memcpy(rx->reference, v, n * sizeof(*v));
                 measure_alignment(rx, frame);
                 rx->lock_frames = 0;
+                rx->lock_moved = 0;
             }
             break;
 

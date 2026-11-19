@@ -116,6 +116,7 @@ static const StatusDef_t STATUS[] = {
     S_F("rx.last_train.coherence", train_coherence, "%.3f", "Last training: how well B's frames agreed (0..1)"),
     S_I("rx.last_train.strongest", train_strongest, "Last training: strongest path, bins"),
     S_I("rx.last_train.earliest", train_earliest, "Last training: earliest strong path, bins"),
+    S_I("rx.last_train.moved", train_moved, "Last training: samples the window was moved back (the lock's move was wrong)"),
 };
 #define STATUS_COUNT (sizeof STATUS / sizeof STATUS[0])
 
@@ -978,9 +979,9 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
                 (long)e->u.locked.align, (double)e->u.locked.fraction, (long)e->u.locked.moved);
             break;
         case PROTO_EV_RX_TRAINED:
-            n = snprintf(line, size, "* rx.trained seq=%lu frame=%lu b_start=%lu coherence=%.3f strongest=%+ld earliest=%+ld\n",
+            n = snprintf(line, size, "* rx.trained seq=%lu frame=%lu b_start=%lu coherence=%.3f strongest=%+ld earliest=%+ld moved=%+ld\n",
                 seq, frame, (unsigned long)e->u.trained.b_start, (double)e->u.trained.coherence,
-                (long)e->u.trained.strongest, (long)e->u.trained.earliest);
+                (long)e->u.trained.strongest, (long)e->u.trained.earliest, (long)e->u.trained.moved);
             break;
         case PROTO_EV_RX_TRAIN_FAILED:
             n = snprintf(line, size, "* rx.train_failed seq=%lu frame=%lu\n", seq, frame);

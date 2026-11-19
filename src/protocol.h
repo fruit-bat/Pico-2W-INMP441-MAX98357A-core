@@ -107,6 +107,7 @@ typedef struct {
     uint32_t train_frame;
     float train_coherence;
     int32_t train_strongest, train_earliest;
+    int32_t train_moved;
 } ProtocolStatus_t;
 
 // ---------------------------------------------------------------------------
@@ -137,7 +138,7 @@ typedef struct {
     uint32_t frame;
     union {
         struct { int32_t align; float fraction; int32_t moved; } locked;
-        struct { uint32_t b_start; float coherence; int32_t strongest, earliest; } trained;
+        struct { uint32_t b_start; float coherence; int32_t strongest, earliest, moved; } trained;
         struct { uint32_t length; } header_failed;
         struct { uint32_t symbols; ProtocolLostReason_t reason; } lost;
         struct {

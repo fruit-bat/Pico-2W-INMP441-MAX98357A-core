@@ -162,13 +162,13 @@ static void test_get(void) {
 
     const char *all = talk("a7 get\n");
     printf("  get (all): %lu lines, %lu bytes\n", (unsigned long)count_lines(all), (unsigned long)strlen(all));
-    CHECK_EQ_U(count_lines(all), SETTING_COUNT + 35u + 1u);
+    CHECK_EQ_U(count_lines(all), SETTING_COUNT + 36u + 1u);
     CHECK(strstr(all, "a7 info.f0=15000.0\n") != NULL);
     CHECK(strstr(all, "a7 count.events_dropped=0\n") != NULL);
     CHECK(strcmp(all + strlen(all) - 6, "a7 ok\n") == 0);
 
     const char *rx = talk("a8 get rx.*\n");
-    CHECK_EQ_U(count_lines(rx), 3u + 2u + 3u + 4u + 1u);
+    CHECK_EQ_U(count_lines(rx), 3u + 2u + 3u + 5u + 1u);
 }
 
 static void test_list(void) {
@@ -244,7 +244,7 @@ static void test_send(void) {
     fake_board_advance_frames(&fb, frames);
     CHECK_STR(drain(),
         "* rx.locked seq=2 frame=4 align=+0 fraction=+0.120 moved=+2\n"
-        "* rx.trained seq=3 frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0\n"
+        "* rx.trained seq=3 frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0 moved=+0\n"
         "* tx.done seq=4 frame=29 id=1 result=sent\n"
         "* rx.packet seq=5 frame=29 crc=ok len=2 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
     CHECK_STR(talk("p3 get count.good rx.delay rx.last_train.coherence\n"),
@@ -587,7 +587,7 @@ static void test_abandoned(void) {
     fake_board_advance_frames(&fb, 24);
     CHECK_STR(talk("x6 set link.spacing=4\n"), "* tx.start seq=3 frame=12 id=2\n"
         "* rx.locked seq=4 frame=15 align=+0 fraction=+0.120 moved=+2\n"
-        "* rx.trained seq=5 frame=30 b_start=20 coherence=0.830 strongest=-1 earliest=+0\nx6 ok\n");
+        "* rx.trained seq=5 frame=30 b_start=20 coherence=0.830 strongest=-1 earliest=+0 moved=+0\nx6 ok\n");
     fake_board_advance_frames(&fb, 1);
     CHECK_STR(drain(), "* tx.done seq=6 frame=36 id=2 result=abandoned\n"
         "* rx.lost seq=7 frame=36 symbols=7 reason=spacing\n");

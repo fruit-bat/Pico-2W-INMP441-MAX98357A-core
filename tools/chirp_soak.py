@@ -29,6 +29,9 @@ Outcomes (the receiver's conclusion, see protocol.md):
     unconcluded          locked, but no conclusion within the time limit
     tx_abandoned         the sender cut the packet short
 
+moved_back: samples the receiver moved its window back after training,
+because the lock's move had gone to a long echo's wrapped image (packet_rx.h).
+
 The CSV has one row per packet, plus one "idle" row per idle period. The
 settings each board had are put back afterwards (also after Ctrl-C).
 """
@@ -53,7 +56,7 @@ CONCLUSIONS = ("rx.packet", "rx.header_failed", "rx.train_failed", "rx.tone", "r
 
 COLUMNS = ["time", "seed", "dir", "spacing", "volume", "length", "n", "outcome",
            "locks", "false_before", "crc", "rx_len", "min_margin", "weakest", "weak",
-           "align", "fraction", "moved", "b_start", "coherence", "strongest", "earliest", "rx_delay",
+           "align", "fraction", "moved", "b_start", "coherence", "strongest", "earliest", "moved_back", "rx_delay",
            "byte_errors", "bit_errors", "symbol_errors", "error_symbols",
            "tx_frames", "idle_s", "lost_events", "bad_lines"]
 
@@ -283,7 +286,8 @@ class Soak:
             row.update(align=locked.raw("align"), fraction=locked.raw("fraction"), moved=locked.raw("moved"))
         if trained is not None:
             row.update(b_start=trained.raw("b_start"), coherence=trained.raw("coherence"),
-                       strongest=trained.raw("strongest"), earliest=trained.raw("earliest"))
+                       strongest=trained.raw("strongest"), earliest=trained.raw("earliest"),
+                       moved_back=trained.raw("moved"))
         if p is not None:
             row.update(crc=p.raw("crc"), rx_len=p.raw("len"), min_margin=p.raw("min_margin"),
                        weakest=p.raw("weakest"), weak=p.raw("weak"))
@@ -326,8 +330,8 @@ def summary(rows, file=sys.stdout):
         key = (r["dir"], int(r["spacing"]), int(r["volume"]), int(r["length"]))
         groups.setdefault(key, []).append(r)
     head = ("dir", "spc", "vol", "len", "n", "ok", "crc_bad", "hdr", "train", "lost", "no_lock", "other",
-            "false_idle/min", "false_btw", "margin p10/p50", "sym_err/pkt", "untrusted")
-    widths = (5, 3, 4, 4, 4, 4, 7, 4, 5, 4, 7, 5, 14, 9, 14, 11, 9)
+            "false_idle/min", "false_btw", "margin p10/p50", "sym_err/pkt", "moved_back", "untrusted")
+    widths = (5, 3, 4, 4, 4, 4, 7, 4, 5, 4, 7, 5, 14, 9, 14, 11, 10, 9)
     print("  ".join(h.rjust(w) for h, w in zip(head, widths)), file=file)
     for key in sorted(groups, key=lambda k: (k[1], -k[2], k[3], k[0])):
         rs = groups[key]
@@ -353,6 +357,7 @@ def summary(rows, file=sys.stdout):
                  sum(int(r["false_before"] or 0) for r in packets),
                  "%.2f / %.2f" % (p10, p50) if margins else "-",
                  "%.2f" % (sum(sym) / len(sym)) if sym else "-",
+                 sum(1 for r in packets if r.get("moved_back") not in (None, "", "+0", "0")),
                  untrusted)
         print("  ".join(str(c).rjust(w) for c, w in zip(cells, widths)), file=file)
 
@@ -402,6 +407,11 @@ def main():
     if args.port and len(args.port) > 2:
         ap.error("at most two --port")
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    if args.append and os.path.exists(args.output):
+        with open(args.output) as f:
+            header = next((l.strip() for l in f if l.startswith("time,")), None)
+        if header is not None and header != ",".join(COLUMNS):
+            ap.error("%s has other columns (an older version of this tool): write a new file" % args.output)
     if args.sim:
         boards = [Board.sim(args.sim, speed=args.speed)]
     else:

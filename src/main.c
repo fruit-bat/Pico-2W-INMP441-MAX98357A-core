@@ -28,7 +28,7 @@
 
 // The host talks to the board over USB serial with the protocol in
 // protocol.md (src/protocol.c); tools/chirp_host.py is a client.
-#define FIRMWARE_VERSION "0.2.0"
+#define FIRMWARE_VERSION "0.2.1"
 
 // The chirp sweeps CHIRP_BINS FFT bins (64 bins = 2.76 kHz from F0). Symbols
 // are spaced bins_per_symbol bins apart (setting link.spacing: 1, 2 or 4 while
@@ -142,6 +142,7 @@ typedef struct {
     float32_t folded_power[CHIRP_BINS]; // Coherently folded power the decoder decides from, bins 0 .. CHIRP_BINS-1
     PacketRxStatus_t packet;             // Packet receiver after this frame (see packet_rx.h)
     int32_t align_moved;                 // Samples the window was moved on this frame (when it locked)
+    int32_t train_moved;                 // Samples it was moved back on this frame (training found the lock's move wrong)
     uint32_t abandoned;                  // A packet being received was given up just before this frame:
                                          // 0 none, else 1 + ProtocolLostReason_t
     uint32_t abandoned_symbols;          // Data symbols it had decided
@@ -357,6 +358,19 @@ static float32_t __not_in_flash_func(timing_error_samples)(const RxFrameRecord_t
     return error_angle * samples_per_radian;
 }
 
+// Core 1: moves the RX window 'bins' (plus 'fraction') bins earlier from the
+// next frame on, and tells the packet receiver. delay: this frame's.
+// Returns the move in samples (0: none).
+static int32_t __not_in_flash_func(move_window)(uint32_t delay, int32_t bins, float32_t fraction) {
+    const int32_t move = (int32_t)lroundf(((float32_t)bins + fraction) * (float32_t)(FFT_SIZE / CHIRP_BINS));
+    if (move == 0) return 0;
+    const uint32_t moved = (uint32_t)(((int32_t)delay + move) % (int32_t)FFT_SIZE + (int32_t)FFT_SIZE) % FFT_SIZE;
+    rx_sample_window_set_delay(&rx_window, moved);
+    packet_rx_window_moved(&packet_rx, bins);
+    symbol_timing_tracker_reset(&timing_tracker, moved);
+    return move;
+}
+
 // Core 1: decode the newest block in the RX window and publish the result.
 static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
     static enum tracking_mode last_tracking = TRACK_OFF;
@@ -416,14 +430,13 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
         record.packet = *packet_rx_frame(&packet_rx, chirp_decoder.folded_power_buffer, centre_bins);
         // Preamble A found: move the window onto the earliest path, with its
         // energy on a bin centre (from the next frame)
-        const int32_t move = (int32_t)lroundf(
-            ((float32_t)record.packet.align_bins + record.packet.align_fraction) * (float32_t)(FFT_SIZE / CHIRP_BINS)); // Samples earlier
-        if (packet_align && record.packet.event == PACKET_RX_EVENT_LOCKED && move != 0) {
-            record.align_moved = move;
-            const uint32_t delay = (uint32_t)(((int32_t)record.delay + move) % (int32_t)FFT_SIZE + (int32_t)FFT_SIZE) % FFT_SIZE;
-            rx_sample_window_set_delay(&rx_window, delay);
-            packet_rx_window_moved(&packet_rx, record.packet.align_bins);
-            symbol_timing_tracker_reset(&timing_tracker, delay);
+        if (packet_align && record.packet.event == PACKET_RX_EVENT_LOCKED) {
+            record.align_moved = move_window(record.delay, record.packet.align_bins, record.packet.align_fraction);
+        }
+        // B learned, and it shows the lock's move went to a long echo's
+        // wrapped image: move back (whole bins; the fraction still holds)
+        if (packet_align && record.packet.event == PACKET_RX_EVENT_TRAINED && record.packet.realign_bins != 0) {
+            record.train_moved = move_window(record.delay, record.packet.realign_bins, 0.0f);
         }
         // A complete packet: to core 0 ahead of this frame's record
         if (record.packet.event == PACKET_RX_EVENT_PACKET) {
@@ -589,7 +602,8 @@ static struct {
     uint32_t good, bad, header_failed, lost;
     PacketRxState_t state;
     PacketRxStatus_t last_lock, last_train;
-    int32_t last_moved;
+    int32_t last_moved;             // Samples moved at the last lock...
+    int32_t last_train_moved;       // ...and back at the last training
 } rx_view;
 
 static char board_id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
@@ -641,6 +655,7 @@ static void board_get_status(void *ctx, ProtocolStatus_t *st) {
     st->train_coherence = rx_view.last_train.coherence;
     st->train_strongest = rx_view.last_train.strongest_offset;
     st->train_earliest = rx_view.last_train.earliest_offset;
+    st->train_moved = rx_view.last_train_moved;
 }
 
 static int board_send(void *ctx, const uint8_t *payload, uint32_t length, uint32_t id) {
@@ -711,7 +726,9 @@ static void handle_record(const RxFrameRecord_t *r) {
             break;
         case PACKET_RX_EVENT_TRAINED:
             rx_view.last_train = *st;
+            rx_view.last_train_moved = r->train_moved;
             e.type = PROTO_EV_RX_TRAINED;
+            e.u.trained.moved = r->train_moved;
             e.u.trained.b_start = st->b_start_frame;
             e.u.trained.coherence = st->coherence;
             e.u.trained.strongest = st->strongest_offset;

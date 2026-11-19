@@ -146,6 +146,7 @@ static void one_frame(FakeBoard_t *fb) {
             fb->status.train_coherence = e.u.trained.coherence;
             fb->status.train_strongest = e.u.trained.strongest;
             fb->status.train_earliest = e.u.trained.earliest;
+            fb->status.train_moved = e.u.trained.moved;
             event(fb, e);
             learned = true;
         }

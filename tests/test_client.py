@@ -57,7 +57,7 @@ class Soak(unittest.TestCase):
     def test_judge(self):
         E = chirp_host.Event
         locked = E("* rx.locked seq=1 frame=10 align=+0 fraction=+0.120 moved=+2")
-        trained = E("* rx.trained seq=2 frame=20 b_start=18 coherence=0.830 strongest=-1 earliest=+0")
+        trained = E("* rx.trained seq=2 frame=20 b_start=18 coherence=0.830 strongest=-1 earliest=+0 moved=+0")
         bad = E("* rx.packet seq=3 frame=60 crc=bad len=2 min_margin=0.100 weakest=4 weak=1 hex=4869")
         lost = E("* rx.lost seq=3 frame=40 symbols=5 reason=signal")
         self.assertEqual(chirp_soak.judge([])[0], "no_lock")

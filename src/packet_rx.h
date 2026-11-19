@@ -68,6 +68,25 @@
  * Without the move, near half a frame out B's start is ambiguous by one
  * frame (every B frame mixes two symbols).
  *
+ * Undoing a wrong move: a held symbol can't tell an early path from a long
+ * echo, because the shape wraps. In the room an echo ~44 bins (~700
+ * samples) late sits 20 bins above the strongest, the edge of
+ * PACKET_RX_EARLIEST_SPAN, and now and then reaches the -6 dB threshold:
+ * the lock then moves the window ~19 bins the wrong way and the packet
+ * fails (soak test 2026-11-19: all 14 such packets). B's symbols change,
+ * so training sees it: the strongest path is back where the window was
+ * before the move. When the lock's move was at least
+ * PACKET_RX_UNDO_MIN_BINS and training's strongest path is within
+ * PACKET_RX_UNDO_TOLERANCE bins of undoing it, PACKET_RX_EVENT_TRAINED
+ * comes with realign_bins = minus that move; the caller moves the window
+ * back (whole bins: the lock's fraction still holds) and calls
+ * packet_rx_window_moved() again, which also moves the learned shape. Data
+ * frames that came before the move (up to PACKET_RX_START_SEARCH + 2) were
+ * decided already, with the window where it was. The test is that narrow
+ * on purpose: training's strongest path alone is no guide (a later path
+ * can be the strongest on a window that is right), and training's
+ * earliest wraps just as A's does.
+ *
  * No memory is allocated; the caller provides PACKET_RX_STORAGE_LEN(bins)
  * floats and a channel template.
  */
@@ -90,6 +109,8 @@
 #define PACKET_RX_MIN_COHERENCE      0.3f  // Below this B is not accepted
 #define PACKET_RX_PATH_FRACTION      0.25f // Paths within 6 dB of the strongest count as "strong"
 #define PACKET_RX_EARLIEST_SPAN      20    // The earliest strong path is looked for this many bins above the strongest
+#define PACKET_RX_UNDO_MIN_BINS      8     // A lock move at least this big is undone after B if...
+#define PACKET_RX_UNDO_TOLERANCE     3     // ...training's strongest path is within this many bins of undoing it
 #define PACKET_RX_WEAK_MARGIN        1.2f  // Data decisions with a margin below this are counted as weak
 #define PACKET_RX_MIN_QUALITY        0.55f // Data frames below this don't look like a symbol...
 #define PACKET_RX_LOST_FRAMES        8u    // ...and this many in a row (~190 ms) abandon the packet. Not
@@ -132,6 +153,8 @@ typedef struct {
     int32_t strongest_offset;     // Strongest path, bins from the window's position (-bins/2 .. bins/2-1)
     int32_t earliest_offset;      // Earliest path within 6 dB of the strongest (and within
                                   // PACKET_RX_EARLIEST_SPAN bins above it), same units
+    int32_t realign_bins;         // 0, or the lock's move was wrong: the window is this many bins
+                                  // late, as align_bins (move it, whole bins only)
     // In HEADER and PAYLOAD: the last data symbol decided (on this frame or
     // just before), and its margin
     uint32_t data_symbol;
@@ -159,6 +182,7 @@ typedef struct {
     uint32_t lock_frames;         // LOCK: frames so far
     bool tone;                    // Ignoring a steady tone until it changes
     uint32_t change_frame;        // Frame where LOCK saw the change
+    int32_t lock_moved;           // Bins the caller moved the window since the last lock
     uint32_t next_data_frame;     // HEADER, PAYLOAD: next frame to decide
     float32_t centre[PACKET_RX_HISTORY]; // The decoder's refined centre per frame (bins, ring)
     uint32_t data_total;          // PAYLOAD: data symbols in this packet
@@ -189,7 +213,9 @@ const PacketRxStatus_t *packet_rx_frame(PacketRx_t *rx, const float32_t *folded_
 const uint8_t *packet_rx_payload(const PacketRx_t *rx);
 
 // The caller has moved its window 'bins' bins earlier (bins * frame / bins
-// samples) from the next frame on: what was at bin k is now at bin k - bins
+// samples) from the next frame on: what was at bin k is now at bin k - bins.
+// The receiver's reference, previous frame and learned shape follow
+// (after PACKET_RX_EVENT_LOCKED, and after TRAINED with realign_bins)
 void packet_rx_window_moved(PacketRx_t *rx, int32_t bins);
 
 #endif // PACKET_RX_H

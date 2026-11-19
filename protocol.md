@@ -170,7 +170,7 @@ a side effect, the `ok` line lists it. (See Decisions for the parked
 | `rx.state` | search, lock, train, header, payload |
 | `rx.delay` | receive window delay, 0 .. 1023 samples (start 960). Moved by alignment, tracking and `nudge` |
 | `rx.last_lock.*` | `align`, `fraction`, `moved` from the last lock |
-| `rx.last_train.*` | `frame`, `coherence`, `strongest`, `earliest` from the last training |
+| `rx.last_train.*` | `frame`, `coherence`, `strongest`, `earliest`, `moved` from the last training |
 
 ## Events
 
@@ -188,7 +188,7 @@ come after `seq`.
 |---|---|---|
 | `* hello` | as the `hello` reply | start-up banner; also tells the host the board has restarted |
 | `* rx.locked` | `frame align fraction moved=<samples>` | display line "last lock" |
-| `* rx.trained` | `frame b_start coherence strongest earliest` | display; log `packet_event` 2 |
+| `* rx.trained` | `frame b_start coherence strongest earliest moved=<samples>` | display; log `packet_event` 2. `moved`: the window moved back because the lock's move was wrong (packet_format.md), else 0 |
 | `* rx.train_failed` | `frame` | display "failed" count |
 | `* rx.tone` | `frame` | (not shown today) |
 | `* rx.header_failed` | `frame length` | `# packet header failed` |

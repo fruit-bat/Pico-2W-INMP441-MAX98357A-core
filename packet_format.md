@@ -121,7 +121,7 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PA
 |---|---|---|
 | SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 4 frames in a row → LOCK, measuring how far the window is out from those 4 agreeing A frames (not the frame the first agreed with: see below) (main.c then moves it; `set rx.align=off` turns that off) |
 | LOCK | correlate with A's average spectrum | below 0.4 → TRAIN (B has started); over 16 frames → a steady tone, ignored until it changes |
-| TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths → HEADER (deciding any data frames already in); else → SEARCH |
+| TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths, and whether the lock's move was wrong (main.c then moves the window back) → HEADER (deciding any data frames already in); else → SEARCH |
 | HEADER | matched decisions (`channel_template_decide`); collect 16 bits; check CRC-8 | CRC-8 good → PAYLOAD; bad → SEARCH |
 | PAYLOAD | matched decisions; collect the payload and CRC bits | all symbols received → CHECK |
 | CHECK | descramble, CRC-16 (done in the same frame as the last symbol) | report the packet (good or bad) with its lowest margin, which symbol that was, and how many were below 1.2; main.c puts the payload on its own queue to core 0 → SEARCH |
@@ -214,6 +214,31 @@ way round, early copies carry some of the *next* symbol. `packet_rx`
 reports the earliest copy within 6 dB of the strongest. Because shapes wrap
 every 64 bins, a copy more than half a frame late looks early, so it only
 looks up to 20 bins (320 samples) above the strongest.
+
+**Undoing a wrong move (2026-11-19).** A soak test (`tools/chirp_soak.py`,
+600 packets, both directions, spacing 2 and 4, −28 to −40 dB) failed 63
+packets. Every one of the 5 failures at −28 and −34 dB, and 14 in all, had
+the same story: the lock moved the window about 19 bins (~300 samples), and
+training then found the strongest path 19 bins back, where the window had
+been. A logged capture showed why. In this room an echo about 44 bins
+(~700 samples) late lands, wrapped, 20 bins above the strongest path: the
+edge of the earliest-path search. It is usually 7–12 dB down and now and
+then reaches −6 dB, and A, a held symbol, can't tell it from an early path.
+B can, because its symbols change.
+
+So after training: if the lock moved the window at least 8 bins and
+training's strongest path is within 3 bins of where the window was before,
+`packet_rx` reports `realign_bins` and main.c moves the window back
+(`rx.trained moved=`), and the learned shape moves with it. The rule is
+narrow on purpose. In the soak, training's strongest path was −5..+1 for
+every normal packet and −17..−20 after every bad move, but in a room where
+a later path is the strongest (the model's harsh room) "move to the
+strongest" would move a right window. Training's earliest path is no
+better: the same wrapped echo turned up there too (+1, +2). Up to 4 data
+frames (the first header symbols) have been decided through the wrong
+window by then. `test_ghost_lock` replays the logged frames, and
+`test_wrong_lock_move` checks the whole packet in the model with the lock
+sent 10–19 bins the wrong way.
 
 ## Transmitter (core 1, one symbol per frame)
 
