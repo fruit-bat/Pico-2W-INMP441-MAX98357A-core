@@ -12,6 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import chirp_host  # noqa: E402
+import chirp_soak  # noqa: E402
 from chirp_host import Board, ProtocolError  # noqa: E402
 
 SIM = None
@@ -37,6 +38,71 @@ class Lines(unittest.TestCase):
         self.assertEqual((e.seq, e["code"], e["text"]), (3, 500, "line failed its check"))
         f = chirp_host.parse_fields("name=tx.volume kind=setting help=Transmit level now".split(" "))
         self.assertEqual(f["help"], "Transmit level now")
+
+
+class Soak(unittest.TestCase):
+    """tools/chirp_soak.py: the parts the simulator can't reach (it makes no errors)."""
+
+    def test_compare(self):
+        sent = bytes([0x00, 0xFF, 0x55])
+        self.assertEqual(chirp_soak.compare(sent, sent, 4), (0, 0, []))
+        # 4 bits/symbol: header is symbols 0-3, payload byte 0 is symbols 4-5, byte 2 is 8-9
+        self.assertEqual(chirp_soak.compare(sent, bytes([0x01, 0xFF, 0x54]), 4), (2, 2, [5, 9]))
+        # 5 bits/symbol: payload bits start at stream bit 16; byte 0 bit 0 is stream bit 16 = symbol 3
+        self.assertEqual(chirp_soak.compare(sent, bytes([0x80, 0xFF, 0x55]), 2), (1, 1, [3]))
+        self.assertEqual(chirp_soak.data_symbols(16, 4), 40)
+        self.assertEqual(chirp_soak.data_symbols(16, 2), 32)
+        self.assertEqual(chirp_soak.data_symbols(255, 4), 518)
+
+    def test_judge(self):
+        E = chirp_host.Event
+        locked = E("* rx.locked seq=1 frame=10 align=+0 fraction=+0.120 moved=+2")
+        trained = E("* rx.trained seq=2 frame=20 b_start=18 coherence=0.830 strongest=-1 earliest=+0")
+        bad = E("* rx.packet seq=3 frame=60 crc=bad len=2 min_margin=0.100 weakest=4 weak=1 hex=4869")
+        lost = E("* rx.lost seq=3 frame=40 symbols=5 reason=signal")
+        self.assertEqual(chirp_soak.judge([])[0], "no_lock")
+        self.assertEqual(chirp_soak.judge([locked])[0], "unconcluded")
+        outcome, p, l, t = chirp_soak.judge([locked, trained, bad])
+        self.assertEqual((outcome, p, l, t), ("crc_bad", bad, locked, trained))
+        self.assertEqual(chirp_soak.judge([locked, trained, lost])[0], "lost:signal")
+        # A false lock that gave up, then the real packet: the packet's own lock is reported
+        early = E("* rx.locked seq=0 frame=1 align=+3 fraction=+0.000 moved=+48")
+        tone = E("* rx.tone seq=0 frame=5")
+        outcome, p, l, t = chirp_soak.judge([early, tone, locked, trained, bad])
+        self.assertEqual((outcome, l), ("crc_bad", locked))
+        self.assertEqual(chirp_soak.judge([early, tone])[0], "tone")
+
+    def test_run(self):
+        import csv
+        import subprocess
+        import tempfile
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "chirp_soak.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "soak.csv")
+            r = subprocess.run([sys.executable, tool, "run", "--sim", SIM, "--speed", str(SPEED), "--count", "2",
+                                "--idle", "2", "--volume", "-30", "--length", "4,40", "--seed", "7", path],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("events lost 0, bad lines 0", r.stdout)
+            with open(path) as f:
+                rows = list(csv.DictReader(l for l in f if not l.startswith("#")))
+            packets = [row for row in rows if row["outcome"] != "idle"]
+            self.assertEqual(len(packets), 8)  # 2 spacings x 2 lengths x 2
+            self.assertEqual(len(rows) - len(packets), 4)  # An idle period per condition
+            self.assertTrue(all(row["outcome"] == "ok" and row["bit_errors"] == "0" for row in packets))
+            for row in packets:  # Airtime as the board reported it
+                self.assertEqual(int(row["tx_frames"]), 16 + chirp_soak.data_symbols(int(row["length"]),
+                                                                                      int(row["spacing"])))
+            # Run again with --append: the header isn't repeated, and summary reads both runs
+            r = subprocess.run([sys.executable, tool, "run", "--sim", SIM, "--speed", str(SPEED), "--count", "1",
+                                "--idle", "0", "--spacing", "4", "--volume", "-30", "--length", "4", "--append",
+                                path], capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            s = subprocess.run([sys.executable, tool, "summary", path], capture_output=True, text=True, timeout=30)
+            table = [l.split() for l in s.stdout.splitlines()[1:]]
+            self.assertIn(["A>A", "4", "-30", "4", "3", "3"], [t[:6] for t in table])
+            with open(path) as f:
+                self.assertEqual(sum(1 for l in f if l.startswith("time,")), 1)
 
 
 class WithSim(unittest.TestCase):

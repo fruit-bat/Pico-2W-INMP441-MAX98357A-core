@@ -3,3 +3,6 @@ max-98357A-test-1.py
 build
 Pico-2W-INMP441-MAX98357A-core.code-workspace
 tools/__pycache__
+
+# Soak test results (tools/chirp_soak.py)
+soak/
