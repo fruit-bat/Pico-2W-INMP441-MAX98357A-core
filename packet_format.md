@@ -36,9 +36,13 @@ The format is defined in symbols and bits so it works at any spacing.
 ## Packet layout
 
 ```
-| A: detect   | B: train + align   | H: header  | P: payload           | C: CRC-16 |
-| 8 x sym 0   | 8 known symbols    | 16 bits    | 0..255 bytes         | 16 bits   |
+| A: detect   | B: train + align   | H: header           | P: payload    | C: CRC-16 |
+| 8 x sym 0   | 8 known symbols    | 8 symbols at        | 0..63 bytes   | 16 bits   |
+|             |                    | spacing 8 (Golay)   | at the payload's spacing  |
 ```
+
+The receiver needs no spacing setting: B is the same sound at every
+spacing, and H, at a fixed spacing, says what P and C use.
 
 ### A — detect (*8 frames* of symbol 0)
 
@@ -73,20 +77,54 @@ Learning from changing symbols matches what data looks like (in a room the
 late reflections carry part of the previous symbol); a held symbol would
 not, though in the model the difference was small.
 
-### H — header (16 bits)
+### H — header (12 bits in an extended Golay code, 2026-11-20)
 
 | Bits | Field |
 |---|---|
-| 8 | Payload length in bytes, 0..255 |
-| 8 | CRC-8 of the length byte (so a bad length is caught before waiting for a payload that is not coming) |
+| 2 | Format version: 0 |
+| 2 | Payload spacing: 0 = 1 bin (6 bits/symbol), 1 = 2 (5), 2 = 4 (4), 3 = reserved (for 8) |
+| 2 | Payload error correction: 0 = none; 1–3 reserved |
+| 6 | Payload length in bytes, 0..63 |
 
-At 6 bits/symbol that is 3 symbols (2 spare bits, sent as 0).
+The 12 bits (MSB first, in that order) are the message of an extended Golay
+(24,12) code: the 12 bits, then 12 check bits (the (23,12) code's 11, with
+generator x¹¹+x¹⁰+x⁶+x⁵+x⁴+x²+1, and an overall parity bit). Every two
+codewords differ in at least 8 bits, so the receiver corrects any 3 wrong
+bits and detects any 4. The 24 bits go out as **8 symbols at spacing 8**
+(3 bits each, Gray coded, MSB first), whatever the payload's spacing: the
+transmitter numbers them at its own spacing (×2 at 4 bits, ×8 at 6), as it
+does B. Not scrambled.
+
+Why (soak 3, 2026-11-20, `rx.symbols`): of 48 packets that failed with
+symbols decided, 36 had one wrong symbol and 44 at most two; every one of
+the 21 failed headers had 1 or 2. 61% of wrong symbols were one step off
+(one bit, with Gray coding). Spacing 8 puts the header symbols twice as far
+apart as the default payload's, and the code then corrects 3 one-step slips,
+or one symbol wrong in all 3 bits. It replaces the CRC-8, which could only
+detect.
+
+The receiver decodes by trying all 4096 codewords (in Gray-code order, one
+XOR and a bit count each: well under a millisecond, once per packet).
+**Too many wrong bits** (`reason=check`) or **a format it doesn't know**
+(`reason=format`: another version, the reserved spacing, any error
+correction) ends the packet. `rx.packet` reports `fixed=`, the bits
+corrected.
+
+Trade-off: a stronger code accepts more noise. 24 random bits land within 3
+bits of some codeword 57% of the time (CRC-8: 0.4%); the format check then
+rejects all but 5%, so about 3% of junk headers get through, to a bad CRC-16
+up to 3.6 s later. A junk header needs a false lock and a B that trains
+first, and soaks have seen no false locks; if that changes, the version bits
+could go to a fixed pattern, or correction could stop at 2 bits (7%).
+
+Cost: 8 symbols (0.19 s) instead of 4 (0.09 s) at the default spacing.
 
 ### P — payload and C — CRC
 
-Payload bytes, then CRC-16/CCITT (poly 0x1021, init 0xFFFF) over the header
-and payload. The bit stream (H, P, C) is packed most significant bit first
-into b-bit symbols, the last symbol padded with zeros.
+Payload bytes, then CRC-16/CCITT (poly 0x1021, init 0xFFFF) over the
+header's 12 bits as two bytes (big-endian) and the payload. The bit stream
+(P, C) is packed most significant bit first into b-bit symbols at the
+payload's spacing, the last symbol padded with zeros.
 
 Two optional, cheap steps on the bit stream (I'd include both):
 - **Scrambling**: XOR the payload bits with an LFSR sequence, so that
@@ -98,23 +136,22 @@ Two optional, cheap steps on the bit stream (I'd include both):
   It changes nothing for error detection; it helps when forward error
   correction is added. The preamble is not Gray coded.
 
-### Airtime examples (6 bits/symbol)
+### Airtime examples
 
-| Payload | Symbols (A+B, H, P+C) | Time |
-|---|---|---|
-| 0 bytes | 16 + 3 + 3 | 0.51 s |
-| 16 bytes | 16 + 3 + 24 | 1.00 s |
-| 64 bytes | 16 + 3 + 88 | 2.48 s |
-| 255 bytes | 16 + 3 + 343 | 8.4 s |
+| Payload | Symbols (A+B, H, P+C) at 4 bits | Time | At 6 bits |
+|---|---|---|---|
+| 0 bytes | 16 + 8 + 4 | 0.65 s | 0.63 s |
+| 16 bytes | 16 + 8 + 36 | 1.39 s | 1.11 s |
+| 63 bytes | 16 + 8 + 130 | 3.58 s | 2.58 s |
 
 The preamble is ~0.4 s; long payloads make it cheap, short ones do not.
 
 ## Receiver states (core 1, one step per frame)
 
 ```
-SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PAYLOAD --last symbol--> CHECK
-   ^                 |                 |                  |                                            |
-   +----timeout------+-----timeout-----+-----bad CRC-8----+----------- CRC-16 good or bad -------------+
+SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --decoded--> PAYLOAD --last symbol--> CHECK
+   ^                 |                 |                  |                                          |
+   +----timeout------+-----timeout-----+--check/format----+---------- CRC-16 good or bad ------------+
 ```
 
 | State | Each frame | Leaves when |
@@ -122,7 +159,7 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --CRC-8 ok--> PA
 | SEARCH | correlate this frame's spectrum (square-root power, mean removed) with the previous one | 0.5 or more on 4 frames in a row → LOCK, measuring how far the window is out from those 4 agreeing A frames (not the frame the first agreed with: see below) (main.c then moves it; `set rx.align=off` turns that off) |
 | LOCK | correlate with A's average spectrum | below 0.4 → TRAIN (B has started); over 16 frames → a steady tone, ignored until it changes |
 | TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths, and whether the lock's move was wrong (main.c then moves the window back) → HEADER (deciding any data frames already in); else → SEARCH |
-| HEADER | matched decisions (`channel_template_decide`); collect 16 bits; check CRC-8 | CRC-8 good → PAYLOAD; bad → SEARCH |
+| HEADER | matched decisions (`channel_template_decide`) among the 8 spacing-8 symbols; collect 24 bits; Golay decode | at most 3 bits wrong and a known format → PAYLOAD, at the spacing it gives; else → SEARCH (`rx.header_failed reason=check\|format`) |
 | PAYLOAD | matched decisions; collect the payload and CRC bits | all symbols received → CHECK |
 | CHECK | descramble, CRC-16 (done in the same frame as the last symbol) | report the packet (good or bad) with its lowest margin, which symbol that was, and how many were below 1.2; main.c puts the payload on its own queue to core 0 → SEARCH |
 
@@ -256,6 +293,12 @@ frames* after, for the room to quieten).
 
 ## Spacing: 4 bins per symbol by default
 
+Since the Golay header (2026-11-20) `link.spacing` sets only what this board
+sends (and the test modes); a receiver follows each packet's header, so
+boards no longer need to match, and changing it no longer abandons a packet
+being received.
+
+
 Long (255-byte) packets at 1 bin per symbol, 2026-11-17: board 1 → 2 10/10
 intact, board 2 → 1 only 2/10. The errors were ±1 slips at the same symbols
 in most packets, set by the previous symbol (paths 16–48 samples late carry
@@ -271,7 +314,8 @@ spacing on every row.
 1. **Default spacing**: 1 bin/symbol (most rate) or 2 (more tolerant of
    smearing)? With the matched decision, 1 got 99.9–100% between the boards.
    *Now 4; see above.*
-2. **Maximum payload**: 255 bytes (8 s of airtime) or smaller?
+2. **Maximum payload**: 255 bytes (8 s of airtime) or smaller? *63 since
+   2026-11-20: a 6-bit length in the coded header.*
 3. **Scrambling and Gray coding**: include now (cheap), or leave out until
    needed?
 4. **First implementation step**: I'd propose the transmitter plus a
@@ -279,5 +323,6 @@ spacing on every row.
    learned shape, B position), tested in the host model and between the
    boards, before adding HEADER/PAYLOAD/CHECK.
 
-IP note: everything here is up-chirps, generic CRCs, a scrambler and Gray
-coding; it avoids the down-chirp sync. Patent details remain unverified.
+IP note: everything here is up-chirps, generic CRCs, a scrambler, Gray
+coding and a classic Golay code (not LoRa's Hamming coding chain or
+interleaver); it avoids the down-chirp sync. Patent details remain unverified.

@@ -29,6 +29,9 @@ Outcomes (the receiver's conclusion, see protocol.md):
     unconcluded          locked, but no conclusion within the time limit
     tx_abandoned         the sender cut the packet short
 
+header_fixed: header bits the Golay code corrected (0..3); header_failed:
+why a header was refused (check: more than 3 bits wrong; format: unknown).
+
 moved_back: samples the receiver moved its window back after training,
 because the lock's move had gone to a long echo's wrapped image (packet_rx.h).
 
@@ -58,13 +61,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chirp_host import Board  # noqa: E402
 
 FRAME_S = 1024 / 44100
-HEADER_BITS = 16
+HEADER_SYMBOLS = 8  # The Golay-coded header, at spacing 8 (3 bits/symbol)
 CRC_BITS = 16
 PREAMBLE_FRAMES = 16
 CONCLUSIONS = ("rx.packet", "rx.header_failed", "rx.train_failed", "rx.tone", "rx.lost")
 
 COLUMNS = ["time", "seed", "dir", "spacing", "volume", "length", "n", "outcome",
-           "locks", "false_before", "crc", "rx_len", "min_margin", "weakest", "weak",
+           "locks", "false_before", "crc", "rx_len", "header_fixed", "header_failed", "min_margin", "weakest", "weak",
            "align", "fraction", "moved", "b_start", "coherence", "strongest", "earliest", "moved_back", "rx_delay",
            "byte_errors", "bit_errors", "symbol_errors", "error_symbols",
            "decided", "wrong", "header_wrong", "wrong_second", "wrong_ranks", "symbols", "second", "margins",
@@ -76,22 +79,13 @@ def bits_per_symbol(spacing):
 
 
 def data_symbols(length, spacing):
+    """Symbols after the preamble: the header, then payload and CRC."""
     b = bits_per_symbol(spacing)
-    return -(-(HEADER_BITS + 8 * length + CRC_BITS) // b)
+    return HEADER_SYMBOLS + -(-(8 * length + CRC_BITS) // b)
 
 
 def payload_for(seed, n, length):
     return random.Random("%d:%d" % (seed, n)).randbytes(length)
-
-
-def crc8(data):
-    """CRC-8, polynomial 0x07, initial 0 (packet_format.h)."""
-    crc = 0
-    for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
-    return crc
 
 
 def crc16(data):
@@ -128,19 +122,38 @@ def gray_symbol(value):
     return symbol
 
 
+def golay_encode(bits):
+    """Extended Golay (24,12) codeword: the 12 bits, then 12 check bits (packet_golay_encode)."""
+    r = (bits & 0xFFF) << 11
+    for k in range(22, 10, -1):
+        if r & (1 << k):
+            r ^= 0xC75 << (k - 11)
+    word = ((bits & 0xFFF) << 11) | r
+    return (word << 1) | (bin(word).count("1") & 1)
+
+
+def header_bits(length, spacing):
+    """The header's 12 bits: version 0, spacing code, error correction 0, length."""
+    return ({1: 0, 2: 1, 4: 2}[spacing] << 8) | (length & 63)
+
+
 def sent_symbols(payload, spacing):
-    """The data symbols packet_tx sends for this payload (header first)."""
-    header = bytes([len(payload), crc8([len(payload)])])
-    crc = crc16(header + payload)
-    stream = header + scramble(payload) + bytes([crc >> 8, crc & 0xFF])
+    """The data symbols packet_tx sends for this payload: the 8 header symbols
+    (numbered at spacing 8, 0..7, as the receiver reports them), then the
+    payload and CRC at the payload's spacing."""
+    header = header_bits(len(payload), spacing)
+    code = golay_encode(header)
+    symbols = [gray_symbol((code >> (21 - 3 * i)) & 7) for i in range(HEADER_SYMBOLS)]
+    crc = crc16(bytes([header >> 8, header & 0xFF]) + payload)
+    stream = scramble(payload) + bytes([crc >> 8, crc & 0xFF])
     b = bits_per_symbol(spacing)
     bits = "".join("{:08b}".format(x) for x in stream)
     bits += "0" * (-len(bits) % b)
-    return [gray_symbol(int(bits[i:i + b], 2)) for i in range(0, len(bits), b)]
+    return symbols + [gray_symbol(int(bits[i:i + b], 2)) for i in range(0, len(bits), b)]
 
 
 def header_symbols(spacing):
-    return -(-HEADER_BITS // bits_per_symbol(spacing))
+    return HEADER_SYMBOLS
 
 
 def check_decisions(sent, ev, spacing):
@@ -162,8 +175,9 @@ def check_decisions(sent, ev, spacing):
 def compare(sent, got, spacing):
     """(byte errors, bit errors, data symbols with an error) over the payload.
 
-    Data symbol numbers count from the first header symbol. The CRC bytes
-    aren't reported by the board, so errors there can't be seen.
+    Data symbol numbers count from the first header symbol (8 of them, then
+    the payload). The CRC bytes aren't reported by the board, so errors
+    there can't be seen.
     """
     b = bits_per_symbol(spacing)
     byte_errors = bit_errors = 0
@@ -176,7 +190,7 @@ def compare(sent, got, spacing):
         for bit in range(8):
             if diff & (0x80 >> bit):
                 bit_errors += 1
-                symbols.add((HEADER_BITS + 8 * i + bit) // b)
+                symbols.add(HEADER_SYMBOLS + (8 * i + bit) // b)
     return byte_errors, bit_errors, sorted(symbols)
 
 
@@ -380,13 +394,16 @@ class Soak:
                        strongest=trained.raw("strongest"), earliest=trained.raw("earliest"),
                        moved_back=trained.raw("moved"))
         if p is not None:
-            row.update(crc=p.raw("crc"), rx_len=p.raw("len"), min_margin=p.raw("min_margin"),
+            row.update(crc=p.raw("crc"), rx_len=p.raw("len"), header_fixed=p.raw("fixed"), min_margin=p.raw("min_margin"),
                        weakest=p.raw("weakest"), weak=p.raw("weak"))
             got = p.payload()
             if len(got) == length:
                 byte_errors, bit_errors, symbols = compare(payload, got, spacing)
                 row.update(byte_errors=byte_errors, bit_errors=bit_errors, symbol_errors=len(symbols),
                            error_symbols=";".join(str(s) for s in symbols))
+        if outcome == "header_failed":
+            failed = next((e for e in reversed(events) if e.name == "rx.header_failed"), None)
+            row["header_failed"] = failed.raw("reason") if failed is not None else ""
         if decisions is not None and outcome in ("ok", "crc_bad", "header_failed"):
             row.update(check_decisions(sent_symbols(payload, spacing), decisions, spacing))
         row["rx_delay"] = rx.get("rx.delay")["rx.delay"]
@@ -423,8 +440,8 @@ def summary(rows, file=sys.stdout):
         key = (r["dir"], int(r["spacing"]), int(r["volume"]), int(r["length"]))
         groups.setdefault(key, []).append(r)
     head = ("dir", "spc", "vol", "len", "n", "ok", "crc_bad", "hdr", "train", "lost", "no_lock", "other",
-            "false_idle/min", "false_btw", "margin p10/p50", "sym_err/pkt", "moved_back", "untrusted")
-    widths = (5, 3, 4, 4, 4, 4, 7, 4, 5, 4, 7, 5, 14, 9, 14, 11, 10, 9)
+            "false_idle/min", "false_btw", "margin p10/p50", "sym_err/pkt", "moved_back", "hdr_fixed", "untrusted")
+    widths = (5, 3, 4, 4, 4, 4, 7, 4, 5, 4, 7, 5, 14, 9, 14, 11, 10, 9, 9)
     print("  ".join(h.rjust(w) for h, w in zip(head, widths)), file=file)
     for key in sorted(groups, key=lambda k: (k[1], -k[2], k[3], k[0])):
         rs = groups[key]
@@ -451,6 +468,7 @@ def summary(rows, file=sys.stdout):
                  "%.2f / %.2f" % (p10, p50) if margins else "-",
                  "%.2f" % (sum(sym) / len(sym)) if sym else "-",
                  sum(1 for r in packets if r.get("moved_back") not in (None, "", "+0", "0")),
+                 sum(1 for r in packets if r.get("header_fixed") not in (None, "", "0")),
                  untrusted)
         print("  ".join(str(c).rjust(w) for c, w in zip(cells, widths)), file=file)
 

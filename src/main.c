@@ -28,11 +28,12 @@
 
 // The host talks to the board over USB serial with the protocol in
 // protocol.md (src/protocol.c); tools/chirp_host.py is a client.
-#define FIRMWARE_VERSION "0.2.2"
+#define FIRMWARE_VERSION "0.3.0"
 
 // The chirp sweeps CHIRP_BINS FFT bins (64 bins = 2.76 kHz from F0). Symbols
 // are spaced bins_per_symbol bins apart (setting link.spacing: 1, 2 or 4 while
-// running; both boards must match): 1 gives 64 symbols (6 bits each),
+// running; for packets only the sender's matters, as the receiver follows
+// each header; the test modes need both boards to match): 1 gives 64 symbols (6 bits each),
 // 2 gives 32 (5 bits), 4 gives 16 (4 bits). Wider spacing costs rate but
 // tolerates a channel that smears each symbol over neighbouring bins (the
 // desk channel spreads about +/-1 bin), and widens the tracker's pull-in to
@@ -299,7 +300,7 @@ static void init_audio_system(void) {
 
     packet_tx_init(&packet_tx, bits_per_symbol());
     channel_template_init(&channel_template, CHIRP_BINS, channel_template_storage);
-    packet_rx_init(&packet_rx, CHIRP_BINS, bits_per_symbol(), packet_rx_storage, &channel_template);
+    packet_rx_init(&packet_rx, CHIRP_BINS, packet_rx_storage, &channel_template);
 }
 
 static float32_t __not_in_flash_func(peak_abs)(const float32_t *buffer, uint32_t size) {
@@ -528,19 +529,18 @@ static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
 }
 
 // Core 1: changes the symbol spacing (between blocks, so the transmitter and
-// receiver change together). A packet being sent or received is abandoned.
+// the test modes' decoder change together). A packet being sent is
+// abandoned; the packet receiver carries on (it follows each header).
 static void apply_spacing(uint32_t bps) {
     if (packet_tx_busy(&packet_tx)) {
         const TxEvent_t e = { .id = packet_tx_id, .frame = i2s_core_get_rx_block_count(), .abandoned = true };
         spsc_ring_push(&tx_event_queue, &e);
     }
-    note_rx_abandoned(PROTO_LOST_SPACING);
     bins_per_symbol = bps;
     const uint32_t n = num_symbols();
     chirp_encoder.number_of_symbols = n;
     chirp_symbol_rx_config_init(&symbol_rx_config, n);
     packet_tx_init(&packet_tx, bits_per_symbol());
-    packet_rx_init(&packet_rx, CHIRP_BINS, bits_per_symbol(), packet_rx_storage, &channel_template);
     symbol_sequence_init(&tx_sequence, bits_per_symbol());
 }
 
@@ -727,7 +727,7 @@ static void handle_record(const RxFrameRecord_t *r) {
     rx_view.frame = r->frame;
     rx_view.state = st->state;
 
-    // A packet given up before this frame (spacing change, reset, transmitting)
+    // A packet given up before this frame (reset rx, transmitting)
     if (r->abandoned) {
         rx_view.lost++;
         ProtocolEvent_t lost = { .type = PROTO_EV_RX_LOST, .frame = r->frame };
@@ -766,7 +766,7 @@ static void handle_record(const RxFrameRecord_t *r) {
         case PACKET_RX_EVENT_HEADER_FAILED:
             rx_view.header_failed++;
             e.type = PROTO_EV_RX_HEADER_FAILED;
-            e.u.header_failed.length = st->length;
+            e.u.header_failed.format = st->header_result == PACKET_RX_HEADER_FORMAT;
             if (pop_rx_packet(r->frame)) {
                 e.decision_count = rx_packet_in.decision_count;
                 e.decisions = rx_packet_in.decisions;
@@ -788,6 +788,8 @@ static void handle_record(const RxFrameRecord_t *r) {
             e.type = PROTO_EV_RX_PACKET;
             e.u.packet.crc_ok = st->crc_ok;
             e.u.packet.length = rx_packet_in.length;
+            e.u.packet.spacing = st->spacing;
+            e.u.packet.fixed = st->header_fixed;
             e.u.packet.min_margin = st->min_margin;
             e.u.packet.weakest = st->weakest_symbol;
             e.u.packet.weak = st->weak_symbols;

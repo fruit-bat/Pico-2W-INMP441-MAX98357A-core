@@ -8,13 +8,12 @@
 void packet_rx_init(
     PacketRx_t *rx,
     uint32_t bins,
-    uint32_t bits_per_symbol,
     float32_t *storage,
     ChannelTemplate_t *tmpl
 ) {
     rx->bins = bins;
-    rx->bits_per_symbol = bits_per_symbol;
-    rx->bins_per_symbol = bins >> bits_per_symbol;
+    rx->bits_per_symbol = PACKET_HEADER_BITS_PER_SYMBOL;
+    rx->bins_per_symbol = PACKET_HEADER_SPACING;
     rx->history = storage;
     rx->previous = storage + PACKET_RX_HISTORY * bins;
     rx->reference = rx->previous + bins;
@@ -66,9 +65,9 @@ static float32_t dot(const float32_t *a, const float32_t *b, uint32_t n) {
     return s;
 }
 
-// FFT bin of B symbol i
+// FFT bin of B symbol i (the same at every spacing: its 16-symbol grid)
 static uint32_t b_bin(const PacketRx_t *rx, uint32_t i) {
-    return packet_b_symbol(i, rx->bits_per_symbol) * rx->bins_per_symbol;
+    return packet_b_grid16[i] * (rx->bins / 16u);
 }
 
 // How well the B frames starting at 'start' agree once each is moved round
@@ -208,8 +207,11 @@ static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
     // power too)
     correlation_vector(rx, rx->tmpl->shape, rx->shape_vector);
 
-    // The data symbols follow B
+    // The header follows B, at its own spacing
     st->state = PACKET_RX_HEADER;
+    rx->bits_per_symbol = PACKET_HEADER_BITS_PER_SYMBOL;
+    rx->bins_per_symbol = PACKET_HEADER_SPACING;
+    rx->header_code = 0;
     rx->low_quality = 0;
     rx->next_data_frame = start + PACKET_B_LEN;
     rx->bit_count = 0;
@@ -221,7 +223,7 @@ static void __not_in_flash_func(finish_training)(PacketRx_t *rx) {
 }
 
 const uint8_t *packet_rx_payload(const PacketRx_t *rx) {
-    return &rx->bytes[PACKET_HEADER_BYTES];
+    return &rx->bytes[2];
 }
 
 const PacketRxDecision_t *packet_rx_decisions(const PacketRx_t *rx) {
@@ -249,8 +251,35 @@ static float32_t __not_in_flash_func(frame_quality)(const PacketRx_t *rx, const 
     return best;
 }
 
-// Decides the data symbol in one frame and adds its bits (MSB first); then
-// checks the header or finishes the packet when enough are in
+// The header is complete: decode it, and set up for the payload at the
+// spacing it gives (or give up)
+static void __not_in_flash_func(finish_header)(PacketRx_t *rx) {
+    PacketRxStatus_t *st = &rx->status;
+    uint32_t bits, fixed;
+    PacketHeader_t h;
+    const bool decoded = packet_golay_decode(rx->header_code, &bits, &fixed);
+    st->header_fixed = decoded ? fixed : 0u;
+    if (!decoded || !packet_header_unpack(bits, &h)) {
+        st->header_result = decoded ? PACKET_RX_HEADER_FORMAT : PACKET_RX_HEADER_CHECK;
+        st->event = PACKET_RX_EVENT_HEADER_FAILED;
+        back_to_search(rx);
+        return;
+    }
+    st->header_result = PACKET_RX_HEADER_OK;
+    st->spacing = h.spacing;
+    st->length = h.length;
+    rx->bins_per_symbol = h.spacing;
+    rx->bits_per_symbol = (uint32_t)__builtin_ctz(rx->bins / h.spacing);
+    rx->bytes[0] = (uint8_t)(bits >> 8);
+    rx->bytes[1] = (uint8_t)bits;
+    rx->bit_count = 0;
+    rx->data_total = PACKET_HEADER_SYMBOLS + packet_payload_symbol_count(h.length, rx->bits_per_symbol);
+    st->state = PACKET_RX_PAYLOAD;
+}
+
+// Decides the data symbol in one frame (at the header's spacing, then the
+// payload's) and adds its bits (MSB first); then decodes the header or
+// finishes the packet when enough are in
 static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *folded_power) {
     PacketRxStatus_t *st = &rx->status;
     const uint32_t b = rx->bits_per_symbol;
@@ -280,27 +309,24 @@ static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *fo
     }
     st->data_count++;
     const uint32_t value = packet_gray_value(symbol);
-    for (uint32_t k = b; k-- > 0;) {
-        const uint32_t byte = rx->bit_count / 8u;
-        if (byte < PACKET_MAX_BYTES) rx->bytes[byte] |= (uint8_t)(((value >> k) & 1u) << (7u - rx->bit_count % 8u));
-        rx->bit_count++;
+
+    if (st->state == PACKET_RX_HEADER) {
+        rx->header_code = (rx->header_code << b) | value;
+        if (st->data_count >= PACKET_HEADER_SYMBOLS) finish_header(rx);
+        return;
     }
 
-    if (st->state == PACKET_RX_HEADER && rx->bit_count >= 8u * PACKET_HEADER_BYTES) {
-        st->length = rx->bytes[0];
-        if (packet_crc8(rx->bytes, 1) != rx->bytes[1]) {
-            st->event = PACKET_RX_EVENT_HEADER_FAILED;
-            back_to_search(rx);
-            return;
-        }
-        st->state = PACKET_RX_PAYLOAD;
-        rx->data_total = packet_symbol_count(st->length, b) - PACKET_PREAMBLE_LEN;
+    for (uint32_t k = b; k-- > 0;) {
+        const uint32_t byte = 2u + rx->bit_count / 8u;
+        if (byte < sizeof rx->bytes) rx->bytes[byte] |= (uint8_t)(((value >> k) & 1u) << (7u - rx->bit_count % 8u));
+        rx->bit_count++;
     }
-    if (st->state == PACKET_RX_PAYLOAD && st->data_count >= rx->data_total) {
+    if (st->data_count >= rx->data_total) {
         const uint32_t len = st->length;
-        packet_scramble(&rx->bytes[PACKET_HEADER_BYTES], len);
-        const uint16_t crc = packet_crc16(rx->bytes, PACKET_HEADER_BYTES + len);
-        const uint16_t sent = (uint16_t)((rx->bytes[PACKET_HEADER_BYTES + len] << 8) | rx->bytes[PACKET_HEADER_BYTES + len + 1u]);
+        uint8_t *payload = &rx->bytes[2];
+        packet_scramble(payload, len);
+        const uint16_t crc = packet_crc16(rx->bytes, 2u + len);
+        const uint16_t sent = (uint16_t)((payload[len] << 8) | payload[len + 1u]);
         st->crc_ok = crc == sent;
         st->event = PACKET_RX_EVENT_PACKET;
         back_to_search(rx);

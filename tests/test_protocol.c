@@ -178,7 +178,8 @@ static void test_list(void) {
     CHECK_STR(talk("l2 list rx.tracking link.spacing\n"),
         "l2 name=rx.tracking kind=setting type=choice values=off,decision,pilot default=off help=Symbol timing tracking\n"
         "l2 name=link.spacing kind=setting type=int values=1,2,4 default=4 units=bins "
-        "help=Bins between symbols (4 bits/symbol at 4, 5 at 2, 6 at 1); both boards must match\nl2 ok\n");
+        "help=Bins between symbols in packets sent and the test modes (4 bits/symbol at 4, 5 at 2, 6 at 1); "
+        "packet receivers follow the header\nl2 ok\n");
     CHECK_STR(talk("l3 list count.good\n"),
         "l3 name=count.good kind=status type=int help=Packets received with a good CRC\nl3 ok\n");
     const char *all = talk("l4 list\n");
@@ -238,15 +239,15 @@ static void test_send(void) {
     fake_board_advance_frames(&fb, 1);
     CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
 
-    // 2 bytes at 4 bits/symbol: 16 preamble + (16 + 16 + 16) / 4 = 28 frames
+    // 2 bytes at 4 bits/symbol: 16 preamble + 8 header + (16 + 16) / 4 = 32 frames
     const uint32_t frames = fake_board_packet_frames(&fb, 2);
-    CHECK_EQ_U(frames, 28);
+    CHECK_EQ_U(frames, 32);
     fake_board_advance_frames(&fb, frames);
     CHECK_STR(drain(),
         "* rx.locked seq=2 frame=4 align=+0 fraction=+0.120 moved=+2\n"
         "* rx.trained seq=3 frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0 moved=+0\n"
-        "* tx.done seq=4 frame=29 id=1 result=sent\n"
-        "* rx.packet seq=5 frame=29 crc=ok len=2 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
+        "* tx.done seq=4 frame=33 id=1 result=sent\n"
+        "* rx.packet seq=5 frame=33 crc=ok len=2 spacing=4 fixed=0 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
     CHECK_STR(talk("p3 get count.good rx.delay rx.last_train.coherence\n"),
         "p3 count.good=1\np3 rx.delay=962\np3 rx.last_train.coherence=0.830\np3 ok\n");
 
@@ -254,27 +255,27 @@ static void test_send(void) {
     CHECK_STR(talk("p4 send hex=01\np5 send hex=02\np6 send hex=03\n"),
         "p4 ok id=2\np5 ok id=3\np6 err 450 transmit queue full\n");
     fake_board_advance_frames(&fb, 1);
-    CHECK_STR(talk("p7 send hex=04\n"), "* tx.start seq=6 frame=30 id=2\np7 ok id=4\n");
+    CHECK_STR(talk("p7 send hex=04\n"), "* tx.start seq=6 frame=34 id=2\np7 ok id=4\n");
 
-    // Real time: 255 bytes at 4 bits/symbol take 16 + 518 frames, 12.4 s
+    // Real time: 63 bytes at 4 bits/symbol take 16 + 8 + 130 frames, 3.6 s
     setup();
     CHECK_STR(talk("p8 set rx.during_tx=off\n"), "p8 ok\n");
     char line[600] = "p9 send hex=";
-    for (int i = 0; i < 255; i++) strcat(line, "ab");
+    for (int i = 0; i < 63; i++) strcat(line, "ab");
     strcat(line, "\n");
     CHECK_STR(talk(line), "p9 ok id=1\n");
-    fake_board_advance_us(&fb, 12000000u);
+    fake_board_advance_us(&fb, 3500000u);
     CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
-    fake_board_advance_us(&fb, 500000u);
-    CHECK_STR(drain(), "* tx.done seq=2 frame=535 id=1 result=sent\n");
+    fake_board_advance_us(&fb, 200000u);
+    CHECK_STR(drain(), "* tx.done seq=2 frame=155 id=1 result=sent\n");
 
     // Bad hex
     CHECK_STR(talk("q1 send hex=486\n"), "q1 err 506 odd number of hex digits\n");
     CHECK_STR(talk("q2 send hex=zz\n"), "q2 err 506 not hex\n");
     strcpy(line, "q3 send hex=");
-    for (int i = 0; i < 256; i++) strcat(line, "00");
+    for (int i = 0; i < 64; i++) strcat(line, "00");
     strcat(line, "\n");
-    CHECK_STR(talk(line), "q3 err 506 more than 255 bytes\n");
+    CHECK_STR(talk(line), "q3 err 506 more than 63 bytes\n");
     CHECK_STR(talk("q4 send\n"), "q4 err 505 send takes hex=<bytes>\n");
     CHECK_STR(talk("q5 send text=hi\n"), "q5 err 505 send takes hex=<bytes>\n");
     CHECK_STR(talk("q6 send hex=\n"), "q6 ok id=2\n"); // An empty packet is allowed
@@ -307,7 +308,7 @@ static void test_ordering(void) {
     CHECK_EQ_U(protocol_input(&proto, cmd1, strlen(cmd1)), strlen(cmd1));
     strcpy(all + 10, drain_raw());
     CHECK_STR(decode(all),
-        "* rx.packet seq=1 frame=7 crc=ok len=4 min_margin=1.500 weakest=0 weak=0 hex=00010203\n"
+        "* rx.packet seq=1 frame=7 crc=ok len=4 spacing=0 fixed=0 min_margin=1.500 weakest=0 weak=0 hex=00010203\n"
         "e1 tx.volume=-28\ne1 ok\n");
 
     // Events around a long reply never land inside it
@@ -603,7 +604,7 @@ static void test_abandoned(void) {
         "* rx.trained seq=5 frame=30 b_start=20 coherence=0.830 strongest=-1 earliest=+0 moved=+0\nx6 ok\n");
     fake_board_advance_frames(&fb, 1);
     CHECK_STR(drain(), "* tx.done seq=6 frame=36 id=2 result=abandoned\n"
-        "* rx.lost seq=7 frame=36 symbols=7 reason=spacing\n");
+        "* rx.lost seq=7 frame=36 symbols=7 reason=signal\n");
 
     // reset rx while hearing: rx.lost, and nothing more from that packet
     CHECK_STR(talk("x7 send hex=0102030405\n"), "x7 ok id=3\n");
@@ -636,7 +637,7 @@ static void test_stream_priority(void) {
     CHECK(queued <= PROTOCOL_OUT_SIZE - PROTOCOL_REPLY_MAX - PROTOCOL_EVENT_RESERVE);
 
     // Events still get in, and a command is answered at once
-    for (int i = 0; i < 3; i++) inject_packet(255);
+    for (int i = 0; i < 3; i++) inject_packet(PROTOCOL_PAYLOAD_MAX);
     CHECK_EQ_U(proto.events_dropped, 0);
     const char *cmd = encode("p4 get count.stream_dropped count.events_dropped\n");
     CHECK_EQ_U(protocol_input(&proto, cmd, strlen(cmd)), strlen(cmd));
@@ -680,11 +681,12 @@ static void test_stream_priority(void) {
 // The host stops reading: events are dropped and counted, commands wait,
 // and replies are never lost
 static void test_flow(void) {
+    enum { FLOOD = 300 }; // Enough longest-packet events to overflow the output queue
     setup();
-    for (int i = 0; i < 100; i++) inject_packet(255);
+    for (int i = 0; i < FLOOD; i++) inject_packet(PROTOCOL_PAYLOAD_MAX);
     const uint32_t queued = protocol_output_pending(&proto);
-    printf("  100 long packet events: %lu bytes queued, %lu dropped\n",
-        (unsigned long)queued, (unsigned long)proto.events_dropped);
+    printf("  %d long packet events: %lu bytes queued, %lu dropped\n",
+        FLOOD, (unsigned long)queued, (unsigned long)proto.events_dropped);
     CHECK(proto.events_dropped > 0);
     CHECK(queued <= PROTOCOL_OUT_SIZE);
 
@@ -711,11 +713,11 @@ static void test_flow(void) {
     snprintf(expect, sizeof expect, "f1 count.events_dropped=%lu\nf1 ok\n", (unsigned long)proto.events_dropped);
     CHECK(strstr(seen, expect) != NULL);
     CHECK(strstr(seen, "f2 ok\n") != NULL);
-    // The notice follows the 100 packets (seq 1..100); the dropped ones
+    // The notice follows the packets (seq 1..FLOOD); the dropped ones
     // left a gap in the sequence numbers just before it
-    snprintf(expect, sizeof expect, "* overflow seq=101 dropped=%lu\n", (unsigned long)proto.events_dropped);
+    snprintf(expect, sizeof expect, "* overflow seq=%d dropped=%lu\n", FLOOD + 1, (unsigned long)proto.events_dropped);
     CHECK(strstr(seen, expect) != NULL);
-    const uint32_t delivered = 100u - proto.events_dropped;
+    const uint32_t delivered = FLOOD - proto.events_dropped;
     snprintf(expect, sizeof expect, "* rx.packet seq=%lu ", (unsigned long)delivered);
     CHECK(strstr(seen, expect) != NULL);
     snprintf(expect, sizeof expect, "* rx.packet seq=%lu ", (unsigned long)delivered + 1u);
@@ -724,14 +726,16 @@ static void test_flow(void) {
     uint32_t packets = 0;
     for (const char *s = seen; (s = strstr(s, "* rx.packet")) != NULL; s++) {
         const char *nl = strchr(s, '\n');
-        CHECK(nl && strstr(s, " hex=") && nl - strstr(s, " hex=") == 5 + 510);
+        CHECK(nl && strstr(s, " hex=") && nl - strstr(s, " hex=") == 5 + 2 * PROTOCOL_PAYLOAD_MAX);
         packets++;
     }
-    CHECK_EQ_U(packets + proto.events_dropped, 100);
+    CHECK_EQ_U(packets + proto.events_dropped, FLOOD);
 
     // Afterwards events flow again, and reset counters clears the count
     inject_packet(1);
-    CHECK(strncmp(drain(), "* rx.packet seq=102 ", 20) == 0);
+    char next[32];
+    snprintf(next, sizeof next, "* rx.packet seq=%d ", FLOOD + 2);
+    CHECK(strncmp(drain(), next, strlen(next)) == 0);
     CHECK_STR(talk("f3 reset counters\nf4 get count.events_dropped\n"), "f3 ok\nf4 count.events_dropped=0\nf4 ok\n");
 }
 

@@ -40,7 +40,7 @@
 #define PROTOCOL_OUT_SIZE 24576u   // Output queue, bytes
 #define PROTOCOL_REPLY_MAX 6144u   // Longest reply to one command, bytes, with its checks ("list" of everything is about 4 KB)
 #define PROTOCOL_TAG_MAX 8u
-#define PROTOCOL_PAYLOAD_MAX 255u  // Bytes in a packet (as packet_format.h)
+#define PROTOCOL_PAYLOAD_MAX 63u   // Bytes in a packet (as packet_format.h)
 #define PROTOCOL_CHIRP_BINS 64u    // FFT bins the chirp spans (CHIRP_BINS in main.c)
 #define PROTOCOL_FFT_SIZE 1024u    // Bins in the spectrum stream's source
 #define PROTOCOL_SPECTRUM_MAX 512u // Most spectrum bins one subscription may ask for
@@ -117,7 +117,6 @@ typedef struct {
 // Why a packet being received was given up (rx.lost reason=)
 typedef enum {
     PROTO_LOST_SIGNAL = 0,   // The signal went (packet_rx: too many frames that don't look like a symbol)
-    PROTO_LOST_SPACING,      // link.spacing changed
     PROTO_LOST_RESET,        // "reset rx"
     PROTO_LOST_TRANSMIT,     // This board started sending, with rx.during_tx off
 } ProtocolLostReason_t;
@@ -152,11 +151,13 @@ typedef struct {
     union {
         struct { int32_t align; float fraction; int32_t moved; } locked;
         struct { uint32_t b_start; float coherence; int32_t strongest, earliest, moved; } trained;
-        struct { uint32_t length; } header_failed;
+        struct { bool format; } header_failed; // false: too many wrong bits; true: a format this board doesn't know
         struct { uint32_t symbols; ProtocolLostReason_t reason; } lost;
         struct {
             bool crc_ok;
             uint32_t length;
+            uint32_t spacing;  // Payload bins per symbol (from the header)
+            uint32_t fixed;    // Header bits corrected
             float min_margin;
             uint32_t weakest, weak;
             const uint8_t *payload; // Only needs to last for the protocol_event() call

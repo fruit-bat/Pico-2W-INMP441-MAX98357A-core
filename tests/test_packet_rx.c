@@ -71,6 +71,7 @@ typedef struct {
     double final_offset;          // Window offset at the end (after any moves)
     PacketRxStatus_t last_trained;
     uint32_t decisions_ok;        // Packets whose kept decisions are all the symbols sent
+    PacketRxStatus_t last_header; // At the last HEADER_FAILED
 } Events_t;
 
 // A ghost for the lock to fall for: with 'align', the window is moved this
@@ -88,7 +89,7 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
         .noise_rms = snr_db > 90.0 ? 0.0 : (RIG_VOLUME / sqrt(2.0)) / pow(10.0, snr_db / 20.0),
         .echoes = echoes, .echo_count = echo_count,
     };
-    packet_rx_init(&prx, BINS, (uint32_t)log2(rig_m), rx_storage, &tmpl);
+    packet_rx_init(&prx, BINS, rx_storage, &tmpl);
     Events_t e;
     memset(&e, 0, sizeof e);
     e.min_quality = 1.0f;
@@ -121,7 +122,7 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
                 break;
             case PACKET_RX_EVENT_TRAIN_FAILED: e.failed++; break;
             case PACKET_RX_EVENT_TONE: e.tone++; break;
-            case PACKET_RX_EVENT_HEADER_FAILED: e.header_failed++; break;
+            case PACKET_RX_EVENT_HEADER_FAILED: e.header_failed++; e.last_header = *st; break;
             case PACKET_RX_EVENT_LOST: e.lost++; e.last_lost = *st; break;
             case PACKET_RX_EVENT_PACKET:
                 e.packets++;
@@ -130,10 +131,13 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
                         && memcmp(packet_rx_payload(&prx), sent_payload, sent_length) == 0) e.good++;
                 {
                     const PacketRxDecision_t *d = packet_rx_decisions(&prx);
-                    bool same = st->data_count == packet_symbol_count(sent_length, prx.bits_per_symbol) - PACKET_PREAMBLE_LEN;
+                    const uint32_t b = (uint32_t)log2(rig_m);
+                    bool same = st->data_count == packet_symbol_count(sent_length, b) - PACKET_PREAMBLE_LEN;
                     for (uint32_t i = 0; same && i < st->data_count; i++) {
-                        same = d[i].symbol == stream[LEAD + PACKET_PREAMBLE_LEN + i] && d[i].second != d[i].symbol
-                            && d[i].margin >= 1000u;
+                        // Header symbols are kept at spacing 8 (the stream has them at the rig's)
+                        const uint32_t sent = stream[LEAD + PACKET_PREAMBLE_LEN + i];
+                        const uint32_t want = i < PACKET_HEADER_SYMBOLS ? sent >> (b - PACKET_HEADER_BITS_PER_SYMBOL) : sent;
+                        same = d[i].symbol == want && d[i].second != d[i].symbol && d[i].margin >= 1000u;
                     }
                     if (same) e.decisions_ok++;
                 }
@@ -423,8 +427,8 @@ static void test_long_packets(void) {
                 weak += e.last_packet.weak_symbols;
                 if (e.packets && e.last_packet.min_margin < min_margin) min_margin = e.last_packet.min_margin;
             }
-            printf("  %s room, 255 bytes, %-8s %u/8 intact, %u weak decisions, min margin %.2f\n",
-                harsh ? "harsh   " : "measured", i == 0 ? "no noise" : (i == 1 ? "0 dB" : "-6 dB"), good, weak, min_margin);
+            printf("  %s room, %u bytes, %-8s %u/8 intact, %u weak decisions, min margin %.2f\n",
+                harsh ? "harsh   " : "measured", (unsigned)sizeof payload, i == 0 ? "no noise" : (i == 1 ? "0 dB" : "-6 dB"), good, weak, min_margin);
             CHECK_EQ_U(good, 8);
             CHECK_EQ_U(lost, 0);
         }
@@ -444,21 +448,84 @@ static void test_bad_crc(void) {
     if (e.packets) CHECK(!e.last_packet.crc_ok);
 }
 
-// A corrupted header is caught by its CRC-8
+// Changes header symbol i (at spacing 1, as the rig) so its 3-bit value has
+// these bits flipped
+static void corrupt_header_symbol(uint32_t i, uint32_t flip) {
+    uint32_t *s = &stream[LEAD + PACKET_PREAMBLE_LEN + i];
+    const uint32_t s8 = *s >> 3;
+    *s = packet_gray_symbol(packet_gray_value(s8) ^ flip) << 3;
+}
+
+// Header errors: up to 3 wrong bits are corrected (the packet arrives, and
+// says how many); 4 are caught, and the packet is given up
 static void test_bad_header(void) {
+    static const struct { uint32_t symbol, flip; } cases[][2] = {
+        { { 0, 4 }, { 0, 0 } },  // One bit
+        { { 0, 7 }, { 0, 0 } },  // A wild symbol: all 3 bits
+        { { 2, 1 }, { 7, 3 } },  // 3 bits in 2 symbols
+        { { 0, 7 }, { 5, 2 } },  // 4 bits: too many
+    };
+    static const uint32_t fixed[] = { 1, 3, 3, 0 };
     rig_setup_spacing(1);
+    for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        build_packet_stream(80);
+        for (unsigned c = 0; c < 2; c++) if (cases[k][c].flip) corrupt_header_symbol(cases[k][c].symbol, cases[k][c].flip);
+        const Events_t e = run(80, 0.0, 100.0, NULL, 0, true);
+        char label[48];
+        snprintf(label, sizeof label, "header: %u bits wrong", k < 3 ? fixed[k] : 4u);
+        print_packet(label, e);
+        if (k < 3) {
+            CHECK_EQ_U(e.good, 1);
+            CHECK_EQ_U(e.last_packet.header_fixed, fixed[k]);
+            CHECK_EQ_U(e.last_packet.spacing, 1);
+        } else {
+            CHECK_EQ_U(e.header_failed, 1);
+            CHECK_EQ_U(e.packets, 0);
+            CHECK_EQ_U(e.last_header.header_result, PACKET_RX_HEADER_CHECK);
+        }
+    }
+}
+
+// A header from a newer format (here: error correction 1) is decoded, and
+// refused
+static void test_unknown_header(void) {
+    rig_setup_spacing(4);
     build_packet_stream(80);
-    stream[LEAD + PACKET_PREAMBLE_LEN] ^= 0x20;
+    const PacketHeader_t h = { PACKET_VERSION, 4, 1, sizeof test_payload };
+    const uint32_t code = packet_golay_encode(packet_header_pack(&h));
+    for (uint32_t i = 0; i < PACKET_HEADER_SYMBOLS; i++) {
+        const uint32_t v = (code >> (21u - 3u * i)) & 7u;
+        stream[LEAD + PACKET_PREAMBLE_LEN + i] = packet_gray_symbol(v) << 1; // Spacing 8 at 4 bits/symbol
+    }
     const Events_t e = run(80, 0.0, 100.0, NULL, 0, true);
-    print_packet("first header symbol changed", e);
+    print_packet("header with error correction 1", e);
     CHECK_EQ_U(e.header_failed, 1);
-    CHECK_EQ_U(e.packets, 0);
+    CHECK_EQ_U(e.last_header.header_result, PACKET_RX_HEADER_FORMAT);
+    rig_setup_spacing(1);
+}
+
+// The receiver follows the header's spacing: packets at 1, 2 and 4 bins per
+// symbol, one after another, all with the same receiver set-up
+static void test_mixed_spacings(void) {
+    static const uint32_t spacings[] = { 4, 1, 2, 4 };
+    for (unsigned k = 0; k < 4; k++) {
+        rig_setup_spacing(spacings[k]);
+        chirp_channel_seed(90 + k);
+        build_packet_stream(90);
+        const Events_t e = run(90, 150.0, 0.0, measured_echoes, 3, true);
+        char label[48];
+        snprintf(label, sizeof label, "spacing %u, room, 0 dB", spacings[k]);
+        print_packet(label, e);
+        CHECK_EQ_U(e.good, 1);
+        CHECK_EQ_U(e.last_packet.spacing, spacings[k]);
+    }
+    rig_setup_spacing(1);
 }
 
 // Two packets back to back with a short gap: both received
 static void test_two_packets(void) {
     rig_setup_spacing(1);
-    const uint32_t len = 43u + 4u;
+    const uint32_t len = packet_symbol_count(sizeof test_payload, 6) + 4u;
     build_packet_stream(LEAD + 2 * len + 10);
     for (uint32_t k = 0; k < len; k++) stream[LEAD + len + k] = stream[LEAD + k];
     const Events_t e = run(LEAD + 2 * len + 10, 210.0, 0.0, room_echoes, 3, true);
@@ -472,7 +539,8 @@ static void test_two_packets(void) {
 // packet straight after it is received
 static void test_lost_signal(void) {
     rig_setup_spacing(1);
-    const uint32_t len = 43u, cut = 20u; // 16-byte packet: 43 symbols; stop after 20 (4 data symbols)
+    // 16-byte packet; stop after the header and 4 payload symbols
+    const uint32_t len = packet_symbol_count(sizeof test_payload, 6), cut = PACKET_PREAMBLE_LEN + PACKET_HEADER_SYMBOLS + 4u;
     const uint32_t frames = LEAD + len + 6u + len + 10u;
     build_packet_stream(frames);
     for (uint32_t k = 0; k < len; k++) stream[LEAD + len + 6u + k] = stream[LEAD + k]; // A second, whole packet
@@ -519,7 +587,7 @@ static const float32_t logged_centre[11] = { 8.5176f, 12.9065f, 47.1189f, 47.428
 // have followed is stood in for by a copy of 27137 (another whole A frame).
 static void test_partial_first_frame(void) {
     channel_template_init(&tmpl, BINS, template_storage);
-    packet_rx_init(&prx, BINS, 4, rx_storage, &tmpl);
+    packet_rx_init(&prx, BINS, rx_storage, &tmpl);
     const uint32_t logged = sizeof logged_centre / sizeof logged_centre[0];
     const uint32_t count = logged + 1u;
     const PacketRxStatus_t *st = NULL;
@@ -549,7 +617,7 @@ static void test_partial_first_frame(void) {
 // board's later frames were taken through the wrong window.)
 static void test_ghost_lock(void) {
     channel_template_init(&tmpl, BINS, template_storage);
-    packet_rx_init(&prx, BINS, 4, rx_storage, &tmpl);
+    packet_rx_init(&prx, BINS, rx_storage, &tmpl);
     int32_t locked_at = -1, trained_at = -1;
     PacketRxStatus_t lock, trained;
     memset(&lock, 0, sizeof lock);
@@ -593,6 +661,8 @@ int main(void) {
     RUN_TEST(test_long_packets);
     RUN_TEST(test_bad_crc);
     RUN_TEST(test_bad_header);
+    RUN_TEST(test_unknown_header);
+    RUN_TEST(test_mixed_spacings);
     RUN_TEST(test_two_packets);
     RUN_TEST(test_lost_signal);
 

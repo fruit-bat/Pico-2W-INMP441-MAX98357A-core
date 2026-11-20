@@ -632,15 +632,15 @@ class CsvLog:
             elif e.name == "rx.trained":
                 self._train = {k: e.raw(k) for k in ("coherence", "b_start", "strongest", "earliest")}
             elif e.name == "rx.packet":
-                bits = 64 // self.board.settings.get("link.spacing", 4)
+                bits = 64 // (e["spacing"] if e.raw("spacing") else self.board.settings.get("link.spacing", 4))
                 bits = bits.bit_length() - 1
                 length = e["len"]
                 notes.append("# packet frame=%d crc_ok=%d length=%d data_symbols=%d min_margin=%s weakest=%s "
                              "weak=%s payload=%s" % (frame, e["crc"] == "ok", length,
-                                                     (16 + 8 * length + 16 + bits - 1) // bits, e.raw("min_margin"),
+                                                     8 + (8 * length + 16 + bits - 1) // bits, e.raw("min_margin"),
                                                      e.raw("weakest"), e.raw("weak"), _printable(e.payload())))
             elif e.name == "rx.header_failed":
-                notes.append("# packet header failed: length byte %s" % e.raw("length"))
+                notes.append("# packet header failed: %s" % e.raw("reason"))
             elif e.name == "rx.lost":
                 why = {"signal": "signal gone", "spacing": "spacing changed", "reset": "reset rx",
                        "transmit": "this board transmitting"}.get(e.raw("reason"), e.raw("reason") or "signal gone")

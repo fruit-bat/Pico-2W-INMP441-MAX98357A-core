@@ -46,13 +46,13 @@ class Soak(unittest.TestCase):
     def test_compare(self):
         sent = bytes([0x00, 0xFF, 0x55])
         self.assertEqual(chirp_soak.compare(sent, sent, 4), (0, 0, []))
-        # 4 bits/symbol: header is symbols 0-3, payload byte 0 is symbols 4-5, byte 2 is 8-9
-        self.assertEqual(chirp_soak.compare(sent, bytes([0x01, 0xFF, 0x54]), 4), (2, 2, [5, 9]))
-        # 5 bits/symbol: payload bits start at stream bit 16; byte 0 bit 0 is stream bit 16 = symbol 3
-        self.assertEqual(chirp_soak.compare(sent, bytes([0x80, 0xFF, 0x55]), 2), (1, 1, [3]))
-        self.assertEqual(chirp_soak.data_symbols(16, 4), 40)
-        self.assertEqual(chirp_soak.data_symbols(16, 2), 32)
-        self.assertEqual(chirp_soak.data_symbols(255, 4), 518)
+        # 4 bits/symbol: header is symbols 0-7, payload byte 0 is symbols 8-9, byte 2 is 12-13
+        self.assertEqual(chirp_soak.compare(sent, bytes([0x01, 0xFF, 0x54]), 4), (2, 2, [9, 13]))
+        # 5 bits/symbol: byte 1 bit 0 is payload bit 8 = symbol 8 + 1
+        self.assertEqual(chirp_soak.compare(sent, bytes([0x00, 0x7F, 0x55]), 2), (1, 1, [9]))
+        self.assertEqual(chirp_soak.data_symbols(16, 4), 44)
+        self.assertEqual(chirp_soak.data_symbols(16, 2), 37)
+        self.assertEqual(chirp_soak.data_symbols(63, 4), 138)
 
     def test_judge(self):
         E = chirp_host.Event
@@ -79,29 +79,29 @@ class Soak(unittest.TestCase):
         self.assertEqual(chirp_soak.judge([early, tone])[0], "tone")
 
     def test_decisions(self):
-        # The symbols packet_tx sends for "Hi" (printed by the C, 2026-11-20)
-        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 4), [0, 3, 0, 11, 8, 10, 7, 12, 0, 13, 7, 2])
-        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 2), [0, 15, 5, 8, 20, 28, 31, 13, 15, 8])
-        self.assertEqual(chirp_soak.crc8(b"123456789"), 0xF4)
+        # The symbols packet_tx sends for "Hi" (printed by the C, 2026-11-20; header at spacing 8)
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 4), [1, 0, 0, 3, 2, 1, 3, 4, 8, 10, 7, 12, 5, 11, 3, 3])
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 2), [0, 7, 0, 3, 5, 3, 1, 3, 17, 22, 6, 11, 13, 21, 31])
         self.assertEqual(chirp_soak.crc16(b"123456789"), 0x29B1)
+        self.assertEqual(chirp_soak.golay_encode(0x210) >> 12, 0x210)
         # Symbol 1 (header) and 9 wrong: 1's runner-up was right; margins rank 9 lowest, then 1
         sent = chirp_soak.sent_symbols(b"Hi", 4)
         got = list(sent)
         got[1], got[9] = 2, 12
         second = [0] * len(sent)
-        second[1] = 3
+        second[1] = 0
         margins = [1500] * len(sent)
         margins[1], margins[9], margins[4] = 1010, 1001, 1020
         ev = chirp_host.Event("* rx.symbols seq=1 frame=2 count=%d symbols=%s second=%s margins=%s"
                               % (len(got), bytes(got).hex(), bytes(second).hex(), ",".join(map(str, margins))))
         c = chirp_soak.check_decisions(sent, ev, 4)
         self.assertEqual((c["decided"], c["wrong"], c["header_wrong"], c["wrong_second"], c["wrong_ranks"]),
-                         (12, "1;9", 1, 1, "2;1"))
-        # A failed header: only the header's symbols come
-        ev = chirp_host.Event("* rx.symbols seq=1 frame=2 count=4 symbols=0003000c second=00000000 "
-                              "margins=1100,1200,1300,1050")
+                         (16, "1;9", 1, 1, "2;1"))
+        # A failed header: only the header's 8 symbols come (here symbol 3 wrong, with the lowest margin)
+        ev = chirp_host.Event("* rx.symbols seq=1 frame=2 count=8 symbols=0100000502010304 second=0000000000000000 "
+                              "margins=1100,1200,1300,1050,1400,1400,1400,1400")
         c = chirp_soak.check_decisions(sent, ev, 4)
-        self.assertEqual((c["decided"], c["wrong"], c["header_wrong"], c["wrong_ranks"]), (4, "3", 1, "1"))
+        self.assertEqual((c["decided"], c["wrong"], c["header_wrong"], c["wrong_ranks"]), (8, "3", 1, "1"))
 
     def test_run(self):
         import csv
@@ -174,17 +174,18 @@ class WithSim(unittest.TestCase):
         heard = self.b.wait_event("rx.packet", timeout=5)
         self.assertEqual(heard.payload(), payload)
         self.assertEqual(heard["crc"], "ok")
-        # 16 bytes at 4 bits/symbol: 16 preamble + (16 + 128 + 16) / 4 data frames
-        self.assertEqual(done["frame"] - start["frame"], 16 + 40)
+        # 16 bytes at 4 bits/symbol: 16 preamble + 8 header + (128 + 16) / 4 frames
+        self.assertEqual(done["frame"] - start["frame"], 16 + 8 + 36)
+        self.assertEqual((heard["spacing"], heard["fixed"]), (4, 0))
 
     def test_commands_while_events_flow(self):
         self.b.sub("frame", fields="delay")
         self.b.sub("spectrum", units="power")
-        pid = self.b.send(bytes(range(255)))
+        pid = self.b.send(bytes(range(63)))
         for i in range(50):  # Replies are matched by tag, whatever comes in between
             self.assertEqual(self.b.get("tx.volume")["tx.volume"], -28)
         heard = self.b.wait_event("rx.packet", timeout=30)
-        self.assertEqual(heard.payload(), bytes(range(255)))
+        self.assertEqual(heard.payload(), bytes(range(63)))
         done = self.b.wait_event("tx.done", lambda e: e["id"] == pid, timeout=1)
         self.assertLess(done.seq, heard.seq)
 
@@ -245,7 +246,7 @@ class WithSim(unittest.TestCase):
                           rows[0]["packet_align_on"]), ("packet", "off", "4", "-28", "1"))
         # The packet's comment line follows its row
         i = lines.index(next(l for l in lines if l.startswith(events[6]["frame"] + ",")))
-        self.assertEqual(lines[i + 1], "# packet frame=%s crc_ok=1 length=16 data_symbols=40 min_margin=2.000 "
+        self.assertEqual(lines[i + 1], "# packet frame=%s crc_ok=1 length=16 data_symbols=44 min_margin=2.000 "
                                        "weakest=0 weak=0 payload=chirp packet 042" % events[6]["frame"])
 
     def test_log_command(self):

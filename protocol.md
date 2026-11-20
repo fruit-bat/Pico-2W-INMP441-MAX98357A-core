@@ -49,7 +49,7 @@ today must still be available (see the inventory at the end).
   with bytes over 0x7E, is rejected (`err 500`).
 - Empty lines (or only spaces) are ignored, and need no check.
 - Maximum line length 1024 characters with the check from the host. That
-  is enough for a 255-byte packet in hex (510 characters) plus the rest of
+  is enough for the longest packet (63 bytes since 0.3.0) in hex plus the rest of
   the line. Lines from the board can be up to 6 KB: a 512-bin spectrum as
   raw power is about 5.2 KB. A host with little memory just doesn't
   subscribe to the long ones. A longer line can't be checked: it is thrown away up to its LF and
@@ -106,7 +106,7 @@ an event, and anything else is a reply to that tag.
 | `set` | `name=value ...` | other settings it changed, on the `ok` line | all or nothing: one bad value rejects the whole command. E.g. `a8 set link.spacing=4` → `a8 ok test.symbol=8` (the symbol wrapped) |
 | `nudge` | `samples=<n>` (−1023 .. 1023) | `ok delay=<new>` | moves the receive window; positive = later (more delay). Today keys `z` `x`. Relative, so not safe to repeat blindly (see Link errors) |
 | `list` | names (none = all) | one line per item: name, kind, type, range, units, help | for clients and humans; generated from the table |
-| `send` | `hex=<bytes>` | `ok id=<n>` | queues a packet; later `* tx.start id=` and `* tx.done id=` |
+| `send` | `hex=<bytes>` | `ok id=<n>` | queues a packet (0..63 bytes, at this board's `link.spacing`); later `* tx.start id=` and `* tx.done id=` |
 | `sub` | `stream=<name> [every=<n>] [fields=a,b,...] [units=db\|power] [from=<bin> to=<bin>]`; or nothing | with no arguments: one line per subscription in force | start or replace a stream (see Streams) |
 | `unsub` | `stream=<name>` or `all` | — | safe to repeat: unsubscribing what isn't subscribed is fine |
 | `reset` | `counters` / `rx` / `settings` | — | clear counters, abandon the packet being received, restore the built-in default settings (the saved ones are not touched) |
@@ -125,7 +125,7 @@ board:  a2 ok
 host:   a3 set tx.volume=-60
 board:  a3 err 503 tx.volume out of range -55..-1
 host:   a4 send hex=6869
-board:  * rx.packet seq=40 frame=1803 crc=ok len=16 min_margin=2.310 weakest=3 weak=0 hex=...
+board:  * rx.packet seq=40 frame=1803 crc=ok len=16 spacing=4 fixed=0 min_margin=2.310 weakest=3 weak=0 hex=...
 board:  a4 ok id=7
 board:  * tx.start seq=41 frame=1811 id=7
 board:  * tx.done seq=42 frame=1837 id=7 result=sent
@@ -140,7 +140,7 @@ items can only be read. Out-of-range values are rejected, never clamped.
 
 | Name | Values | Default | Today |
 |---|---|---|---|
-| `link.spacing` | 1, 2, 4 bins per symbol | 4 | key `b` |
+| `link.spacing` | 1, 2, 4 bins per symbol | 4 | key `b`. Since 0.3.0 only for packets this board sends (and the test modes): a receiver follows each packet's header, so boards needn't match |
 | `tx.volume` | −55 .. −1 dBFS (integer) | −28 | keys `[` `]` (3 dB steps) |
 | `rx.align` | on, off | on | key `a` |
 | `rx.tracking` | off, decision, pilot | off | key `t` |
@@ -192,9 +192,9 @@ come after `seq`.
 | `* rx.trained` | `frame b_start coherence strongest earliest moved=<samples>` | display; log `packet_event` 2. `moved`: the window moved back because the lock's move was wrong (packet_format.md), else 0 |
 | `* rx.train_failed` | `frame` | display "failed" count |
 | `* rx.tone` | `frame` | (not shown today) |
-| `* rx.header_failed` | `frame length` | `# packet header failed` |
-| `* rx.lost` | `frame symbols reason=signal\|spacing\|reset\|transmit` | `# packet lost`. A packet given up part-way: the signal went, `link.spacing` changed, `reset rx`, or this board started sending with `rx.during_tx=off` |
-| `* rx.packet` | `frame crc=ok\|bad len min_margin weakest weak hex` | `# packet ...` |
+| `* rx.header_failed` | `frame reason=check\|format` | `# packet header failed`. `check`: more than 3 of the header's 24 bits wrong; `format`: decoded, but a version, spacing or error correction this board doesn't know (0.3.0; was `length`) |
+| `* rx.lost` | `frame symbols reason=signal\|reset\|transmit` | `# packet lost`. A packet given up part-way: the signal went, `reset rx`, or this board started sending with `rx.during_tx=off` (`spacing` went in 0.3.0: a spacing change no longer stops the receiver) |
+| `* rx.packet` | `frame crc=ok\|bad len spacing fixed min_margin weakest weak hex` | `# packet ...`. `spacing`: the payload's, from the header; `fixed`: header bits the Golay code corrected (0..3) |
 | `* rx.symbols` | `frame count symbols second margins` | new, only with `rx.symbols=on`: straight after `rx.packet` or `rx.header_failed`, every data symbol decided (header first): `symbols` and `second` (the runner-up) as 2 hex digits each, `margins` comma-separated in thousandths (1000 = a tie). For choosing error correction |
 | `* tx.start` | `frame id` | (new) |
 | `* tx.done` | `frame id result=sent\|abandoned` | (new). `abandoned`: cut short, e.g. by a `link.spacing` change, so a host waiting on that id always hears how it ended |

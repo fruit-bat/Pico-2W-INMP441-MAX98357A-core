@@ -18,9 +18,9 @@ static uint32_t bits_per_symbol(const FakeBoard_t *fb) {
 }
 
 uint32_t fake_board_packet_frames(const FakeBoard_t *fb, uint32_t length) {
-    const uint32_t bits = 16u + 8u * length + 16u; // Header, payload, CRC-16
+    const uint32_t bits = 8u * length + 16u; // Payload, CRC-16
     const uint32_t b = bits_per_symbol(fb);
-    return 16u + (bits + b - 1u) / b;
+    return 16u + 8u + (bits + b - 1u) / b;   // Preamble, header (8 symbols), the rest
 }
 
 // Made-up spectra: low noise, with the symbol's bin standing out while a
@@ -98,8 +98,9 @@ static void one_frame(FakeBoard_t *fb) {
     fb->status.frames = fb->frame;
     const bool hear = fb->settings.value[SETTING_RX_DURING_TX] != 0;
 
-    // As main.c: a spacing change cuts the packet being sent short, and gives
-    // up the one being received; so does "reset rx" (both on the next pass)
+    // As main.c: a spacing change cuts the packet being sent short (the
+    // receiver, hearing it stop, gives up for lack of signal); "reset rx"
+    // gives up the one being received (both on the next pass)
     const bool spacing = fb->abandon && fb->sending;
     if (spacing) {
         fb->sending = false;
@@ -114,7 +115,7 @@ static void one_frame(FakeBoard_t *fb) {
         fb->status.lost++;
         ProtocolEvent_t lost = { .type = PROTO_EV_RX_LOST };
         lost.u.lost.symbols = fb->sent_frames > 16u ? fb->sent_frames - 16u : 0u;
-        lost.u.lost.reason = spacing ? PROTO_LOST_SPACING : PROTO_LOST_RESET;
+        lost.u.lost.reason = spacing ? PROTO_LOST_SIGNAL : PROTO_LOST_RESET;
         event(fb, lost);
     }
     if (fb->reset_rx) fb->status.rx_state = PROTO_RX_SEARCH;
@@ -162,6 +163,8 @@ static void one_frame(FakeBoard_t *fb) {
                 ProtocolEvent_t e = { .type = PROTO_EV_RX_PACKET };
                 e.u.packet.crc_ok = true;
                 e.u.packet.length = fb->current.length;
+                e.u.packet.spacing = (uint32_t)fb->settings.value[SETTING_LINK_SPACING];
+                e.u.packet.fixed = 0;
                 e.u.packet.min_margin = 2.0f;
                 e.u.packet.weakest = 0;
                 e.u.packet.weak = 0;

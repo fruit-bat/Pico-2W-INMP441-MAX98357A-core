@@ -13,18 +13,23 @@
  *   LOCK    in A; waiting for the spectrum to change (the start of B)
  *   TRAIN   collecting B; then finds exactly which frame B started on, and
  *           learns the channel's shape from the B frames (channel_template)
- *   HEADER  decides data symbols with the learned shape, until the header's
- *           16 bits are in; checks its CRC-8 (bad: back to SEARCH)
- *   PAYLOAD decides the rest; when the last symbol is in, descrambles the
- *           payload, checks the CRC-16 and reports the packet (good or bad)
- *           with PACKET_RX_EVENT_PACKET; back to SEARCH
+ *   HEADER  decides the header's 8 symbols (spacing 8) with the learned
+ *           shape and decodes its Golay codeword, correcting up to 3 wrong
+ *           bits (more, or a format it doesn't know: back to SEARCH)
+ *   PAYLOAD decides the rest at the spacing the header gives; when the last
+ *           symbol is in, descrambles the payload, checks the CRC-16 and
+ *           reports the packet (good or bad) with PACKET_RX_EVENT_PACKET;
+ *           back to SEARCH
+ *
+ * The receiver has no spacing setting: B sounds the same at every spacing,
+ * and the header, at a fixed spacing, says what the payload uses.
  *
  * In HEADER and PAYLOAD each frame's "quality" is checked: the correlation
  * (mean removed, 0..1) of its square-root power with the learned shape at
  * the best candidate symbol. A symbol scores about 0.85 between the boards,
  * noise about 0.3, independent of level. PACKET_RX_LOST_FRAMES frames in a
  * row below PACKET_RX_MIN_QUALITY abandon the packet (PACKET_RX_EVENT_LOST),
- * so a header that passed its CRC-8 by chance, or a transmitter that
+ * so a header decoded from noise by chance, or a transmitter that
  * stopped, doesn't hold the receiver for the rest of a long payload.
  *
  * Data symbols are decided by channel_template_decide: each candidate
@@ -131,10 +136,16 @@ typedef enum {
     PACKET_RX_EVENT_TRAINED,      // B found and learned; see the status fields
     PACKET_RX_EVENT_TRAIN_FAILED, // The change after A was not B
     PACKET_RX_EVENT_TONE,         // A held symbol went on too long; ignored until it changes
-    PACKET_RX_EVENT_HEADER_FAILED, // The header's CRC-8 was wrong
+    PACKET_RX_EVENT_HEADER_FAILED, // The header could not be decoded, or has an unknown format (see header_result)
     PACKET_RX_EVENT_PACKET,       // A packet is complete; see the packet fields and packet_rx_payload()
     PACKET_RX_EVENT_LOST,         // The signal went during the header or payload; abandoned
 } PacketRxEvent_t;
+
+typedef enum {
+    PACKET_RX_HEADER_OK = 0,
+    PACKET_RX_HEADER_CHECK,       // More than PACKET_HEADER_MAX_FIXED bits wrong
+    PACKET_RX_HEADER_FORMAT,      // Decoded, but a version, spacing or error correction this code doesn't know
+} PacketRxHeaderResult_t;
 
 typedef struct {
     PacketRxState_t state;
@@ -162,29 +173,34 @@ typedef struct {
     float32_t data_quality;       // Its quality (see above)
     uint32_t data_count;          // Data symbols decided so far in this packet
     // Set with PACKET_RX_EVENT_HEADER_FAILED / PACKET (and kept until the next one):
-    uint32_t length;              // Payload length from the header
+    PacketRxHeaderResult_t header_result;
+    uint32_t header_fixed;        // Header bits the code corrected (0 .. 3; with CHECK, 0)
+    uint32_t spacing;             // Payload bins per symbol, from the header (PACKET only)
+    uint32_t length;              // Payload length from the header (PACKET only)
     bool crc_ok;                  // CRC-16 good (PACKET only)
     float32_t min_margin;         // Lowest data decision margin in the packet
     uint32_t weakest_symbol;      // Which data symbol it was (0 = first after B)
     uint32_t weak_symbols;        // Data decisions with a margin below PACKET_RX_WEAK_MARGIN
 } PacketRxStatus_t;
 
-// Data symbols in the longest packet (header, payload and CRC at the fewest
-// bits per symbol)
-#define PACKET_RX_MAX_DATA_SYMBOLS ((8u * PACKET_MAX_BYTES + PACKET_MIN_BITS_PER_SYMBOL - 1u) / PACKET_MIN_BITS_PER_SYMBOL)
+// Data symbols in the longest packet (header, then payload and CRC at the
+// fewest bits per symbol)
+#define PACKET_RX_MAX_DATA_SYMBOLS (PACKET_HEADER_SYMBOLS \
+    + (8u * PACKET_MAX_BYTES + PACKET_MIN_BITS_PER_SYMBOL - 1u) / PACKET_MIN_BITS_PER_SYMBOL)
 
 // One data symbol's decision, kept for measurement (how wrong decisions
 // look, for choosing error correction)
 typedef struct {
-    uint8_t symbol;               // The symbol decided (before Gray decoding)
+    uint8_t symbol;               // The symbol decided (before Gray decoding): for the header,
+                                  // 0 .. 7 at spacing 8; for the payload, at its spacing
     uint8_t second;               // The runner-up
     uint16_t margin;              // Its margin in thousandths (1000 = a tie), at most 65535
 } PacketRxDecision_t;
 
 typedef struct {
     uint32_t bins;                // Folded spectrum length
-    uint32_t bits_per_symbol;     // 4 .. 6
-    uint32_t bins_per_symbol;
+    uint32_t bits_per_symbol;     // PAYLOAD: the payload's, from the header (4 .. 6)
+    uint32_t bins_per_symbol;     // PAYLOAD: the payload's spacing
     float32_t *history;           // PACKET_RX_HISTORY frames of folded power (ring)
     float32_t *previous;          // Previous frame, as a correlation vector
     float32_t *reference;         // A's average, as a correlation vector
@@ -197,10 +213,12 @@ typedef struct {
     int32_t lock_moved;           // Bins the caller moved the window since the last lock
     uint32_t next_data_frame;     // HEADER, PAYLOAD: next frame to decide
     float32_t centre[PACKET_RX_HISTORY]; // The decoder's refined centre per frame (bins, ring)
-    uint32_t data_total;          // PAYLOAD: data symbols in this packet
+    uint32_t data_total;          // PAYLOAD: data symbols in this packet (header included)
+    uint32_t header_code;         // HEADER: the codeword's bits so far
     uint32_t bit_count;           // Bits collected into bytes
     uint32_t low_quality;         // Consecutive data frames below PACKET_RX_MIN_QUALITY
-    uint8_t bytes[PACKET_MAX_BYTES]; // Header, payload (descrambled once complete), CRC-16
+    uint8_t bytes[2u + PACKET_MAX_BYTES]; // Header (2 bytes, for the CRC), payload (descrambled once
+                                          // complete), CRC-16
     PacketRxDecision_t decisions[PACKET_RX_MAX_DATA_SYMBOLS]; // This packet's data symbols so far (status.data_count)
     PacketRxStatus_t status;
 } PacketRx_t;
@@ -208,7 +226,6 @@ typedef struct {
 void packet_rx_init(
     PacketRx_t *rx,
     uint32_t bins,
-    uint32_t bits_per_symbol,
     float32_t *storage,
     ChannelTemplate_t *tmpl
 );

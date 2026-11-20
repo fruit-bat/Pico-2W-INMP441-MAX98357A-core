@@ -49,7 +49,7 @@ typedef struct {
 
 static const SettingDef_t SETTINGS[SETTING_COUNT] = {
     [SETTING_LINK_SPACING] = { "link.spacing", NULL, 1, 4, SPACINGS, 3, 4, "bins",
-                               "Bins between symbols (4 bits/symbol at 4, 5 at 2, 6 at 1); both boards must match" },
+                               "Bins between symbols in packets sent and the test modes (4 bits/symbol at 4, 5 at 2, 6 at 1); packet receivers follow the header" },
     [SETTING_TX_VOLUME]    = { "tx.volume", NULL, -55, -1, NULL, 0, -28, "dBFS", "Transmit level" },
     [SETTING_RX_ALIGN]     = { "rx.align", OFF_ON, 0, 1, NULL, 0, 1, "",
                                "Move the receive window onto the earliest path when a preamble is found" },
@@ -102,8 +102,8 @@ static const StatusDef_t STATUS[] = {
     S_U("count.records_dropped", records_dropped, "Per-frame records lost between the cores"),
     S_U("count.good", good, "Packets received with a good CRC"),
     S_U("count.bad", bad, "Packets received with a bad CRC"),
-    S_U("count.header_failed", header_failed, "Headers with a bad CRC-8"),
-    S_U("count.lost", lost, "Packets abandoned part-way (signal gone, spacing change, reset rx, transmitting)"),
+    S_U("count.header_failed", header_failed, "Headers with too many wrong bits, or an unknown format"),
+    S_U("count.lost", lost, "Packets abandoned part-way (signal gone, reset rx, transmitting)"),
     S_U("count.rx_dropped", rx_dropped, "Received packets lost between the cores"),
     S_U("count.events_dropped", events_dropped, "Events dropped because the host was not reading"),
     S_U("count.link_errors", link_errors, "Lines from the host that failed their check (or were too long to check)"),
@@ -1023,22 +1023,23 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
             n = snprintf(line, size, "* rx.tone seq=%lu frame=%lu\n", seq, frame);
             break;
         case PROTO_EV_RX_HEADER_FAILED:
-            n = snprintf(line, size, "* rx.header_failed seq=%lu frame=%lu length=%lu\n", seq, frame,
-                (unsigned long)e->u.header_failed.length);
+            n = snprintf(line, size, "* rx.header_failed seq=%lu frame=%lu reason=%s\n", seq, frame,
+                e->u.header_failed.format ? "format" : "check");
             break;
         case PROTO_EV_RX_LOST:
         {
-            static const char *const REASONS[] = { "signal", "spacing", "reset", "transmit" };
+            static const char *const REASONS[] = { "signal", "reset", "transmit" };
             const uint32_t r = (uint32_t)e->u.lost.reason;
             n = snprintf(line, size, "* rx.lost seq=%lu frame=%lu symbols=%lu reason=%s\n", seq, frame,
-                (unsigned long)e->u.lost.symbols, r < 4u ? REASONS[r] : "?");
+                (unsigned long)e->u.lost.symbols, r < 3u ? REASONS[r] : "?");
         }
             break;
         case PROTO_EV_RX_PACKET: {
             uint32_t len = e->u.packet.length;
             if (len > PROTOCOL_PAYLOAD_MAX) len = PROTOCOL_PAYLOAD_MAX;
-            n = snprintf(line, size, "* rx.packet seq=%lu frame=%lu crc=%s len=%lu min_margin=%.3f weakest=%lu weak=%lu hex=",
-                seq, frame, e->u.packet.crc_ok ? "ok" : "bad", (unsigned long)len, (double)e->u.packet.min_margin,
+            n = snprintf(line, size, "* rx.packet seq=%lu frame=%lu crc=%s len=%lu spacing=%lu fixed=%lu min_margin=%.3f weakest=%lu weak=%lu hex=",
+                seq, frame, e->u.packet.crc_ok ? "ok" : "bad", (unsigned long)len, (unsigned long)e->u.packet.spacing,
+                (unsigned long)e->u.packet.fixed, (double)e->u.packet.min_margin,
                 (unsigned long)e->u.packet.weakest, (unsigned long)e->u.packet.weak);
             for (uint32_t i = 0; i < len; i++) {
                 line[n++] = HEX[e->u.packet.payload[i] >> 4];
