@@ -38,7 +38,8 @@ uint32_t __not_in_flash_func(channel_template_decide)(
     uint32_t first_bin,
     uint32_t step,
     uint32_t count,
-    float32_t *margin
+    float32_t *margin,
+    uint32_t *second_i
 ) {
     const uint32_t n = t->bins;
     float32_t *amp = t->work;
@@ -49,7 +50,7 @@ uint32_t __not_in_flash_func(channel_template_decide)(
     }
 
     float32_t best = -1.0f, second = -1.0f;
-    uint32_t best_i = 0;
+    uint32_t best_i = 0, runner_up = 0;
     for (uint32_t i = 0; i < count; i++) {
         const uint32_t bin = (first_bin + i * step) % n;
         float32_t score = 0.0f;
@@ -63,15 +64,18 @@ uint32_t __not_in_flash_func(channel_template_decide)(
         }
         if (score > best) {
             second = best;
+            runner_up = best_i;
             best = score;
             best_i = i;
         } else if (score > second) {
             second = score;
+            runner_up = i;
         }
     }
 
     if (margin != NULL) {
         *margin = second > 0.0f ? best / second : (best > 0.0f ? 1e9f : 1.0f);
     }
+    if (second_i != NULL) *second_i = runner_up;
     return best_i;
 }

@@ -57,14 +57,16 @@ void channel_template_learn(ChannelTemplate_t *t, const float32_t *folded_power,
 
 // Decides between count candidate bins first_bin + i * step (mod bins),
 // i = 0 .. count - 1, returning the best i. If margin is not NULL it
-// receives the best score over the second best (>= 1; near 1 means unsure).
+// receives the best score over the second best (>= 1; near 1 means unsure),
+// and if second is not NULL it receives the second best i (the runner-up).
 uint32_t channel_template_decide(
     const ChannelTemplate_t *t,
     const float32_t *folded_power,
     uint32_t first_bin,
     uint32_t step,
     uint32_t count,
-    float32_t *margin
+    float32_t *margin,
+    uint32_t *second
 );
 
 #endif // CHANNEL_TEMPLATE_H

@@ -28,7 +28,7 @@
 
 // The host talks to the board over USB serial with the protocol in
 // protocol.md (src/protocol.c); tools/chirp_host.py is a client.
-#define FIRMWARE_VERSION "0.2.1"
+#define FIRMWARE_VERSION "0.2.2"
 
 // The chirp sweeps CHIRP_BINS FFT bins (64 bins = 2.76 kHz from F0). Symbols
 // are spaced bins_per_symbol bins apart (setting link.spacing: 1, 2 or 4 while
@@ -167,12 +167,16 @@ typedef struct {
 static uint8_t rx_record_storage[SPSC_RING_STORAGE_LEN(sizeof(RxFrameRecord_t), RX_RECORD_QUEUE_CAPACITY)];
 static SpscRing_t rx_record_queue;
 
-// A packet received by core 1 (good or bad), for core 0. Pushed just before
-// the record whose packet.event is PACKET_RX_EVENT_PACKET; that record's
-// packet fields hold the details (CRC, margins).
+// A packet received by core 1 (good or bad, or a failed header), for core 0.
+// Pushed just before the record whose packet.event is PACKET_RX_EVENT_PACKET
+// or HEADER_FAILED; that record's packet fields hold the details (CRC,
+// margins).
 typedef struct {
-    uint32_t length;
+    uint32_t frame;  // The record's frame (to match them up)
+    uint32_t length; // Payload bytes (0 for a failed header)
     uint8_t payload[PACKET_MAX_PAYLOAD];
+    uint32_t decision_count;
+    ProtocolDecision_t decisions[PACKET_RX_MAX_DATA_SYMBOLS]; // For rx.symbols
 } RxPacket_t;
 
 static uint8_t rx_packet_storage[SPSC_RING_STORAGE_LEN(sizeof(RxPacket_t), RX_PACKET_QUEUE_CAPACITY)];
@@ -438,11 +442,20 @@ static void __not_in_flash_func(process_rx_block)(uint32_t frame) {
         if (packet_align && record.packet.event == PACKET_RX_EVENT_TRAINED && record.packet.realign_bins != 0) {
             record.train_moved = move_window(record.delay, record.packet.realign_bins, 0.0f);
         }
-        // A complete packet: to core 0 ahead of this frame's record
-        if (record.packet.event == PACKET_RX_EVENT_PACKET) {
+        // A complete packet (or a failed header): to core 0 ahead of this
+        // frame's record, with its symbol decisions
+        if (record.packet.event == PACKET_RX_EVENT_PACKET || record.packet.event == PACKET_RX_EVENT_HEADER_FAILED) {
             static RxPacket_t rx_packet; // Static: core 1's stack is small
-            rx_packet.length = record.packet.length;
+            rx_packet.frame = frame;
+            rx_packet.length = record.packet.event == PACKET_RX_EVENT_PACKET ? record.packet.length : 0u;
             memcpy(rx_packet.payload, packet_rx_payload(&packet_rx), rx_packet.length);
+            const uint32_t count = record.packet.data_count < PACKET_RX_MAX_DATA_SYMBOLS
+                ? record.packet.data_count : PACKET_RX_MAX_DATA_SYMBOLS;
+            const PacketRxDecision_t *d = packet_rx_decisions(&packet_rx);
+            for (uint32_t i = 0; i < count; i++) {
+                rx_packet.decisions[i] = (ProtocolDecision_t){ d[i].symbol, d[i].second, d[i].margin };
+            }
+            rx_packet.decision_count = count;
             if (!spsc_ring_push(&rx_packet_queue, &rx_packet)) rx_packets_dropped++;
         }
     } else {
@@ -698,6 +711,16 @@ static const ProtocolBoard_t board = {
     // save/load: no flash storage yet ("save" answers err 452)
 };
 
+// Core 0: the packet core 1 queued just before the record for this frame;
+// false (and an empty packet) if it is missing (the queue was full)
+static RxPacket_t rx_packet_in;
+static bool pop_rx_packet(uint32_t frame) {
+    if (spsc_ring_pop(&rx_packet_queue, &rx_packet_in) && rx_packet_in.frame == frame) return true;
+    rx_packet_in.length = 0;
+    rx_packet_in.decision_count = 0;
+    return false;
+}
+
 // Core 0: one record from core 1 -> events and stream lines
 static void handle_record(const RxFrameRecord_t *r) {
     const PacketRxStatus_t *st = &r->packet;
@@ -744,6 +767,10 @@ static void handle_record(const RxFrameRecord_t *r) {
             rx_view.header_failed++;
             e.type = PROTO_EV_RX_HEADER_FAILED;
             e.u.header_failed.length = st->length;
+            if (pop_rx_packet(r->frame)) {
+                e.decision_count = rx_packet_in.decision_count;
+                e.decisions = rx_packet_in.decisions;
+            }
             break;
         case PACKET_RX_EVENT_LOST:
             rx_view.lost++;
@@ -753,16 +780,18 @@ static void handle_record(const RxFrameRecord_t *r) {
             break;
         case PACKET_RX_EVENT_PACKET: {
             // Its payload was queued just before this record
-            static RxPacket_t rx_packet;
-            if (!spsc_ring_pop(&rx_packet_queue, &rx_packet)) rx_packet.length = 0;
+            if (pop_rx_packet(r->frame)) {
+                e.decision_count = rx_packet_in.decision_count;
+                e.decisions = rx_packet_in.decisions;
+            }
             if (st->crc_ok) rx_view.good++; else rx_view.bad++;
             e.type = PROTO_EV_RX_PACKET;
             e.u.packet.crc_ok = st->crc_ok;
-            e.u.packet.length = rx_packet.length;
+            e.u.packet.length = rx_packet_in.length;
             e.u.packet.min_margin = st->min_margin;
             e.u.packet.weakest = st->weakest_symbol;
             e.u.packet.weak = st->weak_symbols;
-            e.u.packet.payload = rx_packet.payload;
+            e.u.packet.payload = rx_packet_in.payload;
             break;
         }
         default:

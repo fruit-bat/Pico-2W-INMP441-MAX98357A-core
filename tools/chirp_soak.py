@@ -32,6 +32,15 @@ Outcomes (the receiver's conclusion, see protocol.md):
 moved_back: samples the receiver moved its window back after training,
 because the lock's move had gone to a long echo's wrapped image (packet_rx.h).
 
+Symbol decisions: the receiver is set to rx.symbols=on, so each packet (and
+each failed header) is followed by every data symbol it decided, with the
+runner-up and the margin. They are compared with the symbols sent (rebuilt
+here from the payload, as packet_tx does): decided, wrong (data symbol
+numbers, header first), header_wrong (how many of the header's symbols),
+wrong_second (how many wrong ones had the right symbol as runner-up),
+wrong_ranks (each wrong one's rank by margin in its packet, 1 = the lowest),
+and the raw symbols / second / margins. "summary" adds an error table.
+
 The CSV has one row per packet, plus one "idle" row per idle period. The
 settings each board had are put back afterwards (also after Ctrl-C).
 """
@@ -58,6 +67,7 @@ COLUMNS = ["time", "seed", "dir", "spacing", "volume", "length", "n", "outcome",
            "locks", "false_before", "crc", "rx_len", "min_margin", "weakest", "weak",
            "align", "fraction", "moved", "b_start", "coherence", "strongest", "earliest", "moved_back", "rx_delay",
            "byte_errors", "bit_errors", "symbol_errors", "error_symbols",
+           "decided", "wrong", "header_wrong", "wrong_second", "wrong_ranks", "symbols", "second", "margins",
            "tx_frames", "idle_s", "lost_events", "bad_lines"]
 
 
@@ -72,6 +82,81 @@ def data_symbols(length, spacing):
 
 def payload_for(seed, n, length):
     return random.Random("%d:%d" % (seed, n)).randbytes(length)
+
+
+def crc8(data):
+    """CRC-8, polynomial 0x07, initial 0 (packet_format.h)."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+
+def crc16(data):
+    """CRC-16/CCITT-FALSE (packet_format.h)."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def scramble(data):
+    """XOR with the symbol_sequence LFSR's 8-bit symbols (packet_scramble)."""
+    lfsr, out = 0xACE1, bytearray()
+    for byte in data:
+        v = 0
+        for _ in range(8):
+            bit = lfsr & 1
+            lfsr >>= 1
+            if bit:
+                lfsr ^= 0xB400
+            v = (v << 1) | bit
+        out.append(byte ^ v)
+    return bytes(out)
+
+
+def gray_symbol(value):
+    """The symbol whose Gray code is value (packet_gray_symbol)."""
+    symbol, shift = value, value >> 1
+    while shift:
+        symbol ^= shift
+        shift >>= 1
+    return symbol
+
+
+def sent_symbols(payload, spacing):
+    """The data symbols packet_tx sends for this payload (header first)."""
+    header = bytes([len(payload), crc8([len(payload)])])
+    crc = crc16(header + payload)
+    stream = header + scramble(payload) + bytes([crc >> 8, crc & 0xFF])
+    b = bits_per_symbol(spacing)
+    bits = "".join("{:08b}".format(x) for x in stream)
+    bits += "0" * (-len(bits) % b)
+    return [gray_symbol(int(bits[i:i + b], 2)) for i in range(0, len(bits), b)]
+
+
+def header_symbols(spacing):
+    return -(-HEADER_BITS // bits_per_symbol(spacing))
+
+
+def check_decisions(sent, ev, spacing):
+    """Columns from an rx.symbols event, against the symbols sent."""
+    got = bytes.fromhex(ev.raw("symbols"))
+    second = bytes.fromhex(ev.raw("second"))
+    text = ev.raw("margins")
+    margins = [int(m) for m in text.split(",")] if text else []
+    wrong = [i for i, g in enumerate(got) if i >= len(sent) or g != sent[i]]
+    order = sorted(range(len(got)), key=lambda i: (margins[i], i))
+    rank = {i: r + 1 for r, i in enumerate(order)}
+    return dict(decided=len(got), wrong=";".join(map(str, wrong)),
+                header_wrong=sum(1 for i in wrong if i < header_symbols(spacing)),
+                wrong_second=sum(1 for i in wrong if i < len(sent) and second[i] == sent[i]),
+                wrong_ranks=";".join(str(rank[i]) for i in wrong),
+                symbols=ev.raw("symbols"), second=ev.raw("second"), margins=text)
 
 
 def compare(sent, got, spacing):
@@ -160,9 +245,9 @@ def count_locks(events):
 def judge(events):
     """The packet's outcome from the receiver's events in its window, plus
     the rx.locked and rx.trained events that led to it."""
-    locked = trained = None
+    locked = trained = decisions = None
     outcome, packet = None, None
-    for e in events:
+    for k, e in enumerate(events):
         if e.name == "rx.locked":
             locked, trained = e, None
         elif e.name == "rx.trained":
@@ -170,15 +255,21 @@ def judge(events):
         elif e.name == "rx.packet" and packet is None:
             packet = e
             outcome = "ok" if e["crc"] == "ok" else "crc_bad"
-            break
         elif e.name in CONCLUSIONS:
             outcome = e.name[3:] if e.name != "rx.lost" else "lost:%s" % e.raw("reason")
+        else:
+            continue
+        # rx.symbols follows a packet or a failed header straight away
+        nxt = events[k + 1] if k + 1 < len(events) else None
+        decisions = nxt if nxt is not None and nxt.name == "rx.symbols" else None
+        if packet is not None:
+            break
     if outcome is None:
         if locked is None:
             outcome = "no_lock"
         else:
             outcome = "unconcluded"
-    return outcome, packet, locked, trained
+    return outcome, packet, locked, trained, decisions
 
 
 class Soak:
@@ -271,7 +362,7 @@ class Soak:
         events = watcher.take_rx()
         tx_events = watcher.take_tx()
 
-        outcome, p, locked, trained = judge(events)
+        outcome, p, locked, trained, decisions = judge(events)
         done = next((e for e in tx_events if e.name == "tx.done" and e["id"] == pid), None)
         start = next((e for e in tx_events if e.name == "tx.start" and e["id"] == pid), None)
         if not sent or done is None:
@@ -296,6 +387,8 @@ class Soak:
                 byte_errors, bit_errors, symbols = compare(payload, got, spacing)
                 row.update(byte_errors=byte_errors, bit_errors=bit_errors, symbol_errors=len(symbols),
                            error_symbols=";".join(str(s) for s in symbols))
+        if decisions is not None and outcome in ("ok", "crc_bad", "header_failed"):
+            row.update(check_decisions(sent_symbols(payload, spacing), decisions, spacing))
         row["rx_delay"] = rx.get("rx.delay")["rx.delay"]
         lost, bad = (x - y for x, y in zip(self._health(), health))
         row.update(lost_events=lost, bad_lines=bad)
@@ -304,8 +397,8 @@ class Soak:
         detail = ""
         if p is not None:
             detail = " margin %s" % p.raw("min_margin")
-            if row.get("symbol_errors"):
-                detail += ", %s symbol errors" % row["symbol_errors"]
+        if row.get("wrong"):
+            detail += ", wrong symbols %s (ranks %s)" % (row["wrong"], row["wrong_ranks"])
         if lost or bad:
             detail += "  [events lost %d, bad lines %d: don't trust this row]" % (lost, bad)
         print("%s spacing %d %+d dB %d bytes #%d: %s%s"
@@ -359,6 +452,44 @@ def summary(rows, file=sys.stdout):
                  "%.2f" % (sum(sym) / len(sym)) if sym else "-",
                  sum(1 for r in packets if r.get("moved_back") not in (None, "", "+0", "0")),
                  untrusted)
+        print("  ".join(str(c).rjust(w) for c, w in zip(cells, widths)), file=file)
+
+    errors(rows, groups, file)
+
+
+def errors(rows, groups, file=sys.stdout):
+    """Symbol decisions against what was sent (rows with rx.symbols only).
+
+    wrong/pkt: packets (ok or crc_bad) with 0, 1, 2, 3+ wrong data symbols.
+    hdr_wrong: failed headers with 1, 2, 3+ wrong header symbols.
+    2nd_right: wrong symbols whose runner-up was the symbol sent.
+    rank<=1/2/4: wrong symbols among the 1, 2, 4 lowest margins in their packet.
+    """
+    if not any(r.get("decided") for r in rows):
+        return
+    print("\nSymbol decisions (wrong/pkt: 0/1/2/3+ wrong symbols; hdr_wrong: failed headers with 1/2/3+)",
+          file=file)
+    head = ("dir", "spc", "vol", "len", "pkts", "wrong/pkt", "hdr_fail", "hdr_wrong", "wrong", "2nd_right",
+            "rank<=1/2/4")
+    widths = (5, 3, 4, 4, 5, 14, 8, 10, 6, 9, 14)
+    print("  ".join(h.rjust(w) for h, w in zip(head, widths)), file=file)
+    for key in sorted(groups, key=lambda k: (k[1], -k[2], k[3], k[0])):
+        rs = [r for r in groups[key] if r.get("decided")]
+        if not rs:
+            continue
+        pk = [r for r in rs if r["outcome"] in ("ok", "crc_bad")]
+        hf = [r for r in rs if r["outcome"] == "header_failed"]
+
+        def count(r):
+            return len(r["wrong"].split(";")) if r["wrong"] else 0
+        dist = [sum(1 for r in pk if min(count(r), 3) == k) for k in range(4)]
+        hdist = [sum(1 for r in hf if min(max(int(r["header_wrong"] or 0), 1), 3) == k) for k in (1, 2, 3)]
+        ranks = [int(x) for r in rs if r["wrong_ranks"] for x in r["wrong_ranks"].split(";")]
+        second = sum(int(r["wrong_second"] or 0) for r in rs)
+        n = len(ranks)
+        cells = (key[0], key[1], key[2], key[3], len(rs), "/".join(map(str, dist)), len(hf),
+                 "/".join(map(str, hdist)), n, "%d%%" % (100 * second // n) if n else "-",
+                 "/".join("%d%%" % (100 * sum(1 for x in ranks if x <= k) // n) for k in (1, 2, 4)) if n else "-")
         print("  ".join(str(c).rjust(w) for c, w in zip(cells, widths)), file=file)
 
 
@@ -421,7 +552,8 @@ def main():
     try:
         hellos = [b.hello() for b in boards]
         for b in boards:
-            restore.append((b, b.get("link.spacing", "tx.volume", "rx.during_tx")))
+            restore.append((b, b.get("link.spacing", "tx.volume", "rx.during_tx", "rx.symbols")))
+            b.set({"rx.symbols": "on"})
         new = not (args.append and os.path.exists(args.output) and os.path.getsize(args.output) > 0)
         with open(args.output, "w" if new else "a", newline="") as out:
             soak = Soak(boards, labels, args, out)

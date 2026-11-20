@@ -70,6 +70,7 @@ typedef struct {
     int32_t realigned;            // realign_bins at the last TRAINED (0: none)
     double final_offset;          // Window offset at the end (after any moves)
     PacketRxStatus_t last_trained;
+    uint32_t decisions_ok;        // Packets whose kept decisions are all the symbols sent
 } Events_t;
 
 // A ghost for the lock to fall for: with 'align', the window is moved this
@@ -127,6 +128,15 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
                 e.last_packet = *st;
                 if (st->crc_ok && st->length == sent_length
                         && memcmp(packet_rx_payload(&prx), sent_payload, sent_length) == 0) e.good++;
+                {
+                    const PacketRxDecision_t *d = packet_rx_decisions(&prx);
+                    bool same = st->data_count == packet_symbol_count(sent_length, prx.bits_per_symbol) - PACKET_PREAMBLE_LEN;
+                    for (uint32_t i = 0; same && i < st->data_count; i++) {
+                        same = d[i].symbol == stream[LEAD + PACKET_PREAMBLE_LEN + i] && d[i].second != d[i].symbol
+                            && d[i].margin >= 1000u;
+                    }
+                    if (same) e.decisions_ok++;
+                }
                 break;
             default: break;
         }
@@ -337,6 +347,7 @@ static void test_packets(void) {
         CHECK_EQ_U(e.good, 1);
         CHECK_EQ_U(e.lost, 0);
         CHECK_EQ_U(e.realigned, 0); // A right lock is left alone, even with echoes as strong as the direct path
+        CHECK_EQ_U(e.decisions_ok, 1); // The decisions kept for rx.symbols are the symbols sent
     }
     rig_setup_spacing(1);
 }

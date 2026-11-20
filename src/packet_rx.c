@@ -224,6 +224,10 @@ const uint8_t *packet_rx_payload(const PacketRx_t *rx) {
     return &rx->bytes[PACKET_HEADER_BYTES];
 }
 
+const PacketRxDecision_t *packet_rx_decisions(const PacketRx_t *rx) {
+    return rx->decisions;
+}
+
 static void back_to_search(PacketRx_t *rx) {
     rx->status.state = PACKET_RX_SEARCH;
     rx->agree = 0;
@@ -251,8 +255,9 @@ static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *fo
     PacketRxStatus_t *st = &rx->status;
     const uint32_t b = rx->bits_per_symbol;
     float32_t margin;
+    uint32_t second;
     const uint32_t symbol = channel_template_decide(
-        rx->tmpl, folded_power, 0, rx->bins_per_symbol, 1u << b, &margin);
+        rx->tmpl, folded_power, 0, rx->bins_per_symbol, 1u << b, &margin, &second);
     st->data_symbol = symbol;
     st->data_margin = margin;
     st->data_quality = frame_quality(rx, folded_power);
@@ -267,6 +272,12 @@ static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *fo
         st->weakest_symbol = st->data_count;
     }
     if (margin < PACKET_RX_WEAK_MARGIN) st->weak_symbols++;
+    if (st->data_count < PACKET_RX_MAX_DATA_SYMBOLS) {
+        PacketRxDecision_t *d = &rx->decisions[st->data_count];
+        d->symbol = (uint8_t)symbol;
+        d->second = (uint8_t)second;
+        d->margin = margin < 65.535f ? (uint16_t)lroundf(margin * 1000.0f) : 65535u;
+    }
     st->data_count++;
     const uint32_t value = packet_gray_value(symbol);
     for (uint32_t k = b; k-- > 0;) {

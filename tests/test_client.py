@@ -62,15 +62,46 @@ class Soak(unittest.TestCase):
         lost = E("* rx.lost seq=3 frame=40 symbols=5 reason=signal")
         self.assertEqual(chirp_soak.judge([])[0], "no_lock")
         self.assertEqual(chirp_soak.judge([locked])[0], "unconcluded")
-        outcome, p, l, t = chirp_soak.judge([locked, trained, bad])
-        self.assertEqual((outcome, p, l, t), ("crc_bad", bad, locked, trained))
+        outcome, p, l, t, d = chirp_soak.judge([locked, trained, bad])
+        self.assertEqual((outcome, p, l, t, d), ("crc_bad", bad, locked, trained, None))
+        # rx.symbols straight after the packet, or after a failed header
+        sym = E("* rx.symbols seq=4 frame=60 count=1 symbols=03 second=02 margins=1002")
+        self.assertIs(chirp_soak.judge([locked, trained, bad, sym])[4], sym)
+        failed = E("* rx.header_failed seq=3 frame=24 length=200")
+        outcome, p, l, t, d = chirp_soak.judge([locked, trained, failed, sym])
+        self.assertEqual((outcome, p, d), ("header_failed", None, sym))
         self.assertEqual(chirp_soak.judge([locked, trained, lost])[0], "lost:signal")
         # A false lock that gave up, then the real packet: the packet's own lock is reported
         early = E("* rx.locked seq=0 frame=1 align=+3 fraction=+0.000 moved=+48")
         tone = E("* rx.tone seq=0 frame=5")
-        outcome, p, l, t = chirp_soak.judge([early, tone, locked, trained, bad])
+        outcome, p, l, t, d = chirp_soak.judge([early, tone, locked, trained, bad])
         self.assertEqual((outcome, l), ("crc_bad", locked))
         self.assertEqual(chirp_soak.judge([early, tone])[0], "tone")
+
+    def test_decisions(self):
+        # The symbols packet_tx sends for "Hi" (printed by the C, 2026-11-20)
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 4), [0, 3, 0, 11, 8, 10, 7, 12, 0, 13, 7, 2])
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 2), [0, 15, 5, 8, 20, 28, 31, 13, 15, 8])
+        self.assertEqual(chirp_soak.crc8(b"123456789"), 0xF4)
+        self.assertEqual(chirp_soak.crc16(b"123456789"), 0x29B1)
+        # Symbol 1 (header) and 9 wrong: 1's runner-up was right; margins rank 9 lowest, then 1
+        sent = chirp_soak.sent_symbols(b"Hi", 4)
+        got = list(sent)
+        got[1], got[9] = 2, 12
+        second = [0] * len(sent)
+        second[1] = 3
+        margins = [1500] * len(sent)
+        margins[1], margins[9], margins[4] = 1010, 1001, 1020
+        ev = chirp_host.Event("* rx.symbols seq=1 frame=2 count=%d symbols=%s second=%s margins=%s"
+                              % (len(got), bytes(got).hex(), bytes(second).hex(), ",".join(map(str, margins))))
+        c = chirp_soak.check_decisions(sent, ev, 4)
+        self.assertEqual((c["decided"], c["wrong"], c["header_wrong"], c["wrong_second"], c["wrong_ranks"]),
+                         (12, "1;9", 1, 1, "2;1"))
+        # A failed header: only the header's symbols come
+        ev = chirp_host.Event("* rx.symbols seq=1 frame=2 count=4 symbols=0003000c second=00000000 "
+                              "margins=1100,1200,1300,1050")
+        c = chirp_soak.check_decisions(sent, ev, 4)
+        self.assertEqual((c["decided"], c["wrong"], c["header_wrong"], c["wrong_ranks"]), (4, "3", 1, "1"))
 
     def test_run(self):
         import csv
@@ -90,6 +121,8 @@ class Soak(unittest.TestCase):
             self.assertEqual(len(packets), 8)  # 2 spacings x 2 lengths x 2
             self.assertEqual(len(rows) - len(packets), 4)  # An idle period per condition
             self.assertTrue(all(row["outcome"] == "ok" and row["bit_errors"] == "0" for row in packets))
+            # The simulator's rx.symbols are 3 made-up decisions, but they get through
+            self.assertTrue(all(row["decided"] == "3" and row["margins"] == "1500,1002,65535" for row in packets))
             for row in packets:  # Airtime as the board reported it
                 self.assertEqual(int(row["tx_frames"]), 16 + chirp_soak.data_symbols(int(row["length"]),
                                                                                       int(row["spacing"])))
@@ -100,6 +133,7 @@ class Soak(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             s = subprocess.run([sys.executable, tool, "summary", path], capture_output=True, text=True, timeout=30)
             table = [l.split() for l in s.stdout.splitlines()[1:]]
+            self.assertIn("Symbol decisions", s.stdout)
             self.assertIn(["A>A", "4", "-30", "4", "3", "3"], [t[:6] for t in table])
             with open(path) as f:
                 self.assertEqual(sum(1 for l in f if l.startswith("time,")), 1)

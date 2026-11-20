@@ -168,7 +168,7 @@ static void test_get(void) {
     CHECK(strcmp(all + strlen(all) - 6, "a7 ok\n") == 0);
 
     const char *rx = talk("a8 get rx.*\n");
-    CHECK_EQ_U(count_lines(rx), 3u + 2u + 3u + 5u + 1u);
+    CHECK_EQ_U(count_lines(rx), 4u + 2u + 3u + 5u + 1u);
 }
 
 static void test_list(void) {
@@ -279,6 +279,19 @@ static void test_send(void) {
     CHECK_STR(talk("q5 send text=hi\n"), "q5 err 505 send takes hex=<bytes>\n");
     CHECK_STR(talk("q6 send hex=\n"), "q6 ok id=2\n"); // An empty packet is allowed
     CHECK_STR(talk("q7 send hex=4A4b\n"), "q7 ok id=3\n"); // Either case
+}
+
+// rx.symbols=on: each packet is followed by its symbol decisions
+static void test_symbols(void) {
+    setup();
+    CHECK_STR(talk("r1 send hex=4869\n"), "r1 ok id=1\n");
+    fake_board_advance_frames(&fb, 30);
+    CHECK(strstr(drain(), "* rx.symbols") == NULL); // Off by default
+    CHECK_STR(talk("r2 set rx.symbols=on\nr3 send hex=4869\n"), "r2 ok\nr3 ok id=2\n");
+    fake_board_advance_frames(&fb, 30);
+    const char *s = drain();
+    CHECK(strstr(s, "hex=4869\n* rx.symbols seq=") != NULL);
+    CHECK(strstr(s, " count=3 symbols=013f07 second=020006 margins=1500,1002,65535\n") != NULL);
 }
 
 // Events can come before or after a reply, but lines are whole, a reply's
@@ -728,6 +741,7 @@ int main(void) {
     RUN_TEST(test_list);
     RUN_TEST(test_set);
     RUN_TEST(test_send);
+    RUN_TEST(test_symbols);
     RUN_TEST(test_ordering);
     RUN_TEST(test_abandoned);
     RUN_TEST(test_input);

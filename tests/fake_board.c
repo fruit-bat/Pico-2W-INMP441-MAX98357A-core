@@ -166,6 +166,9 @@ static void one_frame(FakeBoard_t *fb) {
                 e.u.packet.weakest = 0;
                 e.u.packet.weak = 0;
                 e.u.packet.payload = fb->current.payload;
+                static const ProtocolDecision_t decisions[] = { { 1, 2, 1500 }, { 0x3f, 0, 1002 }, { 7, 6, 65535 } };
+                e.decision_count = 3;
+                e.decisions = decisions;
                 event(fb, e);
             }
         }

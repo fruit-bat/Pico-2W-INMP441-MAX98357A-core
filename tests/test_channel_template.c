@@ -73,7 +73,7 @@ static Result_t run(const ChirpEcho_t *echoes, uint32_t echo_count, double snr_d
         r.frames++;
         offsets[(rx.symbol_index + rig_m - sent) % rig_m]++;
         const uint32_t s = channel_template_decide(&tmpl, rig_decoder.folded_power_buffer,
-            rotation, rig_bins_per_symbol, rig_m, NULL);
+            rotation, rig_bins_per_symbol, rig_m, NULL, NULL);
         if (s != sent) r.matched++;
     }
     uint32_t most = 0;

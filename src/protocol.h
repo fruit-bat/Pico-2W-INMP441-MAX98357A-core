@@ -71,6 +71,7 @@ typedef enum {
     SETTING_RX_ALIGN,         // off, on
     SETTING_RX_TRACKING,      // off, decision, pilot (as enum tracking_mode in main.c)
     SETTING_RX_DURING_TX,     // off, on
+    SETTING_RX_SYMBOLS,       // off, on: report each packet's symbol decisions (* rx.symbols)
     SETTING_TEST_MODE,        // loopback, mic, tone, chirp, sequence, packet (as enum test_mode)
     SETTING_TEST_SYMBOL,      // 0 .. symbols-1
     SETTING_COUNT
@@ -133,9 +134,21 @@ typedef enum {
     PROTO_EV_TX_DONE,
 } ProtocolEventType_t;
 
+// One data symbol decision (rx.symbols)
+typedef struct {
+    uint8_t symbol;   // Decided
+    uint8_t second;   // Runner-up
+    uint16_t margin;  // Margin in thousandths (1000 = a tie)
+} ProtocolDecision_t;
+
 typedef struct {
     ProtocolEventType_t type;
     uint32_t frame;
+    // RX_HEADER_FAILED, RX_PACKET: the data symbol decisions, header first
+    // (for "* rx.symbols", sent after the event when rx.symbols is on);
+    // only need to last for the protocol_event() call
+    uint32_t decision_count;
+    const ProtocolDecision_t *decisions;
     union {
         struct { int32_t align; float fraction; int32_t moved; } locked;
         struct { uint32_t b_start; float coherence; int32_t strongest, earliest, moved; } trained;

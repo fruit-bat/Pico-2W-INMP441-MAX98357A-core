@@ -145,6 +145,7 @@ items can only be read. Out-of-range values are rejected, never clamped.
 | `rx.align` | on, off | on | key `a` |
 | `rx.tracking` | off, decision, pilot | off | key `t` |
 | `rx.during_tx` | on, off | on | compile-time `PACKET_RX_WHILE_TRANSMITTING` |
+| `rx.symbols` | on, off | off | new: report each packet's symbol decisions (`* rx.symbols`), for measurement |
 | `test.mode` | packet, sequence, chirp, tone, mic, loopback | packet | keys `1`–`6` |
 | `test.symbol` | 0 .. symbols−1 | 0 | keys `o` `p` (chirp mode) |
 
@@ -194,6 +195,7 @@ come after `seq`.
 | `* rx.header_failed` | `frame length` | `# packet header failed` |
 | `* rx.lost` | `frame symbols reason=signal\|spacing\|reset\|transmit` | `# packet lost`. A packet given up part-way: the signal went, `link.spacing` changed, `reset rx`, or this board started sending with `rx.during_tx=off` |
 | `* rx.packet` | `frame crc=ok\|bad len min_margin weakest weak hex` | `# packet ...` |
+| `* rx.symbols` | `frame count symbols second margins` | new, only with `rx.symbols=on`: straight after `rx.packet` or `rx.header_failed`, every data symbol decided (header first): `symbols` and `second` (the runner-up) as 2 hex digits each, `margins` comma-separated in thousandths (1000 = a tie). For choosing error correction |
 | `* tx.start` | `frame id` | (new) |
 | `* tx.done` | `frame id result=sent\|abandoned` | (new). `abandoned`: cut short, e.g. by a `link.spacing` change, so a host waiting on that id always hears how it ended |
 | `* overflow` | `dropped=<n>` | (new) see Flow |

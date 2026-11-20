@@ -169,6 +169,18 @@ typedef struct {
     uint32_t weak_symbols;        // Data decisions with a margin below PACKET_RX_WEAK_MARGIN
 } PacketRxStatus_t;
 
+// Data symbols in the longest packet (header, payload and CRC at the fewest
+// bits per symbol)
+#define PACKET_RX_MAX_DATA_SYMBOLS ((8u * PACKET_MAX_BYTES + PACKET_MIN_BITS_PER_SYMBOL - 1u) / PACKET_MIN_BITS_PER_SYMBOL)
+
+// One data symbol's decision, kept for measurement (how wrong decisions
+// look, for choosing error correction)
+typedef struct {
+    uint8_t symbol;               // The symbol decided (before Gray decoding)
+    uint8_t second;               // The runner-up
+    uint16_t margin;              // Its margin in thousandths (1000 = a tie), at most 65535
+} PacketRxDecision_t;
+
 typedef struct {
     uint32_t bins;                // Folded spectrum length
     uint32_t bits_per_symbol;     // 4 .. 6
@@ -189,6 +201,7 @@ typedef struct {
     uint32_t bit_count;           // Bits collected into bytes
     uint32_t low_quality;         // Consecutive data frames below PACKET_RX_MIN_QUALITY
     uint8_t bytes[PACKET_MAX_BYTES]; // Header, payload (descrambled once complete), CRC-16
+    PacketRxDecision_t decisions[PACKET_RX_MAX_DATA_SYMBOLS]; // This packet's data symbols so far (status.data_count)
     PacketRxStatus_t status;
 } PacketRx_t;
 
@@ -211,6 +224,11 @@ const PacketRxStatus_t *packet_rx_frame(PacketRx_t *rx, const float32_t *folded_
 // After PACKET_RX_EVENT_PACKET: the payload (status.length bytes), valid
 // until the next frame is processed
 const uint8_t *packet_rx_payload(const PacketRx_t *rx);
+
+// After PACKET_RX_EVENT_HEADER_FAILED or PACKET: the packet's data symbol
+// decisions (status.data_count of them, header first), valid until the
+// next frame is processed
+const PacketRxDecision_t *packet_rx_decisions(const PacketRx_t *rx);
 
 // The caller has moved its window 'bins' bins earlier (bins * frame / bins
 // samples) from the next frame on: what was at bin k is now at bin k - bins.

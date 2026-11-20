@@ -56,6 +56,8 @@ static const SettingDef_t SETTINGS[SETTING_COUNT] = {
     [SETTING_RX_TRACKING]  = { "rx.tracking", TRACKING, 0, 2, NULL, 0, 0, "", "Symbol timing tracking" },
     [SETTING_RX_DURING_TX] = { "rx.during_tx", OFF_ON, 0, 1, NULL, 0, 1, "",
                                "Receive while transmitting (a board hears its own packets)" },
+    [SETTING_RX_SYMBOLS]   = { "rx.symbols", OFF_ON, 0, 1, NULL, 0, 0, "",
+                               "Report each packet's symbol decisions after it (* rx.symbols), for measurement" },
     [SETTING_TEST_MODE]    = { "test.mode", MODES, 0, 5, NULL, 0, 5, "", "What the transmitter does" },
     [SETTING_TEST_SYMBOL]  = { "test.symbol", NULL, 0, (int32_t)PROTOCOL_CHIRP_BINS - 1, NULL, 0, 0, "",
                                "Symbol sent in chirp mode; below link.symbols" },
@@ -966,6 +968,37 @@ static void emit_link_error(Protocol_t *p, const char *why) {
     emit(p, line, (uint32_t)n);
 }
 
+static char *put_uint(char *o, uint32_t v);
+
+// "* rx.symbols": the decisions as hex symbols, hex runners-up and margins
+// in thousandths (as many as fit in a line; count says how many)
+static void emit_symbols(Protocol_t *p, const ProtocolEvent_t *e) {
+    static const char HEX[] = "0123456789abcdef";
+    char *line = p->event_line;
+    const size_t size = sizeof p->event_line;
+    // Each decision takes 2 + 2 + up to 6 characters
+    const uint32_t room = (uint32_t)(PROTOCOL_OUT_LINE_MAX - PROTOCOL_CHECK_LEN - 100u) / 10u;
+    const uint32_t count = e->decision_count < room ? e->decision_count : room;
+    int n = snprintf(line, size, "* rx.symbols seq=%lu frame=%lu count=%lu symbols=", (unsigned long)p->next_seq++,
+        (unsigned long)e->frame, (unsigned long)count);
+    for (uint32_t i = 0; i < count; i++) {
+        line[n++] = HEX[(e->decisions[i].symbol >> 4) & 15];
+        line[n++] = HEX[e->decisions[i].symbol & 15];
+    }
+    n += snprintf(line + n, size - (size_t)n, " second=");
+    for (uint32_t i = 0; i < count; i++) {
+        line[n++] = HEX[(e->decisions[i].second >> 4) & 15];
+        line[n++] = HEX[e->decisions[i].second & 15];
+    }
+    n += snprintf(line + n, size - (size_t)n, " margins=");
+    for (uint32_t i = 0; i < count; i++) {
+        if (i) line[n++] = ',';
+        n = (int)(put_uint(line + n, e->decisions[i].margin) - line);
+    }
+    line[n++] = '\n';
+    emit(p, line, (uint32_t)n);
+}
+
 void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
     static const char HEX[] = "0123456789abcdef";
     char *line = p->event_line;
@@ -1023,6 +1056,11 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
             break;
     }
     if (n > 0) emit(p, line, (uint32_t)n);
+
+    if ((e->type == PROTO_EV_RX_HEADER_FAILED || e->type == PROTO_EV_RX_PACKET)
+        && p->settings.value[SETTING_RX_SYMBOLS] && e->decisions != NULL) {
+        emit_symbols(p, e);
+    }
 }
 
 // Queues a stream line if it leaves room for a whole reply and some events;
