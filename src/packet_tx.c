@@ -5,15 +5,16 @@
 void packet_tx_init(PacketTx_t *tx, uint32_t bits_per_symbol) {
     memset(tx, 0, sizeof(*tx));
     tx->bits_per_symbol = bits_per_symbol;
+    reed_solomon_init();
 }
 
-bool packet_tx_start(PacketTx_t *tx, const uint8_t *payload, uint32_t length) {
-    if (tx->busy || length > PACKET_MAX_PAYLOAD) return false;
+bool packet_tx_start(PacketTx_t *tx, const uint8_t *payload, uint32_t length, uint32_t ecc) {
+    if (tx->busy || length > PACKET_MAX_PAYLOAD || ecc > PACKET_ECC_RS2) return false;
 
     const PacketHeader_t h = {
         .version = PACKET_VERSION,
         .spacing = 64u >> tx->bits_per_symbol,
-        .ecc = PACKET_ECC_NONE,
+        .ecc = ecc,
         .length = length,
     };
     const uint32_t header = packet_header_pack(&h);
@@ -29,9 +30,11 @@ bool packet_tx_start(PacketTx_t *tx, const uint8_t *payload, uint32_t length) {
     packet_scramble(b, length);
     b[length] = (uint8_t)(crc >> 8);
     b[length + 1u] = (uint8_t)crc;
+    // Check bytes over what is sent (scrambled payload and CRC)
+    if (ecc == PACKET_ECC_RS2) reed_solomon_encode(b, length + PACKET_CRC_BYTES, &b[length + PACKET_CRC_BYTES]);
 
-    tx->byte_count = length + PACKET_CRC_BYTES;
-    tx->symbol_count = packet_symbol_count(length, tx->bits_per_symbol);
+    tx->byte_count = packet_coded_bytes(length, ecc);
+    tx->symbol_count = packet_symbol_count(length, ecc, tx->bits_per_symbol);
     tx->next = 0;
     tx->busy = true;
     return true;

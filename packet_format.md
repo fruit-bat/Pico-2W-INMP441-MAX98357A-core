@@ -36,13 +36,13 @@ The format is defined in symbols and bits so it works at any spacing.
 ## Packet layout
 
 ```
-| A: detect   | B: train + align   | H: header           | P: payload    | C: CRC-16 |
-| 8 x sym 0   | 8 known symbols    | 8 symbols at        | 0..63 bytes   | 16 bits   |
-|             |                    | spacing 8 (Golay)   | at the payload's spacing  |
+| A: detect   | B: train + align   | H: header           | P: payload    | C: CRC-16 | R: RS check  |
+| 8 x sym 0   | 8 known symbols    | 8 symbols at        | 0..63 bytes   | 16 bits   | 4 bytes, if  |
+|             |                    | spacing 8 (Golay)   | at the payload's spacing  | H says rs2   |
 ```
 
-The receiver needs no spacing setting: B is the same sound at every
-spacing, and H, at a fixed spacing, says what P and C use.
+The receiver needs no spacing or error correction setting: B is the same
+sound at every spacing, and H, at a fixed spacing, says what P, C and R use.
 
 ### A — detect (*8 frames* of symbol 0)
 
@@ -83,7 +83,7 @@ not, though in the model the difference was small.
 |---|---|
 | 2 | Format version: 0 |
 | 2 | Payload spacing: 0 = 1 bin (6 bits/symbol), 1 = 2 (5), 2 = 4 (4), 3 = reserved (for 8) |
-| 2 | Payload error correction: 0 = none; 1–3 reserved |
+| 2 | Payload error correction: 0 = none; 1 = rs2 (R below); 2, 3 reserved |
 | 6 | Payload length in bytes, 0..63 |
 
 The 12 bits (MSB first, in that order) are the message of an extended Golay
@@ -106,7 +106,7 @@ detect.
 The receiver decodes by trying all 4096 codewords (in Gray-code order, one
 XOR and a bit count each: well under a millisecond, once per packet).
 **Too many wrong bits** (`reason=check`) or **a format it doesn't know**
-(`reason=format`: another version, the reserved spacing, any error
+(`reason=format`: another version, the reserved spacing, a reserved error
 correction) ends the packet. `rx.packet` reports `fixed=`, the bits
 corrected.
 
@@ -136,13 +136,42 @@ Two optional, cheap steps on the bit stream (I'd include both):
   It changes nothing for error detection; it helps when forward error
   correction is added. The preamble is not Gray coded.
 
+### R — Reed–Solomon check bytes (`link.ecc=rs2`, the default; 2026-11-21)
+
+With error correction 1 in the header, 4 check bytes follow the CRC: a
+Reed–Solomon code over GF(256) on the bytes as sent (scrambled payload and
+CRC), so the receiver corrects **any 2 wrong bytes** in P, C and R before it
+descrambles and checks the CRC. The CRC then catches a wrong correction.
+Usual conventions (`reed_solomon.h`): field polynomial 0x11D, generator
+roots 2⁰..2³, check bytes last, the code shortened to the packet (at most 69
+bytes of the 255 it could cover). The receiver decodes once per packet
+(Berlekamp–Massey, Chien search, Forney; tens of microseconds on core 1).
+`rx.packet` reports `ecc=` and `corrected=` (bytes, or `failed`).
+
+Why (soak 4, 2026-11-21, `rx.symbols`): with the Golay header no packet
+failed in its header; of the 9 that failed their CRC, 8 had a single wrong
+symbol and 1 a run of 3. A symbol of 4–6 bits lies in one or two bytes, so
+one wrong symbol costs at most 2 bytes: 2 correctable bytes cover a wrong
+symbol wherever it falls, or two that fall within single bytes.
+
+Limits: 3 or more wrong bytes are refused, or now and then "corrected" into
+another codeword: about as often as a random word lies within 2 bytes of
+one, 0.4% for a 16-byte payload, 3.6% for 63 (`test_reed_solomon`); the
+CRC-16 then lets through 1 in 65536 of those. At 5 bits a symbol straddles
+a byte boundary 4 times in 5, so a single wrong symbol often uses up both
+bytes (2 of 5 corrections in the first board check). Marking the least
+certain decisions as erasures (the decoder then fixes up to 4 marked bytes)
+is the next step if the soaks show 2-byte failures.
+
+Cost: 32 bits, 8 symbols at 4 bits per symbol (0.19 s).
+
 ### Airtime examples
 
-| Payload | Symbols (A+B, H, P+C) at 4 bits | Time | At 6 bits |
-|---|---|---|---|
-| 0 bytes | 16 + 8 + 4 | 0.65 s | 0.63 s |
-| 16 bytes | 16 + 8 + 36 | 1.39 s | 1.11 s |
-| 63 bytes | 16 + 8 + 130 | 3.58 s | 2.58 s |
+| Payload | Symbols (A+B, H, P+C) at 4 bits | Time | At 6 bits | With rs2 (+R) at 4 bits | At 6 bits |
+|---|---|---|---|---|---|
+| 0 bytes | 16 + 8 + 4 | 0.65 s | 0.63 s | 16 + 8 + 12: 0.84 s | 0.77 s |
+| 16 bytes | 16 + 8 + 36 | 1.39 s | 1.11 s | 16 + 8 + 44: 1.58 s | 1.25 s |
+| 63 bytes | 16 + 8 + 130 | 3.58 s | 2.58 s | 16 + 8 + 138: 3.76 s | 2.69 s |
 
 The preamble is ~0.4 s; long payloads make it cheap, short ones do not.
 
@@ -160,8 +189,8 @@ SEARCH --detect--> LOCK --A ends--> TRAIN --B₇ seen--> HEADER --decoded--> PAY
 | LOCK | correlate with A's average spectrum | below 0.4 → TRAIN (B has started); over 16 frames → a steady tone, ignored until it changes |
 | TRAIN | keep frames | 2 frames after B should have ended: place B (best coherence, at least 0.3), learn the shape, report the strongest and earliest paths, and whether the lock's move was wrong (main.c then moves the window back) → HEADER (deciding any data frames already in); else → SEARCH |
 | HEADER | matched decisions (`channel_template_decide`) among the 8 spacing-8 symbols; collect 24 bits; Golay decode | at most 3 bits wrong and a known format → PAYLOAD, at the spacing it gives; else → SEARCH (`rx.header_failed reason=check\|format`) |
-| PAYLOAD | matched decisions; collect the payload and CRC bits | all symbols received → CHECK |
-| CHECK | descramble, CRC-16 (done in the same frame as the last symbol) | report the packet (good or bad) with its lowest margin, which symbol that was, and how many were below 1.2; main.c puts the payload on its own queue to core 0 → SEARCH |
+| PAYLOAD | matched decisions; collect the payload, CRC and any check bytes | all symbols received → CHECK |
+| CHECK | with rs2, Reed–Solomon correction; then descramble, CRC-16 (done in the same frame as the last symbol) | report the packet (good or bad) with its lowest margin, which symbol that was, and how many were below 1.2; main.c puts the payload on its own queue to core 0 → SEARCH |
 
 No timing tracking during the data yet: the crystals agree to 0.6 ppm, about
 0.2 samples over the longest packet, and each packet re-aligns from its A.
@@ -280,7 +309,7 @@ sent 10–19 bins the wrong way.
 ## Transmitter (core 1, one symbol per frame)
 
 ```
-IDLE (silence) --packet queued--> A (8) --> B (8) --> H, P, C --> IDLE
+IDLE (silence) --packet queued--> A (8) --> B (8) --> H, P, C, R --> IDLE
 ```
 
 Core 0 queues a packet (bytes) on a single-producer single-consumer ring,
@@ -324,5 +353,5 @@ spacing on every row.
    boards, before adding HEADER/PAYLOAD/CHECK.
 
 IP note: everything here is up-chirps, generic CRCs, a scrambler, Gray
-coding and a classic Golay code (not LoRa's Hamming coding chain or
-interleaver); it avoids the down-chirp sync. Patent details remain unverified.
+coding, a classic Golay code and a textbook Reed–Solomon code (not LoRa's
+Hamming coding chain or interleaver); it avoids the down-chirp sync. Patent details remain unverified.

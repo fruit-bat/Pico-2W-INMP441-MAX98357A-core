@@ -11,6 +11,7 @@ void packet_rx_init(
     float32_t *storage,
     ChannelTemplate_t *tmpl
 ) {
+    reed_solomon_init();
     rx->bins = bins;
     rx->bits_per_symbol = PACKET_HEADER_BITS_PER_SYMBOL;
     rx->bins_per_symbol = PACKET_HEADER_SPACING;
@@ -268,12 +269,13 @@ static void __not_in_flash_func(finish_header)(PacketRx_t *rx) {
     st->header_result = PACKET_RX_HEADER_OK;
     st->spacing = h.spacing;
     st->length = h.length;
+    st->ecc = h.ecc;
     rx->bins_per_symbol = h.spacing;
     rx->bits_per_symbol = (uint32_t)__builtin_ctz(rx->bins / h.spacing);
     rx->bytes[0] = (uint8_t)(bits >> 8);
     rx->bytes[1] = (uint8_t)bits;
     rx->bit_count = 0;
-    rx->data_total = PACKET_HEADER_SYMBOLS + packet_payload_symbol_count(h.length, rx->bits_per_symbol);
+    rx->data_total = PACKET_HEADER_SYMBOLS + packet_payload_symbol_count(h.length, h.ecc, rx->bits_per_symbol);
     st->state = PACKET_RX_PAYLOAD;
 }
 
@@ -324,6 +326,8 @@ static void __not_in_flash_func(decide_data)(PacketRx_t *rx, const float32_t *fo
     if (st->data_count >= rx->data_total) {
         const uint32_t len = st->length;
         uint8_t *payload = &rx->bytes[2];
+        st->ecc_fixed = st->ecc == PACKET_ECC_RS2
+            ? reed_solomon_decode(payload, packet_coded_bytes(len, st->ecc)) : 0;
         packet_scramble(payload, len);
         const uint16_t crc = packet_crc16(rx->bytes, 2u + len);
         const uint16_t sent = (uint16_t)((payload[len] << 8) | payload[len + 1u]);

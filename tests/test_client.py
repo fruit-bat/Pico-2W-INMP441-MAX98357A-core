@@ -50,9 +50,13 @@ class Soak(unittest.TestCase):
         self.assertEqual(chirp_soak.compare(sent, bytes([0x01, 0xFF, 0x54]), 4), (2, 2, [9, 13]))
         # 5 bits/symbol: byte 1 bit 0 is payload bit 8 = symbol 8 + 1
         self.assertEqual(chirp_soak.compare(sent, bytes([0x00, 0x7F, 0x55]), 2), (1, 1, [9]))
-        self.assertEqual(chirp_soak.data_symbols(16, 4), 44)
-        self.assertEqual(chirp_soak.data_symbols(16, 2), 37)
-        self.assertEqual(chirp_soak.data_symbols(63, 4), 138)
+        self.assertEqual(chirp_soak.data_symbols(16, 4, 0), 44)
+        self.assertEqual(chirp_soak.data_symbols(16, 2, 0), 37)
+        self.assertEqual(chirp_soak.data_symbols(63, 4, 0), 138)
+        # rs2 adds 4 check bytes (packet_format.md airtime table)
+        self.assertEqual(chirp_soak.data_symbols(16, 4, 1), 52)
+        self.assertEqual(chirp_soak.data_symbols(16, 2, 1), 44)
+        self.assertEqual(chirp_soak.data_symbols(63, 4, 1), 146)
 
     def test_judge(self):
         E = chirp_host.Event
@@ -79,13 +83,24 @@ class Soak(unittest.TestCase):
         self.assertEqual(chirp_soak.judge([early, tone])[0], "tone")
 
     def test_decisions(self):
-        # The symbols packet_tx sends for "Hi" (printed by the C, 2026-11-20; header at spacing 8)
-        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 4), [1, 0, 0, 3, 2, 1, 3, 4, 8, 10, 7, 12, 5, 11, 3, 3])
-        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 2), [0, 7, 0, 3, 5, 3, 1, 3, 17, 22, 6, 11, 13, 21, 31])
+        # The symbols packet_tx sends for "Hi" (printed by the C, 2026-11-20; header at spacing 8);
+        # with rs2 the same as test_packet.c's test_hi_symbols
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 4, 0), [1, 0, 0, 3, 2, 1, 3, 4, 8, 10, 7, 12, 5, 11, 3, 3])
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 2, 0), [0, 7, 0, 3, 5, 3, 1, 3, 17, 22, 6, 11, 13, 21, 31])
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 4, 1),
+                         [1, 1, 0, 3, 6, 5, 1, 5, 8, 10, 7, 12, 4, 2, 15, 10, 1, 8, 0, 2, 2, 12, 7, 8])
+        self.assertEqual(chirp_soak.sent_symbols(b"Hi", 2, 1),
+                         [0, 6, 0, 3, 1, 7, 3, 2, 17, 22, 6, 10, 31, 24, 22, 10, 29, 0, 22, 28, 7])
         self.assertEqual(chirp_soak.crc16(b"123456789"), 0x29B1)
+        # Reed-Solomon: the QR code's published example (version 1-M, 10 check bytes; same field
+        # and roots), then the packet's 4 check bytes as test_packet.c pins them
+        qr = bytes([32, 91, 11, 120, 209, 114, 220, 77, 67, 64, 236, 17, 236, 17, 236, 17])
+        self.assertEqual(list(chirp_soak.rs_parity(qr, 10)), [196, 35, 39, 119, 235, 215, 231, 226, 93, 23])
+        self.assertEqual(chirp_soak.rs_parity(b"Hello, chirp!").hex(), "fe46ec5b")
+        self.assertEqual(chirp_soak.rs_parity(bytes(range(20))).hex(), "fa1d5bbc")
         self.assertEqual(chirp_soak.golay_encode(0x210) >> 12, 0x210)
         # Symbol 1 (header) and 9 wrong: 1's runner-up was right; margins rank 9 lowest, then 1
-        sent = chirp_soak.sent_symbols(b"Hi", 4)
+        sent = chirp_soak.sent_symbols(b"Hi", 4, 0)
         got = list(sent)
         got[1], got[9] = 2, 12
         second = [0] * len(sent)
@@ -111,21 +126,24 @@ class Soak(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "soak.csv")
             r = subprocess.run([sys.executable, tool, "run", "--sim", SIM, "--speed", str(SPEED), "--count", "2",
-                                "--idle", "2", "--volume", "-30", "--length", "4,40", "--seed", "7", path],
+                                "--idle", "2", "--ecc", "none,rs2", "--volume", "-30", "--length", "4,40", "--seed", "7",
+                                path],
                                capture_output=True, text=True, timeout=120)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("events lost 0, bad lines 0", r.stdout)
             with open(path) as f:
                 rows = list(csv.DictReader(l for l in f if not l.startswith("#")))
             packets = [row for row in rows if row["outcome"] != "idle"]
-            self.assertEqual(len(packets), 8)  # 2 spacings x 2 lengths x 2
-            self.assertEqual(len(rows) - len(packets), 4)  # An idle period per condition
+            self.assertEqual(len(packets), 16)  # 2 spacings x 2 codes x 2 lengths x 2
+            self.assertEqual(len(rows) - len(packets), 8)  # An idle period per condition
+            self.assertEqual(sorted(set(row["ecc"] for row in packets)), ["none", "rs2"])
+            self.assertTrue(all(row["corrected"] == ("0" if row["ecc"] == "rs2" else "") for row in packets))
             self.assertTrue(all(row["outcome"] == "ok" and row["bit_errors"] == "0" for row in packets))
             # The simulator's rx.symbols are 3 made-up decisions, but they get through
             self.assertTrue(all(row["decided"] == "3" and row["margins"] == "1500,1002,65535" for row in packets))
             for row in packets:  # Airtime as the board reported it
-                self.assertEqual(int(row["tx_frames"]), 16 + chirp_soak.data_symbols(int(row["length"]),
-                                                                                      int(row["spacing"])))
+                self.assertEqual(int(row["tx_frames"]), 16 + chirp_soak.data_symbols(
+                    int(row["length"]), int(row["spacing"]), chirp_soak.ECC_NAMES[row["ecc"]]))
             # Run again with --append: the header isn't repeated, and summary reads both runs
             r = subprocess.run([sys.executable, tool, "run", "--sim", SIM, "--speed", str(SPEED), "--count", "1",
                                 "--idle", "0", "--spacing", "4", "--volume", "-30", "--length", "4", "--append",
@@ -134,7 +152,7 @@ class Soak(unittest.TestCase):
             s = subprocess.run([sys.executable, tool, "summary", path], capture_output=True, text=True, timeout=30)
             table = [l.split() for l in s.stdout.splitlines()[1:]]
             self.assertIn("Symbol decisions", s.stdout)
-            self.assertIn(["A>A", "4", "-30", "4", "3", "3"], [t[:6] for t in table])
+            self.assertIn(["A>A", "4", "rs2", "-30", "4", "3", "3"], [t[:7] for t in table])
             with open(path) as f:
                 self.assertEqual(sum(1 for l in f if l.startswith("time,")), 1)
 
@@ -174,9 +192,9 @@ class WithSim(unittest.TestCase):
         heard = self.b.wait_event("rx.packet", timeout=5)
         self.assertEqual(heard.payload(), payload)
         self.assertEqual(heard["crc"], "ok")
-        # 16 bytes at 4 bits/symbol: 16 preamble + 8 header + (128 + 16) / 4 frames
-        self.assertEqual(done["frame"] - start["frame"], 16 + 8 + 36)
-        self.assertEqual((heard["spacing"], heard["fixed"]), (4, 0))
+        # 16 bytes at 4 bits/symbol with rs2: 16 preamble + 8 header + (128 + 16 + 32) / 4 frames
+        self.assertEqual(done["frame"] - start["frame"], 16 + 8 + 44)
+        self.assertEqual((heard["spacing"], heard["fixed"], heard.raw("ecc"), heard["corrected"]), (4, 0, "rs2", 0))
 
     def test_commands_while_events_flow(self):
         self.b.sub("frame", fields="delay")
@@ -246,7 +264,7 @@ class WithSim(unittest.TestCase):
                           rows[0]["packet_align_on"]), ("packet", "off", "4", "-28", "1"))
         # The packet's comment line follows its row
         i = lines.index(next(l for l in lines if l.startswith(events[6]["frame"] + ",")))
-        self.assertEqual(lines[i + 1], "# packet frame=%s crc_ok=1 length=16 data_symbols=44 min_margin=2.000 "
+        self.assertEqual(lines[i + 1], "# packet frame=%s crc_ok=1 length=16 data_symbols=52 min_margin=2.000 "
                                        "weakest=0 weak=0 payload=chirp packet 042" % events[6]["frame"])
 
     def test_log_command(self):

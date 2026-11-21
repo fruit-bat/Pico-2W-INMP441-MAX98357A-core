@@ -7,7 +7,7 @@
  * The packet format shared by the transmitter and receiver (see
  * packet_format.md for the reasoning). One symbol per frame:
  *
- *   | A: 8 x symbol 0 | B: 8 known symbols | header: 8 symbols | payload | CRC-16 |
+ *   | A: 8 x symbol 0 | B: 8 known symbols | header: 8 symbols | payload | CRC-16 | RS check |
  *
  *   A       detection: a held symbol, easy to spot and lock onto
  *   B       training and alignment: learn the channel's shape, and mark
@@ -21,8 +21,12 @@
  *           header gives
  *   CRC-16  CRC-16/CCITT-FALSE of the header (2 bytes, big-endian) and the
  *           unscrambled payload
+ *   RS check with error correction PACKET_ECC_RS2 (the header says): 4
+ *           Reed-Solomon check bytes over the scrambled payload and the CRC
+ *           (reed_solomon.h), which correct any 2 wrong bytes; the CRC then
+ *           catches a wrong correction
  *
- * Header, payload and CRC bits are sent most significant bit first, Gray
+ * Header, payload, CRC and check bits are sent most significant bit first, Gray
  * coded, bits_per_symbol bits per symbol; the last symbol is padded with
  * zeros. The receiver needs no spacing setting: B is the same sound at
  * every spacing, and the header (at a fixed spacing) gives the payload's.
@@ -38,13 +42,14 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "reed_solomon.h"
 
 #define PACKET_A_LEN 8u
 #define PACKET_B_LEN 8u
 #define PACKET_PREAMBLE_LEN (PACKET_A_LEN + PACKET_B_LEN)
 #define PACKET_MAX_PAYLOAD 63u
 #define PACKET_CRC_BYTES 2u
-#define PACKET_MAX_BYTES (PACKET_MAX_PAYLOAD + PACKET_CRC_BYTES) // Payload and CRC (the header is separate)
+#define PACKET_MAX_BYTES (PACKET_MAX_PAYLOAD + PACKET_CRC_BYTES + RS_PARITY) // Payload, CRC, check bytes (the header is separate)
 #define PACKET_MIN_BITS_PER_SYMBOL 4u
 #define PACKET_MAX_BITS_PER_SYMBOL 6u
 
@@ -57,12 +62,13 @@
 #define PACKET_HEADER_MAX_FIXED 3u // Wrong bits the code corrects
 
 #define PACKET_VERSION 0u // Header format version
-#define PACKET_ECC_NONE 0u // Payload error correction: none (1..3 reserved)
+#define PACKET_ECC_NONE 0u // Payload error correction: none
+#define PACKET_ECC_RS2 1u  // Reed-Solomon, 4 check bytes, corrects 2 bytes (2, 3 reserved)
 
 typedef struct {
     uint32_t version;     // 0..3: PACKET_VERSION
     uint32_t spacing;     // Payload bins per symbol: 1, 2 or 4 (code 3 is reserved: 0 here)
-    uint32_t ecc;         // 0..3: PACKET_ECC_NONE
+    uint32_t ecc;         // 0..3: PACKET_ECC_NONE or PACKET_ECC_RS2
     uint32_t length;      // Payload bytes, 0..63
 } PacketHeader_t;
 
@@ -70,7 +76,7 @@ typedef struct {
 // 2 = 4, 3 reserved) | error correction (2) | length (6), MSB first
 uint32_t packet_header_pack(const PacketHeader_t *h);
 // Unpacks 12 bits; false if the format is not one this code knows (other
-// version, reserved spacing code, error correction other than none)
+// version, reserved spacing code, reserved error correction)
 bool packet_header_unpack(uint32_t bits, PacketHeader_t *h);
 
 // Extended Golay (24,12): the 24-bit codeword for 12 bits (the bits, then
@@ -101,10 +107,13 @@ void packet_scramble(uint8_t *data, uint32_t length);
 static inline uint32_t packet_gray_value(uint32_t symbol) { return symbol ^ (symbol >> 1); } // Symbol -> value
 uint32_t packet_gray_symbol(uint32_t value);                                                   // Value -> symbol
 
-// Symbols after the header (payload and CRC) with this payload length
-uint32_t packet_payload_symbol_count(uint32_t payload_length, uint32_t bits_per_symbol);
+// Bytes after the header (payload, CRC, any check bytes)
+uint32_t packet_coded_bytes(uint32_t payload_length, uint32_t ecc);
 
-// Symbols in a whole packet (preamble and header included) with this payload length
-uint32_t packet_symbol_count(uint32_t payload_length, uint32_t bits_per_symbol);
+// Symbols after the header (payload, CRC, any check bytes)
+uint32_t packet_payload_symbol_count(uint32_t payload_length, uint32_t ecc, uint32_t bits_per_symbol);
+
+// Symbols in a whole packet (preamble and header included)
+uint32_t packet_symbol_count(uint32_t payload_length, uint32_t ecc, uint32_t bits_per_symbol);
 
 #endif // PACKET_FORMAT_H

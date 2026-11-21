@@ -28,7 +28,7 @@
 
 // The host talks to the board over USB serial with the protocol in
 // protocol.md (src/protocol.c); tools/chirp_host.py is a client.
-#define FIRMWARE_VERSION "0.3.0"
+#define FIRMWARE_VERSION "0.4.0"
 
 // The chirp sweeps CHIRP_BINS FFT bins (64 bins = 2.76 kHz from F0). Symbols
 // are spaced bins_per_symbol bins apart (setting link.spacing: 1, 2 or 4 while
@@ -43,6 +43,7 @@
 #define CHIRP_BINS 64u
 #define DEFAULT_BINS_PER_SYMBOL 4u // 1, 2 or 4
 static volatile uint32_t bins_per_symbol_request = DEFAULT_BINS_PER_SYMBOL; // Set by core 0 (link.spacing)
+static volatile uint32_t packet_ecc = PACKET_ECC_RS2; // Set by core 0 (link.ecc); read as each packet starts
 static volatile uint32_t bins_per_symbol = DEFAULT_BINS_PER_SYMBOL;         // In use; core 1 applies requests
 static inline uint32_t num_symbols(void) { return CHIRP_BINS / bins_per_symbol; }
 static inline uint32_t bits_per_symbol(void) { return (uint32_t)__builtin_ctz(num_symbols()); }
@@ -491,7 +492,7 @@ static void __not_in_flash_func(fill_tx_block)(float32_t *buffer) {
             // Start the next queued packet when idle; silence between packets
             static TxPacketRequest_t request;
             if (!packet_tx_busy(&packet_tx) && spsc_ring_pop(&tx_packet_queue, &request)) {
-                packet_tx_start(&packet_tx, request.payload, request.length);
+                packet_tx_start(&packet_tx, request.payload, request.length, packet_ecc);
                 packet_tx_id = request.id;
                 const TxEvent_t e = { .id = request.id, .frame = i2s_core_get_rx_block_count(), .start = true };
                 spsc_ring_push(&tx_event_queue, &e); // 8 deep and 2 a packet: can't fill
@@ -625,6 +626,7 @@ static void board_apply(void *ctx, const ProtocolSettings_t *s, uint32_t changed
     (void)ctx;
     const int32_t *v = s->value;
     if (changed & (1u << SETTING_LINK_SPACING)) bins_per_symbol_request = (uint32_t)v[SETTING_LINK_SPACING];
+    if (changed & (1u << SETTING_LINK_ECC)) packet_ecc = (uint32_t)v[SETTING_LINK_ECC];
     if (changed & (1u << SETTING_TX_VOLUME)) tx_volume_db = v[SETTING_TX_VOLUME];
     if (changed & (1u << SETTING_RX_ALIGN)) packet_align = v[SETTING_RX_ALIGN] != 0;
     if (changed & (1u << SETTING_RX_TRACKING)) tracking_mode = (enum tracking_mode)v[SETTING_RX_TRACKING];
@@ -790,6 +792,8 @@ static void handle_record(const RxFrameRecord_t *r) {
             e.u.packet.length = rx_packet_in.length;
             e.u.packet.spacing = st->spacing;
             e.u.packet.fixed = st->header_fixed;
+            e.u.packet.ecc = st->ecc;
+            e.u.packet.ecc_fixed = st->ecc_fixed;
             e.u.packet.min_margin = st->min_margin;
             e.u.packet.weakest = st->weakest_symbol;
             e.u.packet.weak = st->weak_symbols;

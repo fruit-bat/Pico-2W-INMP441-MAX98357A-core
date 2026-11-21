@@ -31,6 +31,7 @@
 // The settings table
 // ---------------------------------------------------------------------------
 static const char *const OFF_ON[] = { "off", "on", NULL };
+static const char *const ECCS[] = { "none", "rs2", NULL };
 static const char *const TRACKING[] = { "off", "decision", "pilot", NULL };
 static const char *const MODES[] = { "loopback", "mic", "tone", "chirp", "sequence", "packet", NULL };
 static const char *const RX_STATES[] = { "search", "lock", "train", "header", "payload", NULL };
@@ -50,6 +51,8 @@ typedef struct {
 static const SettingDef_t SETTINGS[SETTING_COUNT] = {
     [SETTING_LINK_SPACING] = { "link.spacing", NULL, 1, 4, SPACINGS, 3, 4, "bins",
                                "Bins between symbols in packets sent and the test modes (4 bits/symbol at 4, 5 at 2, 6 at 1); packet receivers follow the header" },
+    [SETTING_LINK_ECC]     = { "link.ecc", ECCS, 0, 1, NULL, 0, 1, "",
+                               "Error correction on packets sent (rs2: 4 Reed-Solomon bytes, corrects 2 wrong bytes); packet receivers follow the header" },
     [SETTING_TX_VOLUME]    = { "tx.volume", NULL, -55, -1, NULL, 0, -28, "dBFS", "Transmit level" },
     [SETTING_RX_ALIGN]     = { "rx.align", OFF_ON, 0, 1, NULL, 0, 1, "",
                                "Move the receive window onto the earliest path when a preamble is found" },
@@ -1037,9 +1040,13 @@ void protocol_event(Protocol_t *p, const ProtocolEvent_t *e) {
         case PROTO_EV_RX_PACKET: {
             uint32_t len = e->u.packet.length;
             if (len > PROTOCOL_PAYLOAD_MAX) len = PROTOCOL_PAYLOAD_MAX;
-            n = snprintf(line, size, "* rx.packet seq=%lu frame=%lu crc=%s len=%lu spacing=%lu fixed=%lu min_margin=%.3f weakest=%lu weak=%lu hex=",
+            char corrected[12];
+            if (e->u.packet.ecc_fixed < 0) snprintf(corrected, sizeof corrected, "failed");
+            else snprintf(corrected, sizeof corrected, "%ld", (long)e->u.packet.ecc_fixed);
+            n = snprintf(line, size, "* rx.packet seq=%lu frame=%lu crc=%s len=%lu spacing=%lu fixed=%lu ecc=%s corrected=%s min_margin=%.3f weakest=%lu weak=%lu hex=",
                 seq, frame, e->u.packet.crc_ok ? "ok" : "bad", (unsigned long)len, (unsigned long)e->u.packet.spacing,
-                (unsigned long)e->u.packet.fixed, (double)e->u.packet.min_margin,
+                (unsigned long)e->u.packet.fixed, e->u.packet.ecc == 1u ? "rs2" : "none", corrected,
+                (double)e->u.packet.min_margin,
                 (unsigned long)e->u.packet.weakest, (unsigned long)e->u.packet.weak);
             for (uint32_t i = 0; i < len; i++) {
                 line[n++] = HEX[e->u.packet.payload[i] >> 4];

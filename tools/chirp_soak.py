@@ -9,8 +9,10 @@
     # The summary table again, from one or more files
     python3 tools/chirp_soak.py summary soak.csv older.csv
 
-The conditions are every combination of --spacing, --volume and --length
-(default 2,4 x -28,-34,-40 x 16), --count packets each, in each direction.
+The conditions are every combination of --spacing, --ecc, --volume and
+--length (default 2,4 x rs2 x -28,-34,-40 x 16), --count packets each, in
+each direction. --ecc sets the sender's link.ecc (none, rs2); receivers
+follow the header.
 Before each condition's packets the receiver is watched for --idle seconds
 with nothing sent, to count false locks in quiet; locks between packets
 are counted too, separately.
@@ -31,6 +33,8 @@ Outcomes (the receiver's conclusion, see protocol.md):
 
 header_fixed: header bits the Golay code corrected (0..3); header_failed:
 why a header was refused (check: more than 3 bits wrong; format: unknown).
+corrected: payload bytes the Reed-Solomon code corrected (0..2), or
+"failed" (more wrong bytes than it can correct); empty with ecc none.
 
 moved_back: samples the receiver moved its window back after training,
 because the lock's move had gone to a long echo's wrapped image (packet_rx.h).
@@ -63,11 +67,14 @@ from chirp_host import Board  # noqa: E402
 FRAME_S = 1024 / 44100
 HEADER_SYMBOLS = 8  # The Golay-coded header, at spacing 8 (3 bits/symbol)
 CRC_BITS = 16
+RS_PARITY = 4  # Reed-Solomon check bytes with error correction rs2
+ECC_NONE, ECC_RS2 = 0, 1  # The header's error correction field (link.ecc none / rs2)
+ECC_NAMES = {"none": ECC_NONE, "rs2": ECC_RS2}
 PREAMBLE_FRAMES = 16
 CONCLUSIONS = ("rx.packet", "rx.header_failed", "rx.train_failed", "rx.tone", "rx.lost")
 
-COLUMNS = ["time", "seed", "dir", "spacing", "volume", "length", "n", "outcome",
-           "locks", "false_before", "crc", "rx_len", "header_fixed", "header_failed", "min_margin", "weakest", "weak",
+COLUMNS = ["time", "seed", "dir", "spacing", "ecc", "volume", "length", "n", "outcome",
+           "locks", "false_before", "crc", "rx_len", "header_fixed", "header_failed", "corrected", "min_margin", "weakest", "weak",
            "align", "fraction", "moved", "b_start", "coherence", "strongest", "earliest", "moved_back", "rx_delay",
            "byte_errors", "bit_errors", "symbol_errors", "error_symbols",
            "decided", "wrong", "header_wrong", "wrong_second", "wrong_ranks", "symbols", "second", "margins",
@@ -78,10 +85,15 @@ def bits_per_symbol(spacing):
     return int(math.log2(64 // spacing))
 
 
-def data_symbols(length, spacing):
-    """Symbols after the preamble: the header, then payload and CRC."""
+def coded_bytes(length, ecc):
+    """Bytes after the header: payload, CRC, any check bytes (packet_coded_bytes)."""
+    return length + CRC_BITS // 8 + (RS_PARITY if ecc == ECC_RS2 else 0)
+
+
+def data_symbols(length, spacing, ecc):
+    """Symbols after the preamble: the header, then payload, CRC and any check bytes."""
     b = bits_per_symbol(spacing)
-    return HEADER_SYMBOLS + -(-(8 * length + CRC_BITS) // b)
+    return HEADER_SYMBOLS + -(-(8 * coded_bytes(length, ecc)) // b)
 
 
 def payload_for(seed, n, length):
@@ -132,20 +144,56 @@ def golay_encode(bits):
     return (word << 1) | (bin(word).count("1") & 1)
 
 
-def header_bits(length, spacing):
-    """The header's 12 bits: version 0, spacing code, error correction 0, length."""
-    return ({1: 0, 2: 1, 4: 2}[spacing] << 8) | (length & 63)
+def _gf_tables():
+    exp, log, x = [0] * 512, [0] * 256, 1
+    for i in range(255):
+        exp[i], log[x] = x, i
+        x <<= 1
+        if x & 0x100:
+            x ^= 0x11D
+    for i in range(255, 512):
+        exp[i] = exp[i - 255]
+    return exp, log
 
 
-def sent_symbols(payload, spacing):
+GF_EXP, GF_LOG = _gf_tables()
+
+
+def _gf_mul(a, b):
+    return GF_EXP[GF_LOG[a] + GF_LOG[b]] if a and b else 0
+
+
+def rs_parity(data, nsym=RS_PARITY):
+    """Reed-Solomon check bytes over GF(256), polynomial 0x11D, roots 2^0 ..
+    2^(nsym-1) (reed_solomon_encode; with nsym=10 it gives the QR code's)."""
+    gen = [1]
+    for j in range(nsym):
+        root = GF_EXP[j]
+        gen = [(gen[k] if k < len(gen) else 0) ^ (_gf_mul(gen[k - 1], root) if k else 0)
+               for k in range(len(gen) + 1)]
+    rem = [0] * nsym
+    for byte in data:
+        fb = byte ^ rem[0]
+        rem = [rem[k + 1] ^ _gf_mul(gen[k + 1], fb) for k in range(nsym - 1)] + [_gf_mul(gen[nsym], fb)]
+    return bytes(rem)
+
+
+def header_bits(length, spacing, ecc):
+    """The header's 12 bits: version 0, spacing code, error correction, length."""
+    return ({1: 0, 2: 1, 4: 2}[spacing] << 8) | (ecc << 6) | (length & 63)
+
+
+def sent_symbols(payload, spacing, ecc):
     """The data symbols packet_tx sends for this payload: the 8 header symbols
     (numbered at spacing 8, 0..7, as the receiver reports them), then the
-    payload and CRC at the payload's spacing."""
-    header = header_bits(len(payload), spacing)
+    payload, CRC and any check bytes at the payload's spacing."""
+    header = header_bits(len(payload), spacing, ecc)
     code = golay_encode(header)
     symbols = [gray_symbol((code >> (21 - 3 * i)) & 7) for i in range(HEADER_SYMBOLS)]
     crc = crc16(bytes([header >> 8, header & 0xFF]) + payload)
     stream = scramble(payload) + bytes([crc >> 8, crc & 0xFF])
+    if ecc == ECC_RS2:
+        stream += rs_parity(stream)
     b = bits_per_symbol(spacing)
     bits = "".join("{:08b}".format(x) for x in stream)
     bits += "0" * (-len(bits) % b)
@@ -323,23 +371,24 @@ class Soak:
         return out
 
     def run(self):
-        conditions = [(s, v, l) for s in self.args.spacing for v in self.args.volume for l in self.args.length]
-        for spacing, volume, length in conditions:
+        conditions = [(s, e, v, l) for s in self.args.spacing for e in self.args.ecc
+                      for v in self.args.volume for l in self.args.length]
+        for spacing, ecc, volume, length in conditions:
             for tx, rx, label in self.directions():
-                self.condition(tx, rx, label, spacing, volume, length)
+                self.condition(tx, rx, label, spacing, ecc, volume, length)
 
-    def condition(self, tx, rx, label, spacing, volume, length):
+    def condition(self, tx, rx, label, spacing, ecc, volume, length):
         for board in set((tx, rx)):
             if board.settings.get("link.spacing") != spacing:
                 board.set({"link.spacing": spacing})
-        tx.set({"tx.volume": volume})
+        tx.set({"tx.volume": volume, "link.ecc": ecc})
         if tx is rx:
             rx.set({"rx.during_tx": "on"})
         watcher = Watcher(tx, rx)
         time.sleep(self._seconds(0.5))  # Let any spacing change settle
         watcher.take_rx()
         watcher.take_tx()
-        common = {"dir": label, "spacing": spacing, "volume": volume, "length": length}
+        common = {"dir": label, "spacing": spacing, "ecc": ecc, "volume": volume, "length": length}
 
         # Quiet: false locks with nothing sent
         if self.args.idle > 0:
@@ -351,10 +400,10 @@ class Soak:
             self._write(dict(common, n="", outcome="idle", locks=count_locks(events),
                              idle_s="%.1f" % ((time.monotonic() - start) * self.speed),
                              lost_events=lost, bad_lines=bad))
-            print("%s spacing %d %+d dB: idle %.0f s, %d false locks"
-                  % (label, spacing, volume, self.args.idle, count_locks(events)), flush=True)
+            print("%s spacing %d %s %+d dB: idle %.0f s, %d false locks"
+                  % (label, spacing, ecc, volume, self.args.idle, count_locks(events)), flush=True)
 
-        frames = PREAMBLE_FRAMES + data_symbols(length, spacing)
+        frames = PREAMBLE_FRAMES + data_symbols(length, spacing, ECC_NAMES[ecc])
         tx_timeout = self._seconds(frames * FRAME_S * 1.5 + 3.0)
         for _ in range(self.args.count):
             self.packet(tx, rx, watcher, common, length, spacing, frames, tx_timeout)
@@ -394,7 +443,8 @@ class Soak:
                        strongest=trained.raw("strongest"), earliest=trained.raw("earliest"),
                        moved_back=trained.raw("moved"))
         if p is not None:
-            row.update(crc=p.raw("crc"), rx_len=p.raw("len"), header_fixed=p.raw("fixed"), min_margin=p.raw("min_margin"),
+            row.update(crc=p.raw("crc"), rx_len=p.raw("len"), header_fixed=p.raw("fixed"),
+                       corrected=p.raw("corrected") if p.raw("ecc") == "rs2" else "", min_margin=p.raw("min_margin"),
                        weakest=p.raw("weakest"), weak=p.raw("weak"))
             got = p.payload()
             if len(got) == length:
@@ -405,7 +455,7 @@ class Soak:
             failed = next((e for e in reversed(events) if e.name == "rx.header_failed"), None)
             row["header_failed"] = failed.raw("reason") if failed is not None else ""
         if decisions is not None and outcome in ("ok", "crc_bad", "header_failed"):
-            row.update(check_decisions(sent_symbols(payload, spacing), decisions, spacing))
+            row.update(check_decisions(sent_symbols(payload, spacing, ECC_NAMES[common["ecc"]]), decisions, spacing))
         row["rx_delay"] = rx.get("rx.delay")["rx.delay"]
         lost, bad = (x - y for x, y in zip(self._health(), health))
         row.update(lost_events=lost, bad_lines=bad)
@@ -414,12 +464,14 @@ class Soak:
         detail = ""
         if p is not None:
             detail = " margin %s" % p.raw("min_margin")
+            if row.get("corrected") not in (None, "", "0"):
+                detail += ", corrected %s" % row["corrected"]
         if row.get("wrong"):
             detail += ", wrong symbols %s (ranks %s)" % (row["wrong"], row["wrong_ranks"])
         if lost or bad:
             detail += "  [events lost %d, bad lines %d: don't trust this row]" % (lost, bad)
-        print("%s spacing %d %+d dB %d bytes #%d: %s%s"
-              % (common["dir"], spacing, common["volume"], length, n, outcome, detail), flush=True)
+        print("%s spacing %d %s %+d dB %d bytes #%d: %s%s"
+              % (common["dir"], spacing, common["ecc"], common["volume"], length, n, outcome, detail), flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -434,16 +486,23 @@ def _percentile(values, p):
     return values[lo] + (values[hi] - values[lo]) * (k - lo)
 
 
+def _group_order(key):
+    direction, spacing, ecc, volume, length = key
+    return (spacing, ecc, -volume, length, direction)
+
+
 def summary(rows, file=sys.stdout):
     groups = {}
     for r in rows:
-        key = (r["dir"], int(r["spacing"]), int(r["volume"]), int(r["length"]))
+        # Files from before link.ecc had no ecc column: those packets had none
+        key = (r["dir"], int(r["spacing"]), r.get("ecc") or "none", int(r["volume"]), int(r["length"]))
         groups.setdefault(key, []).append(r)
-    head = ("dir", "spc", "vol", "len", "n", "ok", "crc_bad", "hdr", "train", "lost", "no_lock", "other",
-            "false_idle/min", "false_btw", "margin p10/p50", "sym_err/pkt", "moved_back", "hdr_fixed", "untrusted")
-    widths = (5, 3, 4, 4, 4, 4, 7, 4, 5, 4, 7, 5, 14, 9, 14, 11, 10, 9, 9)
+    head = ("dir", "spc", "ecc", "vol", "len", "n", "ok", "crc_bad", "hdr", "train", "lost", "no_lock", "other",
+            "false_idle/min", "false_btw", "margin p10/p50", "sym_err/pkt", "moved_back", "hdr_fixed",
+            "rs_fixed", "rs_fail", "untrusted")
+    widths = (5, 3, 4, 4, 4, 4, 4, 7, 4, 5, 4, 7, 5, 14, 9, 14, 11, 10, 9, 8, 7, 9)
     print("  ".join(h.rjust(w) for h, w in zip(head, widths)), file=file)
-    for key in sorted(groups, key=lambda k: (k[1], -k[2], k[3], k[0])):
+    for key in sorted(groups, key=_group_order):
         rs = groups[key]
         packets = [r for r in rs if r["outcome"] != "idle"]
         idle = [r for r in rs if r["outcome"] == "idle"]
@@ -460,7 +519,7 @@ def summary(rows, file=sys.stdout):
         p10, p50 = _percentile(margins, 10), _percentile(margins, 50)
         sym = [int(r["symbol_errors"]) for r in packets if r["symbol_errors"] != ""]
         untrusted = sum(1 for r in rs if int(r["lost_events"] or 0) or int(r["bad_lines"] or 0))
-        cells = (key[0], key[1], key[2], key[3], len(packets), out.get("ok", 0), out.get("crc_bad", 0),
+        cells = (*key, len(packets), out.get("ok", 0), out.get("crc_bad", 0),
                  out.get("header_failed", 0), out.get("train_failed", 0), out.get("lost", 0),
                  out.get("no_lock", 0), other,
                  "%.2f" % (idle_locks * 60 / idle_s) if idle_s else "-",
@@ -469,6 +528,8 @@ def summary(rows, file=sys.stdout):
                  "%.2f" % (sum(sym) / len(sym)) if sym else "-",
                  sum(1 for r in packets if r.get("moved_back") not in (None, "", "+0", "0")),
                  sum(1 for r in packets if r.get("header_fixed") not in (None, "", "0")),
+                 sum(1 for r in packets if r.get("corrected") not in (None, "", "0", "failed")),
+                 sum(1 for r in packets if r.get("corrected") == "failed"),
                  untrusted)
         print("  ".join(str(c).rjust(w) for c, w in zip(cells, widths)), file=file)
 
@@ -487,11 +548,11 @@ def errors(rows, groups, file=sys.stdout):
         return
     print("\nSymbol decisions (wrong/pkt: 0/1/2/3+ wrong symbols; hdr_wrong: failed headers with 1/2/3+)",
           file=file)
-    head = ("dir", "spc", "vol", "len", "pkts", "wrong/pkt", "hdr_fail", "hdr_wrong", "wrong", "2nd_right",
+    head = ("dir", "spc", "ecc", "vol", "len", "pkts", "wrong/pkt", "hdr_fail", "hdr_wrong", "wrong", "2nd_right",
             "rank<=1/2/4")
-    widths = (5, 3, 4, 4, 5, 14, 8, 10, 6, 9, 14)
+    widths = (5, 3, 4, 4, 4, 5, 14, 8, 10, 6, 9, 14)
     print("  ".join(h.rjust(w) for h, w in zip(head, widths)), file=file)
-    for key in sorted(groups, key=lambda k: (k[1], -k[2], k[3], k[0])):
+    for key in sorted(groups, key=_group_order):
         rs = [r for r in groups[key] if r.get("decided")]
         if not rs:
             continue
@@ -505,7 +566,7 @@ def errors(rows, groups, file=sys.stdout):
         ranks = [int(x) for r in rs if r["wrong_ranks"] for x in r["wrong_ranks"].split(";")]
         second = sum(int(r["wrong_second"] or 0) for r in rs)
         n = len(ranks)
-        cells = (key[0], key[1], key[2], key[3], len(rs), "/".join(map(str, dist)), len(hf),
+        cells = (*key, len(rs), "/".join(map(str, dist)), len(hf),
                  "/".join(map(str, hdist)), n, "%d%%" % (100 * second // n) if n else "-",
                  "/".join("%d%%" % (100 * sum(1 for x in ranks if x <= k) // n) for k in (1, 2, 4)) if n else "-")
         print("  ".join(str(c).rjust(w) for c, w in zip(cells, widths)), file=file)
@@ -537,6 +598,7 @@ def main():
     r.add_argument("--speed", type=float, default=1.0, help="simulator clock speed")
     r.add_argument("--both", action="store_true", help="two boards: each direction in turn")
     r.add_argument("--spacing", type=_list(int), default=[2, 4], help="bins per symbol (default 2,4)")
+    r.add_argument("--ecc", type=_list(str), default=["rs2"], help="sender's link.ecc: none, rs2 (default rs2)")
     r.add_argument("--volume", type=_list(int), default=[-28, -34, -40], help="tx.volume (default -28,-34,-40)")
     r.add_argument("--length", type=_list(int), default=[16], help="payload bytes (default 16)")
     r.add_argument("--count", type=int, default=50, help="packets per condition and direction (default 50)")
@@ -552,6 +614,9 @@ def main():
     if args.cmd == "summary":
         summary(read_rows(args.files))
         return
+    bad = [e for e in args.ecc if e not in ECC_NAMES]
+    if bad:
+        ap.error("--ecc: unknown %s (none, rs2)" % ",".join(bad))
 
     if args.port and len(args.port) > 2:
         ap.error("at most two --port")
@@ -570,7 +635,7 @@ def main():
     try:
         hellos = [b.hello() for b in boards]
         for b in boards:
-            restore.append((b, b.get("link.spacing", "tx.volume", "rx.during_tx", "rx.symbols")))
+            restore.append((b, b.get("link.spacing", "link.ecc", "tx.volume", "rx.during_tx", "rx.symbols")))
             b.set({"rx.symbols": "on"})
         new = not (args.append and os.path.exists(args.output) and os.path.getsize(args.output) > 0)
         with open(args.output, "w" if new else "a", newline="") as out:

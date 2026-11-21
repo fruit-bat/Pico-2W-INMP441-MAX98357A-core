@@ -67,6 +67,7 @@ enum {
 // ---------------------------------------------------------------------------
 typedef enum {
     SETTING_LINK_SPACING = 0, // 1, 2, 4 bins per symbol
+    SETTING_LINK_ECC,         // none, rs2: error correction on packets sent
     SETTING_TX_VOLUME,        // dBFS
     SETTING_RX_ALIGN,         // off, on
     SETTING_RX_TRACKING,      // off, decision, pilot (as enum tracking_mode in main.c)
@@ -158,6 +159,8 @@ typedef struct {
             uint32_t length;
             uint32_t spacing;  // Payload bins per symbol (from the header)
             uint32_t fixed;    // Header bits corrected
+            uint32_t ecc;      // Payload error correction (from the header): 0 none, 1 rs2
+            int32_t ecc_fixed; // Payload bytes corrected, or -1 if the code couldn't
             float min_margin;
             uint32_t weakest, weak;
             const uint8_t *payload; // Only needs to last for the protocol_event() call

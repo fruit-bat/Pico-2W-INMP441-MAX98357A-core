@@ -177,14 +177,17 @@ typedef struct {
     uint32_t header_fixed;        // Header bits the code corrected (0 .. 3; with CHECK, 0)
     uint32_t spacing;             // Payload bins per symbol, from the header (PACKET only)
     uint32_t length;              // Payload length from the header (PACKET only)
-    bool crc_ok;                  // CRC-16 good (PACKET only)
+    uint32_t ecc;                 // Payload error correction, from the header (PACKET only)
+    int32_t ecc_fixed;            // Bytes the payload code corrected (0 .. RS_MAX_FIXED), or -1 if
+                                  // it couldn't (PACKET with PACKET_ECC_RS2 only; else 0)
+    bool crc_ok;                  // CRC-16 good, after any correction (PACKET only)
     float32_t min_margin;         // Lowest data decision margin in the packet
     uint32_t weakest_symbol;      // Which data symbol it was (0 = first after B)
     uint32_t weak_symbols;        // Data decisions with a margin below PACKET_RX_WEAK_MARGIN
 } PacketRxStatus_t;
 
-// Data symbols in the longest packet (header, then payload and CRC at the
-// fewest bits per symbol)
+// Data symbols in the longest packet (header, then payload, CRC and check
+// bytes at the fewest bits per symbol)
 #define PACKET_RX_MAX_DATA_SYMBOLS (PACKET_HEADER_SYMBOLS \
     + (8u * PACKET_MAX_BYTES + PACKET_MIN_BITS_PER_SYMBOL - 1u) / PACKET_MIN_BITS_PER_SYMBOL)
 
@@ -217,8 +220,8 @@ typedef struct {
     uint32_t header_code;         // HEADER: the codeword's bits so far
     uint32_t bit_count;           // Bits collected into bytes
     uint32_t low_quality;         // Consecutive data frames below PACKET_RX_MIN_QUALITY
-    uint8_t bytes[2u + PACKET_MAX_BYTES]; // Header (2 bytes, for the CRC), payload (descrambled once
-                                          // complete), CRC-16
+    uint8_t bytes[2u + PACKET_MAX_BYTES]; // Header (2 bytes, for the CRC), payload (corrected and
+                                          // descrambled once complete), CRC-16, any check bytes
     PacketRxDecision_t decisions[PACKET_RX_MAX_DATA_SYMBOLS]; // This packet's data symbols so far (status.data_count)
     PacketRxStatus_t status;
 } PacketRx_t;

@@ -59,6 +59,7 @@ add_library(chirp_dsp STATIC
     ${SRC_DIR}/packet_format.c
     ${SRC_DIR}/packet_tx.c
     ${SRC_DIR}/packet_rx.c
+    ${SRC_DIR}/reed_solomon.c
 )
 target_include_directories(chirp_dsp PUBLIC
     ${SRC_DIR}

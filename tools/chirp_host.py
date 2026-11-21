@@ -635,9 +635,10 @@ class CsvLog:
                 bits = 64 // (e["spacing"] if e.raw("spacing") else self.board.settings.get("link.spacing", 4))
                 bits = bits.bit_length() - 1
                 length = e["len"]
+                coded = 8 * length + 16 + (32 if e.raw("ecc") == "rs2" else 0)  # Payload, CRC, check bytes
                 notes.append("# packet frame=%d crc_ok=%d length=%d data_symbols=%d min_margin=%s weakest=%s "
                              "weak=%s payload=%s" % (frame, e["crc"] == "ok", length,
-                                                     8 + (8 * length + 16 + bits - 1) // bits, e.raw("min_margin"),
+                                                     8 + (coded + bits - 1) // bits, e.raw("min_margin"),
                                                      e.raw("weakest"), e.raw("weak"), _printable(e.payload())))
             elif e.name == "rx.header_failed":
                 notes.append("# packet header failed: %s" % e.raw("reason"))

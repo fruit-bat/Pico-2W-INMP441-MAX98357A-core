@@ -158,7 +158,7 @@ static void test_get(void) {
         "a3 rx.state=search\na3 rx.delay=960\na3 test.mode=packet\na3 ok\n");
     CHECK_STR(talk("a4 get nothing.here\n"), "a4 err 502 unknown name nothing.here\n");
     CHECK_STR(talk("a5 get tx.volume nothing.here\n"), "a5 err 502 unknown name nothing.here\n");
-    CHECK_STR(talk("a6 get link.*\n"), "a6 link.spacing=4\na6 link.symbols=16\na6 link.bits=4\na6 ok\n");
+    CHECK_STR(talk("a6 get link.*\n"), "a6 link.spacing=4\na6 link.ecc=rs2\na6 link.symbols=16\na6 link.bits=4\na6 ok\n");
 
     const char *all = talk("a7 get\n");
     printf("  get (all): %lu lines, %lu bytes\n", (unsigned long)count_lines(all), (unsigned long)strlen(all));
@@ -239,15 +239,16 @@ static void test_send(void) {
     fake_board_advance_frames(&fb, 1);
     CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
 
-    // 2 bytes at 4 bits/symbol: 16 preamble + 8 header + (16 + 16) / 4 = 32 frames
+    // 2 bytes at 4 bits/symbol with rs2 (the default): 16 preamble + 8 header
+    // + (16 payload + 16 CRC + 32 check bits) / 4 = 40 frames
     const uint32_t frames = fake_board_packet_frames(&fb, 2);
-    CHECK_EQ_U(frames, 32);
+    CHECK_EQ_U(frames, 40);
     fake_board_advance_frames(&fb, frames);
     CHECK_STR(drain(),
         "* rx.locked seq=2 frame=4 align=+0 fraction=+0.120 moved=+2\n"
         "* rx.trained seq=3 frame=19 b_start=9 coherence=0.830 strongest=-1 earliest=+0 moved=+0\n"
-        "* tx.done seq=4 frame=33 id=1 result=sent\n"
-        "* rx.packet seq=5 frame=33 crc=ok len=2 spacing=4 fixed=0 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
+        "* tx.done seq=4 frame=41 id=1 result=sent\n"
+        "* rx.packet seq=5 frame=41 crc=ok len=2 spacing=4 fixed=0 ecc=rs2 corrected=0 min_margin=2.000 weakest=0 weak=0 hex=4869\n");
     CHECK_STR(talk("p3 get count.good rx.delay rx.last_train.coherence\n"),
         "p3 count.good=1\np3 rx.delay=962\np3 rx.last_train.coherence=0.830\np3 ok\n");
 
@@ -255,19 +256,19 @@ static void test_send(void) {
     CHECK_STR(talk("p4 send hex=01\np5 send hex=02\np6 send hex=03\n"),
         "p4 ok id=2\np5 ok id=3\np6 err 450 transmit queue full\n");
     fake_board_advance_frames(&fb, 1);
-    CHECK_STR(talk("p7 send hex=04\n"), "* tx.start seq=6 frame=34 id=2\np7 ok id=4\n");
+    CHECK_STR(talk("p7 send hex=04\n"), "* tx.start seq=6 frame=42 id=2\np7 ok id=4\n");
 
-    // Real time: 63 bytes at 4 bits/symbol take 16 + 8 + 130 frames, 3.6 s
+    // Real time: 63 bytes at 4 bits/symbol with rs2 take 16 + 8 + 138 frames, 3.76 s
     setup();
     CHECK_STR(talk("p8 set rx.during_tx=off\n"), "p8 ok\n");
     char line[600] = "p9 send hex=";
     for (int i = 0; i < 63; i++) strcat(line, "ab");
     strcat(line, "\n");
     CHECK_STR(talk(line), "p9 ok id=1\n");
-    fake_board_advance_us(&fb, 3500000u);
+    fake_board_advance_us(&fb, 3700000u);
     CHECK_STR(drain(), "* tx.start seq=1 frame=1 id=1\n");
-    fake_board_advance_us(&fb, 200000u);
-    CHECK_STR(drain(), "* tx.done seq=2 frame=155 id=1 result=sent\n");
+    fake_board_advance_us(&fb, 100000u);
+    CHECK_STR(drain(), "* tx.done seq=2 frame=163 id=1 result=sent\n");
 
     // Bad hex
     CHECK_STR(talk("q1 send hex=486\n"), "q1 err 506 odd number of hex digits\n");
@@ -308,7 +309,7 @@ static void test_ordering(void) {
     CHECK_EQ_U(protocol_input(&proto, cmd1, strlen(cmd1)), strlen(cmd1));
     strcpy(all + 10, drain_raw());
     CHECK_STR(decode(all),
-        "* rx.packet seq=1 frame=7 crc=ok len=4 spacing=0 fixed=0 min_margin=1.500 weakest=0 weak=0 hex=00010203\n"
+        "* rx.packet seq=1 frame=7 crc=ok len=4 spacing=0 fixed=0 ecc=none corrected=0 min_margin=1.500 weakest=0 weak=0 hex=00010203\n"
         "e1 tx.volume=-28\ne1 ok\n");
 
     // Events around a long reply never land inside it

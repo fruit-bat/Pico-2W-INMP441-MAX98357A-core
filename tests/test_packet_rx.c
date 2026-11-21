@@ -40,6 +40,7 @@ static uint32_t stream[MAX_STREAM];
 static const uint8_t test_payload[16] = "packet rx test!";
 static const uint8_t *sent_payload = test_payload;
 static uint32_t sent_length = sizeof test_payload;
+static uint32_t sent_ecc = PACKET_ECC_RS2; // Error correction on packets built (as the firmware's default)
 
 // Builds: LEAD silent frames, a packet, then silence up to 'length' frames.
 // Returns the frame where B starts.
@@ -48,7 +49,7 @@ static uint32_t build_packet_stream_with(uint32_t length, const uint8_t *payload
     sent_length = payload_length;
     for (uint32_t k = 0; k < length; k++) stream[k] = CHIRP_CHANNEL_SILENT;
     packet_tx_init(&ptx, (uint32_t)log2(rig_m));
-    packet_tx_start(&ptx, payload, payload_length);
+    packet_tx_start(&ptx, payload, payload_length, sent_ecc);
     uint32_t k = LEAD, s;
     while (packet_tx_next_symbol(&ptx, &s) && k < length) stream[k++] = s;
     return LEAD + PACKET_A_LEN;
@@ -132,7 +133,7 @@ static Events_t run(uint32_t length, double offset, double snr_db, const ChirpEc
                 {
                     const PacketRxDecision_t *d = packet_rx_decisions(&prx);
                     const uint32_t b = (uint32_t)log2(rig_m);
-                    bool same = st->data_count == packet_symbol_count(sent_length, b) - PACKET_PREAMBLE_LEN;
+                    bool same = st->data_count == packet_symbol_count(sent_length, sent_ecc, b) - PACKET_PREAMBLE_LEN;
                     for (uint32_t i = 0; same && i < st->data_count; i++) {
                         // Header symbols are kept at spacing 8 (the stream has them at the rig's)
                         const uint32_t sent = stream[LEAD + PACKET_PREAMBLE_LEN + i];
@@ -411,7 +412,7 @@ static void test_wrong_lock_move(void) {
 static void test_long_packets(void) {
     static uint8_t payload[PACKET_MAX_PAYLOAD];
     rig_setup_spacing(1);
-    const uint32_t frames = LEAD + packet_symbol_count(sizeof payload, 6) + 10;
+    const uint32_t frames = LEAD + packet_symbol_count(sizeof payload, sent_ecc, 6) + 10;
     for (int harsh = 0; harsh < 2; harsh++) {
         for (int i = 0; i < 3; i++) {
             const double snr = i == 0 ? 100.0 : (i == 1 ? 0.0 : -6.0);
@@ -435,17 +436,63 @@ static void test_long_packets(void) {
     }
 }
 
-// A corrupted packet is reported with a bad CRC, not dropped or accepted:
-// one data symbol (in the payload) is changed on the air
+// Without error correction a corrupted packet is reported with a bad CRC,
+// not dropped or accepted: one data symbol (in the payload) is changed on
+// the air
 static void test_bad_crc(void) {
     rig_setup_spacing(1);
+    sent_ecc = PACKET_ECC_NONE;
     build_packet_stream(80);
     stream[LEAD + PACKET_PREAMBLE_LEN + 10] ^= 0x15;
     const Events_t e = run(80, 0.0, 100.0, NULL, 0, true);
-    print_packet("one symbol changed", e);
+    print_packet("one symbol changed, no error correction", e);
     CHECK_EQ_U(e.packets, 1);
     CHECK_EQ_U(e.good, 0);
-    if (e.packets) CHECK(!e.last_packet.crc_ok);
+    if (e.packets) {
+        CHECK(!e.last_packet.crc_ok);
+        CHECK_EQ_U(e.last_packet.ecc, PACKET_ECC_NONE);
+        CHECK_EQ_U(e.last_packet.ecc_fixed, 0);
+    }
+    sent_ecc = PACKET_ECC_RS2;
+}
+
+// With rs2, wrong bytes after the header are corrected, up to 2 of them
+// (in the check bytes too); 3 are not, and the packet ends with a bad CRC.
+// At 6 bits/symbol, payload symbols 0, 4, 8, 12 and 28 each lie within one
+// byte (0, 3, 6, 9 and 21, the last check byte)
+static void test_payload_correction(void) {
+    static const struct { uint32_t count, symbols[3]; int32_t fixed; } cases[] = {
+        { 1, { 4 }, 1 },
+        { 1, { 28 }, 1 },
+        { 2, { 4, 12 }, 2 },
+        { 2, { 0, 28 }, 2 },
+        { 3, { 0, 4, 12 }, -1 },
+        { 3, { 0, 8, 28 }, -1 },
+    };
+    rig_setup_spacing(1);
+    for (unsigned k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        build_packet_stream(90);
+        for (uint32_t c = 0; c < cases[k].count; c++) {
+            stream[LEAD + PACKET_PREAMBLE_LEN + PACKET_HEADER_SYMBOLS + cases[k].symbols[c]] ^= 0x15;
+        }
+        const Events_t e = run(90, 0.0, 100.0, NULL, 0, true);
+        char label[48];
+        snprintf(label, sizeof label, "%u wrong bytes, rs2", cases[k].count);
+        print_packet(label, e);
+        CHECK_EQ_U(e.packets, 1);
+        if (!e.packets) continue;
+        CHECK_EQ_U(e.last_packet.ecc, PACKET_ECC_RS2);
+        if (cases[k].fixed >= 0) {
+            CHECK_EQ_U(e.good, 1);
+            CHECK_EQ_U(e.last_packet.ecc_fixed, cases[k].fixed);
+        } else {
+            // Not corrected: the code says so, or (rarely) "corrects" to
+            // another codeword, which the CRC catches
+            CHECK_EQ_U(e.good, 0);
+            CHECK(!e.last_packet.crc_ok);
+            printf("    ecc_fixed %d\n", (int)e.last_packet.ecc_fixed);
+        }
+    }
 }
 
 // Changes header symbol i (at spacing 1, as the rig) so its 3-bit value has
@@ -486,46 +533,51 @@ static void test_bad_header(void) {
     }
 }
 
-// A header from a newer format (here: error correction 1) is decoded, and
-// refused
+// A header from a newer format (here: error correction 2, reserved) is
+// decoded, and refused
 static void test_unknown_header(void) {
     rig_setup_spacing(4);
     build_packet_stream(80);
-    const PacketHeader_t h = { PACKET_VERSION, 4, 1, sizeof test_payload };
+    const PacketHeader_t h = { PACKET_VERSION, 4, 2, sizeof test_payload };
     const uint32_t code = packet_golay_encode(packet_header_pack(&h));
     for (uint32_t i = 0; i < PACKET_HEADER_SYMBOLS; i++) {
         const uint32_t v = (code >> (21u - 3u * i)) & 7u;
         stream[LEAD + PACKET_PREAMBLE_LEN + i] = packet_gray_symbol(v) << 1; // Spacing 8 at 4 bits/symbol
     }
     const Events_t e = run(80, 0.0, 100.0, NULL, 0, true);
-    print_packet("header with error correction 1", e);
+    print_packet("header with error correction 2", e);
     CHECK_EQ_U(e.header_failed, 1);
     CHECK_EQ_U(e.last_header.header_result, PACKET_RX_HEADER_FORMAT);
     rig_setup_spacing(1);
 }
 
-// The receiver follows the header's spacing: packets at 1, 2 and 4 bins per
-// symbol, one after another, all with the same receiver set-up
+// The receiver follows the header's spacing and error correction: packets
+// at 1, 2 and 4 bins per symbol, with and without rs2, one after another,
+// all with the same receiver set-up
 static void test_mixed_spacings(void) {
     static const uint32_t spacings[] = { 4, 1, 2, 4 };
+    static const uint32_t eccs[] = { PACKET_ECC_RS2, PACKET_ECC_NONE, PACKET_ECC_RS2, PACKET_ECC_NONE };
     for (unsigned k = 0; k < 4; k++) {
         rig_setup_spacing(spacings[k]);
+        sent_ecc = eccs[k];
         chirp_channel_seed(90 + k);
-        build_packet_stream(90);
-        const Events_t e = run(90, 150.0, 0.0, measured_echoes, 3, true);
+        build_packet_stream(100);
+        const Events_t e = run(100, 150.0, 0.0, measured_echoes, 3, true);
         char label[48];
-        snprintf(label, sizeof label, "spacing %u, room, 0 dB", spacings[k]);
+        snprintf(label, sizeof label, "spacing %u, %s, room, 0 dB", spacings[k], eccs[k] ? "rs2" : "no ecc");
         print_packet(label, e);
         CHECK_EQ_U(e.good, 1);
         CHECK_EQ_U(e.last_packet.spacing, spacings[k]);
+        CHECK_EQ_U(e.last_packet.ecc, eccs[k]);
     }
+    sent_ecc = PACKET_ECC_RS2;
     rig_setup_spacing(1);
 }
 
 // Two packets back to back with a short gap: both received
 static void test_two_packets(void) {
     rig_setup_spacing(1);
-    const uint32_t len = packet_symbol_count(sizeof test_payload, 6) + 4u;
+    const uint32_t len = packet_symbol_count(sizeof test_payload, sent_ecc, 6) + 4u;
     build_packet_stream(LEAD + 2 * len + 10);
     for (uint32_t k = 0; k < len; k++) stream[LEAD + len + k] = stream[LEAD + k];
     const Events_t e = run(LEAD + 2 * len + 10, 210.0, 0.0, room_echoes, 3, true);
@@ -540,7 +592,7 @@ static void test_two_packets(void) {
 static void test_lost_signal(void) {
     rig_setup_spacing(1);
     // 16-byte packet; stop after the header and 4 payload symbols
-    const uint32_t len = packet_symbol_count(sizeof test_payload, 6), cut = PACKET_PREAMBLE_LEN + PACKET_HEADER_SYMBOLS + 4u;
+    const uint32_t len = packet_symbol_count(sizeof test_payload, sent_ecc, 6), cut = PACKET_PREAMBLE_LEN + PACKET_HEADER_SYMBOLS + 4u;
     const uint32_t frames = LEAD + len + 6u + len + 10u;
     build_packet_stream(frames);
     for (uint32_t k = 0; k < len; k++) stream[LEAD + len + 6u + k] = stream[LEAD + k]; // A second, whole packet
@@ -660,6 +712,7 @@ int main(void) {
     RUN_TEST(test_wrong_lock_move);
     RUN_TEST(test_long_packets);
     RUN_TEST(test_bad_crc);
+    RUN_TEST(test_payload_correction);
     RUN_TEST(test_bad_header);
     RUN_TEST(test_unknown_header);
     RUN_TEST(test_mixed_spacings);

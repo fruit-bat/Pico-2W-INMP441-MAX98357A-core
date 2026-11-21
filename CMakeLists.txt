@@ -55,6 +55,7 @@ add_executable(Pico-2W-INMP441-MAX98357A-core-test
     src/packet_format.c
     src/packet_tx.c
     src/packet_rx.c
+    src/reed_solomon.c
     src/protocol.c
     
     # Target precisely the Float32 Transform source files

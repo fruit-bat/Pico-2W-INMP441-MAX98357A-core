@@ -18,7 +18,8 @@ static uint32_t bits_per_symbol(const FakeBoard_t *fb) {
 }
 
 uint32_t fake_board_packet_frames(const FakeBoard_t *fb, uint32_t length) {
-    const uint32_t bits = 8u * length + 16u; // Payload, CRC-16
+    // Payload, CRC-16, Reed-Solomon check bytes with link.ecc rs2
+    const uint32_t bits = 8u * length + 16u + (fb->settings.value[SETTING_LINK_ECC] ? 32u : 0u);
     const uint32_t b = bits_per_symbol(fb);
     return 16u + 8u + (bits + b - 1u) / b;   // Preamble, header (8 symbols), the rest
 }
@@ -165,6 +166,8 @@ static void one_frame(FakeBoard_t *fb) {
                 e.u.packet.length = fb->current.length;
                 e.u.packet.spacing = (uint32_t)fb->settings.value[SETTING_LINK_SPACING];
                 e.u.packet.fixed = 0;
+                e.u.packet.ecc = (uint32_t)fb->settings.value[SETTING_LINK_ECC];
+                e.u.packet.ecc_fixed = 0;
                 e.u.packet.min_margin = 2.0f;
                 e.u.packet.weakest = 0;
                 e.u.packet.weak = 0;

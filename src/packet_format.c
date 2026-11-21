@@ -33,13 +33,17 @@ uint32_t packet_gray_symbol(uint32_t value) {
     return symbol;
 }
 
-uint32_t packet_payload_symbol_count(uint32_t payload_length, uint32_t bits_per_symbol) {
-    const uint32_t bits = 8u * (payload_length + PACKET_CRC_BYTES);
+uint32_t packet_coded_bytes(uint32_t payload_length, uint32_t ecc) {
+    return payload_length + PACKET_CRC_BYTES + (ecc == PACKET_ECC_RS2 ? RS_PARITY : 0u);
+}
+
+uint32_t packet_payload_symbol_count(uint32_t payload_length, uint32_t ecc, uint32_t bits_per_symbol) {
+    const uint32_t bits = 8u * packet_coded_bytes(payload_length, ecc);
     return (bits + bits_per_symbol - 1u) / bits_per_symbol;
 }
 
-uint32_t packet_symbol_count(uint32_t payload_length, uint32_t bits_per_symbol) {
-    return PACKET_PREAMBLE_LEN + PACKET_HEADER_SYMBOLS + packet_payload_symbol_count(payload_length, bits_per_symbol);
+uint32_t packet_symbol_count(uint32_t payload_length, uint32_t ecc, uint32_t bits_per_symbol) {
+    return PACKET_PREAMBLE_LEN + PACKET_HEADER_SYMBOLS + packet_payload_symbol_count(payload_length, ecc, bits_per_symbol);
 }
 
 uint32_t packet_header_pack(const PacketHeader_t *h) {
@@ -53,7 +57,7 @@ bool packet_header_unpack(uint32_t bits, PacketHeader_t *h) {
     h->spacing = SPACINGS[(bits >> 8) & 3u];
     h->ecc = (bits >> 6) & 3u;
     h->length = bits & 63u;
-    return h->version == PACKET_VERSION && h->spacing != 0u && h->ecc == PACKET_ECC_NONE;
+    return h->version == PACKET_VERSION && h->spacing != 0u && h->ecc <= PACKET_ECC_RS2;
 }
 
 // The (23,12) Golay code's generator, x^11 + x^10 + x^6 + x^5 + x^4 + x^2 + 1
